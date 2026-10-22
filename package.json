@@ -1,0 +1,51 @@
+{
+  "name": "dsh-plugin-tools-panel",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "One composer panel with two tabs: a per-tool live kill switch (hide a tool from the model, or refuse the call) and a plugin on/off switch for the whole profile. · 输入框工具条上的一个面板，两个 tab：逐个工具的实时开关（可从模型可见工具里隐藏、或拦截调用），以及整个 profile 的插件启停开关。",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "tool",
+    "guard",
+    "kill-switch",
+    "deny",
+    "group",
+    "分组",
+    "plugin",
+    "switch",
+    "toggle",
+    "composer"
+  ],
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./agent": "./src/agent.js",
+    "./client": "./src/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node test/check.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

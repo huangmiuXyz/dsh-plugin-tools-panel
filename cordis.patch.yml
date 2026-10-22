@@ -1,0 +1,14 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# TWO rows on purpose. The first mounts the panel and the guard; the second mounts
+# only the model-facing `manage_tool_groups` tool. They share one storage file but
+# are separate Loader entries, so the shipped Plugins page can switch the AI's group
+# management off on its own without taking the kill switch down with it — and vice
+# versa. The client row is also the only reason `exports["./client"]` is ever
+# scanned: a package that contributes no Loader row of its own is never walked by
+# `@deepseek-ai/dsh-client-modules`, so its browser bundle would never be served.
+- insert:
+    - id: tools-panel
+      name: 'dsh-plugin-tools-panel'
+    - id: tools-panel-agent
+      name: 'dsh-plugin-tools-panel/agent'
