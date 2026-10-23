@@ -463,14 +463,35 @@ function fakeHost() {
   const listeners = new Map()
   const live = []
   const owners = new Map()
-  /** Every tool the registry knows about, as the GLOBAL layer. */
-  const globals = new Set(['read', 'write', 'edit', 'bash', 'grep', 'todo_write', 'mcp__github__search'])
+  /**
+   * Which layer each tool is registered in — the geometry that actually broke this
+   * plugin.
+   *
+   * A PRESET registers its tool rows (`tool-bash`, `tool-fs`, …) into the PRESET's
+   * own scope, which every agent using that preset inherits. Only the host
+   * composition's rows (`working_directory`, `cordis_inspect_*`, MCP bridges) sit in
+   * the global layer. Modelling this split is what makes the old bug visible: a
+   * restriction applied on the agent's own scope DOES mask inherited tools, so the
+   * failure only shows up when the tool the user switched off lives in a layer the
+   * mask was never applied to.
+   */
+  const PRESET_TOOLS = ['read', 'write', 'edit', 'bash', 'grep', 'todo_write', 'mcp__github__search']
+  const GLOBAL_TOOLS = ['working_directory', 'cordis_inspect_list', 'cordis_inspect_call']
   /** Which names are currently hidden per agent id — what `restrict()` changed. */
   const hidden = new Map()
+  /** Which names are hidden per PRESET name — the layer above the agent. */
   /** Agents whose preset mounts no tools: a scope view with nothing in it. */
   const noTools = new Set()
   /** Every restriction call, in order, so the checks can read what was applied. */
   const restrictCalls = []
+  /**
+   * Every preset ever minted, keyed by preset NAME so agents on the same preset
+   * share one layer. `hidden` is the preset's own mask and `ctx` is the scope
+   * object the plugin walks up to — both shared, exactly as the real registry
+   * shares one mounted preset tree among the agents using it.
+   */
+  const presets = new Map()
+  let nextPresetId = 0
   const server = http.createServer((req, res) => {
     const route = routes.get(new URL(req.url, 'http://localhost').pathname)
     if (route === undefined) {
@@ -484,6 +505,14 @@ function fakeHost() {
       routes.set(route.path, route.handler)
       return () => routes.delete(route.path)
     }
+  }
+
+  /** The names visible to one agent: both layers, minus what is masked on either. */
+  function visibleFor(agentId, preset) {
+    if (noTools.has(agentId)) return []
+    const shared = presets.get(preset)
+    const gone = new Set([...(hidden.get(agentId) ?? []), ...(shared?.hidden ?? [])])
+    return [...GLOBAL_TOOLS, ...PRESET_TOOLS].filter((name) => !gone.has(name))
   }
 
   /** The `tools` service, scoped when it belongs to one agent's context. */
@@ -504,25 +533,25 @@ function fakeHost() {
       throw new Error('an unscoped restriction would mask every agent')
     },
     /**
-     * The GLOBAL view: every registered tool, nothing hidden.
+     * The GLOBAL view: the host composition's own rows, nothing hidden.
      *
      * A scope view is what the agent can CALL, so an agent whose preset mounted no
      * tools answers `[]` — the general rule, not a special case: the menu lists what
      * this session can call, whatever the reason it cannot call anything.
      */
     schemas(scope) {
-      if (scope === undefined) return [...globals].map((name) => ({ name }))
-      if (noTools.has(scope.id)) return []
-      const gone = hidden.get(scope.id) ?? new Set()
-      return [...globals].filter((name) => !gone.has(name)).map((name) => ({ name }))
+      if (scope === undefined) return GLOBAL_TOOLS.map((name) => ({ name }))
+      const agent = live.find((entry) => entry.id === scope.id)
+      return visibleFor(scope.id, agent?.preset).map((name) => ({ name }))
     },
     /**
      * Test-only: register a tool later and fire `tools/change`, the way a real
      * registration does. Used to prove a tool that appears AFTER the switch was set
-     * is hidden as well.
+     * is hidden as well. The new row is a PRESET row, because that is the layer that
+     * actually gains tools at runtime (an MCP server connecting).
      */
     __register(name) {
-      globals.add(name)
+      PRESET_TOOLS.push(name)
       for (const listener of listeners.get('tools/change') ?? []) listener()
     }
   }
@@ -531,31 +560,72 @@ function fakeHost() {
    * One agent with a real scoped context: mounting a fiber runs `apply` with a
    * context whose `tools` service belongs to this agent, exactly as the registry
    * hands it to a plugin mounted in `agent.ctx`.
+   *
+   * The agent ALSO has a parent context standing in for its preset's scope, with a
+   * `plugin` of its own — so the plugin's scope-chain walk finds the layer that
+   * holds the preset's tools. Without that parent there is nothing to walk and the
+   * old single-mount behaviour would look correct.
+   *
+   * Agents that name the SAME preset share ONE preset scope, which is what the real
+   * registry does: the preset's tree is mounted once per generation and every agent
+   * using it inherits from that one layer. Sharing it is what makes "the preset layer
+   * is masked once, not per agent" a meaningful assertion rather than a tautology.
    */
-  function makeAgent(id) {
+  function makeAgent(id, preset = 'standard') {
+    let shared = presets.get(preset)
+    if (shared === undefined) {
+      shared = { presetId: `${preset}-${nextPresetId++}`, hidden: new Set() }
+      presets.set(preset, shared)
+    }
+    const presetId = shared.presetId
     const scopedTools = {
       guard: tools.guard,
-      /** Restrict the global names THIS agent can see. */
+      /** Restrict the names THIS agent can see — its own layer's mask. */
       restrict(filter) {
         const names = filter?.deny ?? []
         if (names.length === 0) throw new Error('empty restriction')
         for (const name of names) {
-          if (!globals.has(name)) throw new Error(`unknown global tool: ${name}`)
+          if (!GLOBAL_TOOLS.includes(name) && !PRESET_TOOLS.includes(name)) {
+            throw new Error(`unknown global tool: ${name}`)
+          }
         }
-        restrictCalls.push({ id, names })
-        const applied = hidden.get(id) ?? new Set()
+        restrictCalls.push({ id, names, layer: 'agent' })
+        const applied = new Set(hidden.get(id) ?? [])
         for (const name of names) applied.add(name)
         hidden.set(id, applied)
         return () => {
-          const set = hidden.get(id) ?? new Set()
+          const set = new Set(hidden.get(id) ?? [])
           for (const name of names) set.delete(name)
           hidden.set(id, set)
         }
       },
-      schemas: tools.schemas
+      schemas: (scope) => tools.schemas(scope ?? { id })
     }
-    const agent = { id }
+    /** The same contract one layer up, masking the PRESET's own registrations. */
+    const presetTools = {
+      guard: tools.guard,
+      restrict(filter) {
+        const names = filter?.deny ?? []
+        if (names.length === 0) throw new Error('empty restriction')
+        for (const name of names) {
+          if (!PRESET_TOOLS.includes(name)) throw new Error(`unknown global tool: ${name}`)
+        }
+        restrictCalls.push({ id: presetId, names, layer: 'preset' })
+        // The mask belongs to the PRESET, not to this agent: every agent sharing the
+        // preset sees the same layer, so a second agent must not get its own copy.
+        for (const name of names) shared.hidden.add(name)
+        return () => {
+          for (const name of names) shared.hidden.delete(name)
+        }
+      },
+      schemas: (scope) => tools.schemas(scope ?? { id })
+    }
+    const agent = { id, preset }
+    agent.presetId = presetId
     agent.ctx = {
+      // `fiber.uid` is the scope's identity and `fiber.parent` is the enclosing
+      // CONTEXT — the documented Cordis shape, which is what the plugin walks.
+      fiber: { uid: id, parent: undefined },
       plugin(definition) {
         const fiberCtx = {
           tools: scopedTools,
@@ -565,13 +635,30 @@ function fakeHost() {
         }
         definition.apply?.(fiberCtx)
         return {
-          /** The real scope teardown removes every restriction the fiber added. */
           dispose() {
             hidden.delete(id)
           }
         }
       }
     }
+    // The preset scope above it. `fiber.parent` is the link the plugin's walk follows.
+    // Shared per preset: a second agent on the same preset points at the SAME object,
+    // so the plugin's "already mounted" check has a real second agent to dedupe.
+    const presetCtx = shared.ctx ?? {
+      fiber: { uid: presetId, parent: undefined },
+      plugin(definition) {
+        const fiberCtx = {
+          tools: presetTools,
+          effect: (fn) => fn(),
+          get: () => undefined,
+          on: () => () => {}
+        }
+        definition.apply?.(fiberCtx)
+        return { dispose() {} }
+      }
+    }
+    shared.ctx = presetCtx
+    agent.ctx.fiber.parent = presetCtx
     return agent
   }
 
@@ -583,9 +670,13 @@ function fakeHost() {
     withoutTools(id) {
       noTools.add(id)
     },
+    /** Test-only: the preset scope id above one agent, as the plugin walks it. */
+    presetScopeOf(id) {
+      return presets.get(live.find((agent) => agent.id === id)?.preset)?.presetId
+    },
     /** Test-only: create an agent, optionally owned by an existing one. */
-    spawn(id, parentId) {
-      const agent = makeAgent(id)
+    spawn(id, parentId, preset = 'standard') {
+      const agent = makeAgent(id, preset)
       live.push(agent)
       if (parentId !== undefined) owners.set(id, parentId)
       const payload = { agent, source: 'startup' }
@@ -642,8 +733,11 @@ const post = (body, withHeader = true) =>
 
 try {
   // Two independent sessions, plus a delegated child and grandchild under the first.
+  // The sibling gets a DIFFERENT preset on purpose: two agents on one preset share
+  // that preset's layer, so masking it would reach the sibling — which is correct
+  // registry behaviour but would make "another session is untouched" untestable.
   host.agents.spawn('root-a')
-  host.agents.spawn('root-b')
+  host.agents.spawn('root-b', undefined, 'other')
   host.agents.spawn('child-a', 'root-a')
   host.agents.spawn('grand-a', 'child-a')
   check('tree: the child link was recorded', parents.get('child-a') === 'root-a', String(parents.get('child-a')))
@@ -768,6 +862,66 @@ try {
     check(
       'live: nor can the grandchild',
       !host.tools.schemas({ id: 'grand-a' }).map((s) => s.name).includes('write')
+    )
+  }
+  {
+    // THE regression this plugin shipped with: the preset's own tool rows live in a
+    // layer ABOVE the agent, and a mask applied only on the agent's own scope never
+    // reaches them — so the tool stayed in the model's schema list while the panel
+    // showed its switch as off. Both layers must be masked, and the proof is the
+    // agent's own visibility, not the number of `restrict()` calls.
+    //
+    // A name that is ALREADY hidden is skipped, so the set is chosen to include one
+    // fresh preset tool, one global-layer tool, and one the earlier blocks already
+    // masked — which is the interesting case: an unchanged name must not force a
+    // re-apply, and a new one must.
+    const payload = await (await post({ sessionId: 'root-a', deny: ['bash', 'write', 'working_directory'] })).json()
+    check('layers: the denied tools are recorded', payload.state?.denied?.length === 3, JSON.stringify(payload.state?.denied))
+    const seen = host.tools.schemas({ id: 'root-a' }).map((s) => s.name)
+    check(
+      'layers: a tool held by the PRESET layer is hidden from the agent',
+      !seen.includes('bash'),
+      seen.join(',')
+    )
+    // A host-composition row (the global layer) must be maskable too, so both
+    // layers are exercised by one switch rather than only the deeper one.
+    check(
+      'layers: a global-layer tool is hidden as well',
+      !seen.includes('working_directory'),
+      seen.join(',')
+    )
+    // The mask must actually have been applied on the PRESET layer, not only read
+    // as an agent-scope restriction. This is the assertion that fails on the old
+    // single-mount code: without it the preset rows simply stay visible.
+    const presetCalls = host.restrictCalls.filter((call) => call.layer === 'preset')
+    check(
+      'layers: the restriction reached the preset layer',
+      presetCalls.some((call) => call.names.includes('bash')),
+      JSON.stringify(presetCalls.map((call) => call.names))
+    )
+    // The preset layer is mounted ONCE for the whole preset, however many agents
+    // use it — a second agent must not produce a second mask. The count is bounded
+    // by the number of preset layers, not by the number of agents.
+    const presetLayers = presetCalls.map((call) => call.id)
+    check(
+      'layers: the preset layer is masked once, not per agent',
+      new Set(presetLayers).size <= 1,
+      `${new Set(presetLayers).size} layer(s) for ${host.live.length} agent(s)`
+    )
+    check(
+      'layers: the other preset tools stay visible',
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
+    )
+    // Releasing must lift BOTH masks, or the tool would stay hidden forever.
+    const released = await (await post({ sessionId: 'root-a', deny: [] })).json()
+    check('layers: releasing empties the list', released.state?.denied?.length === 0)
+    check(
+      'layers: and the preset tool is visible again',
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('bash')
+    )
+    check(
+      'layers: and the global tool is visible again',
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('working_directory')
     )
   }
   {

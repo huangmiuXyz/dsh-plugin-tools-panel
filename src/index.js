@@ -8,19 +8,24 @@
  *   next tool call already sees it — no reload, no restart, not even a re-render.
  *
  * TWO MECHANISMS, ON PURPOSE
- *   1. HIDING (`ctx.tools.restrict()` on the agent's own scope). A restricted tool
- *      disappears from the schemas the model is shown, so it is never offered in
- *      the first place. This is the primary mechanism: the model does not see the
- *      tool, so it does not call it, and the request is smaller.
+ *   1. HIDING (`ctx.tools.restrict()` on the scopes that hold the tools). A
+ *      restricted tool disappears from the schemas the model is shown, so it is never
+ *      offered in the first place. This is the primary mechanism: the model does not
+ *      see the tool, so it does not call it, and the request is smaller.
  *      `restrict()` is scope-bound: the `tools` contract refuses an unscoped call
  *      ("would mask every agent"), so the restriction is applied by a tiny plugin
- *      mounted into `agent.ctx` — one per live agent. That plugin lives and dies
- *      with the agent's scope, which is also what removes the restriction.
+ *      mounted into a scope — the agent's own `agent.ctx` AND every scope above it.
+ *      That chain walk is load-bearing, not defensive: a PRESET registers its tool
+ *      rows into its OWN layer, which is an ancestor of the agent, and only a
+ *      restriction registered on the layer that HOLDS a tool can mask it. Mounting
+ *      on the agent alone left every preset tool visible while the panel showed its
+ *      switch as off. Each mounted plugin lives and dies with its scope, which is
+ *      also what removes the restriction.
  *   2. GUARDING (`ctx.tools.guard()`). A backstop, not the main path. `restrict()`
- *      only masks GLOBAL tools — a scope-local registration stays visible — and a
- *      scope whose mounting failed would otherwise be entirely unguarded. The guard
- *      is a SYNCHRONOUS monotonic check inside the pipeline that resolves the
- *      session's deny list on every call, so a name that slipped past hiding is
+ *      only masks INHERITED contributions — a scope's OWN registrations stay visible
+ *      — and a scope whose mounting failed would otherwise be entirely unguarded.
+ *      The guard is a SYNCHRONOUS monotonic check inside the pipeline that resolves
+ *      the session's deny list on every call, so a name that slipped past hiding is
  *      still refused with a reason the model can read.
  *
  * WHY THE GUARD IS NOT THE PRIMARY MECHANISM ANY MORE
@@ -338,6 +343,16 @@ function makeGuard(table, tree) {
  * calls that mounting a fiber into `agent.ctx`; the fiber is owned by the agent
  * scope, so the restriction is removed when the agent goes away.
  *
+ * WHY A PRESET-SCOPE FIBER IS MOUNTED TOO
+ *   `restrict()` masks what a scope INHERITS, never what its own layer registers
+ *   (`view()` skips the `own` layer when it applies the filters). A preset mounts
+ *   its tool rows (`tool-bash`, `tool-fs`, …) into the PRESET's scope, which is an
+ *   ANCESTOR of every agent using that preset — so from the agent's own scope those
+ *   tools are inherited contributions, and a restriction registered there does mask
+ *   them. The restriction is therefore mounted once per agent AND once per preset
+ *   scope that has a live agent using it; both read the same table, so a switch
+ *   reaches whichever layer holds the tool.
+ *
  * The mounted plugin is deliberately tiny and dumb: it holds one applied signature,
  * re-reads the wanted set from this controller when asked, and does nothing else.
  * All of the policy/inheritance logic stays in one place (the table above) instead
@@ -345,32 +360,30 @@ function makeGuard(table, tree) {
  * @param scope - the plugin context (needs `tools`; provides `schemas`).
  * @returns the controller used by the route and by the agent lifecycle listeners.
  */
-function createRestrictor(scope) {
-  /** agentId -> { holder, fiber } */
+function createRestrictor(scope, agents) {
+  /** scope key -> { holder, fiber, agentId } */
   const entries = new Map()
   let live = true
   let timer
+  /** The agent registry, so a pass can resolve one agent's visible names. */
+  const agentsRef = agents
   /** Why the last mount attempt failed, for the snapshot's diagnostics. */
   let mountError
   /** The last `restrict()` failure, for the snapshot's diagnostics. */
   let restrictError
 
   /**
-   * Names the registry currently holds GLOBALLY, or undefined when it cannot say.
+   * Names one agent can actually CALL, or undefined when it cannot say.
    *
-   * `restrict()` throws for a name it does not know ("unknown global tool"), and it
-   * only masks global tools — a scope-local registration stays visible. Intersecting
-   * the deny list with this set before applying is therefore both what keeps the
-   * call from throwing and what documents the boundary: a name that is not here is
-   * left to the guard.
-   *
-   * `undefined` is not "no tools": a registry that cannot answer must leave the
-   * restriction it already applied alone, because clearing it would turn a
-   * momentary read failure into a tool the user switched off becoming callable.
+   * This — not the global view — is the truth about what the model sees for this
+   * session, and it is the set `restrict()` accepts when called from a scope the
+   * tool is inherited into. Reading it per agent rather than once per pass is
+   * deliberate: two agents can have different visible sets (different presets,
+   * different inherited restrictions), so there is no single answer to cache.
    */
-  function knownGlobalNames() {
+  function visibleNamesOf(agent) {
     try {
-      return new Set(scope.tools.schemas().map((schema) => schema.name))
+      return new Set(scope.tools.schemas(agent).map((schema) => schema.name))
     } catch {
       return undefined
     }
@@ -379,7 +392,7 @@ function createRestrictor(scope) {
   /**
    * The deny list that applies to one agent, cut down to names hiding can mask.
    * @param agentId - the session whose policy applies (after inheritance).
-   * @param known - the global names, or undefined when they are unavailable.
+   * @param known - the maskable names for that agent, or undefined when unavailable.
    * @returns the names to mask, or undefined to leave the applied set untouched.
    */
   function wantedFor(agentId, known) {
@@ -389,16 +402,23 @@ function createRestrictor(scope) {
     return [...deny].filter((name) => known.has(name)).sort()
   }
 
-  /** Mount one agent's restriction plugin, if that agent exposes a scope. */
-  function mount(agent) {
+  /**
+   * Mount one scope's restriction plugin.
+   *
+   * The scope is either an AGENT (`agent.ctx`) or a PRESET scope reachable from a
+   * live agent — both are legitimate mount points, because a preset's tool rows
+   * live in the preset's own layer and are inherited by every agent that uses it.
+   * @param key - stable identity for this scope; used to avoid a double mount.
+   * @param target - `{ ctx, agent, agentId }`; `agent` is what `schemas()` is read
+   * for and `agentId` is the session whose policy applies.
+   * @param mount - how to install the fiber into that scope.
+   */
+  function mountScope(key, target, mount) {
     if (!live) return
-    const id = agent?.id
-    if (typeof id !== 'string' || entries.has(id)) return
-    // `agent.ctx` is not part of the published Agent interface, so its absence is
-    // ordinary (an older registry). The guard still enforces; only hiding is lost.
-    const agentScope = agent.ctx
-    if (agentScope === undefined || typeof agentScope.plugin !== 'function') {
-      mountError = 'agent has no ctx.plugin (older registry): hiding unavailable'
+    if (typeof key !== 'string' || entries.has(key)) return
+    const scopeCtx = target?.ctx
+    if (scopeCtx === undefined || typeof scopeCtx.plugin !== 'function') {
+      mountError = 'scope has no ctx.plugin (older registry): hiding unavailable'
       return
     }
 
@@ -423,13 +443,15 @@ function createRestrictor(scope) {
         }
 
         /**
-         * Re-apply this agent's restriction.
-         * @param known - the global names, when the caller already computed them for
-         * a whole pass. Omitted on the initial mount, where there is no shared pass.
+         * Re-apply this scope's restriction.
+         * @param agentId - the session whose policy this scope serves.
+         * @param known - the maskable names, when the caller already computed them
+         * for a whole pass. Omitted on the initial mount, where there is no shared
+         * pass, and the scope then reads them for its own agent.
          */
-        const sync = (known) => {
+        const sync = (agentId, known) => {
           if (stopped) return
-          const names = wantedFor(id, known ?? knownGlobalNames())
+          const names = wantedFor(agentId, known ?? visibleNamesOf(target.agent))
           // No answer from the registry: keep whatever is applied. Clearing here
           // would make a tool the user switched off callable again.
           if (names === undefined) return
@@ -453,7 +475,7 @@ function createRestrictor(scope) {
             return
           } catch (error) {
             // One unacceptable name (a reserved transport name, a name registered
-            // after `knownGlobalNames()` ran) must not take the whole restriction
+            // after the view was read) must not take the whole restriction
             // down: apply the rest one layer at a time and keep what sticks. The
             // signature stays claimed, so a fixed property of a name — being
             // reserved — is not retried on every tool change; the guard covers it.
@@ -478,14 +500,15 @@ function createRestrictor(scope) {
         } catch {
           // A minimal context without `effect`: the fiber teardown still runs.
         }
-        sync()
+        sync(target.agentId)
       }
     }
 
     try {
       // The holder object is stable: the mounted fiber swaps `sync` in place, and the
-      // controller reaches it through this map.
-      entries.set(id, { holder, fiber: agentScope.plugin(plugin) })
+      // controller reaches it through this map. The agent id travels with the entry
+      // so a preset scope serving several agents is re-synced for each of them.
+      entries.set(key, { holder, fiber: mount(scopeCtx, plugin), agentId: target.agentId })
       mountError = undefined
     } catch (error) {
       // The scope died between listing and mounting. Leave it to the guard, but say
@@ -495,16 +518,55 @@ function createRestrictor(scope) {
     }
   }
 
-  /** Re-read the policy for every mounted agent. */
+  /**
+   * Mount one agent's restriction plugin, if that agent exposes a scope.
+   *
+   * `agent.ctx` is not part of the published Agent interface, so its absence is
+   * ordinary (an older registry). The guard still enforces; only hiding is lost.
+   */
+  function mount(agent) {
+    const id = agent?.id
+    if (typeof id !== 'string') return
+    mountScope(`agent:${id}`, { ctx: agent.ctx, agent, agentId: id }, (ctx, plugin) => ctx.plugin(plugin))
+  }
+
+  /**
+   * Mount one PRESET scope's restriction plugin.
+   *
+   * A preset's tool rows (`tool-bash`, `tool-fs`, …) are registered into the
+   * preset's own layer, which every agent using that preset inherits. A restriction
+   * registered on the agent's own scope DOES mask them, so mounting here is not
+   * required for the common case — it is required for the case the agent's own scope
+   * cannot reach, and it is the only way to keep the mask alive when a preset scope
+   * outlives the agent that first needed it.
+   *
+   * The key is derived from the scope's identity, never from an agent id: one preset
+   * scope may serve many agents, and it must be mounted exactly once.
+   */
+  function mountPresetScope(scopeCtx, agent, agentId, scopeId) {
+    mountScope(
+      `preset:${scopeId}`,
+      { ctx: scopeCtx, agent, agentId },
+      (ctx, plugin) => ctx.plugin(plugin)
+    )
+  }
+
+  /** Re-read the policy for every mounted scope. */
   function syncAll() {
     if (!live) return
-    // One registry read for the whole pass, not one per agent: the global name set
-    // is the same question for all of them.
-    const known = knownGlobalNames()
-    if (known === undefined) return
+    // One visibility read per agent, not one per scope: the maskable set is a
+    // question about what one agent can call, and every scope serving that agent
+    // gets the same answer.
+    const views = new Map()
     for (const entry of entries.values()) {
+      const agentId = entry.agentId
+      if (agentId === undefined) continue
+      if (!views.has(agentId)) {
+        const agent = agentsRef?.get?.(agentId)
+        views.set(agentId, agent === undefined ? undefined : visibleNamesOf(agent))
+      }
       try {
-        entry.holder.sync(known)
+        entry.holder.sync(agentId, views.get(agentId))
       } catch {
         // A throwing scope must not stop the other agents from being updated.
       }
@@ -521,6 +583,23 @@ function createRestrictor(scope) {
    */
   function mountAll(list) {
     for (const agent of list ?? []) mount(agent)
+  }
+
+  /**
+   * Mount one agent's restriction on its own scope and every scope above it.
+   *
+   * The agent's own scope masks what it inherits; the scopes ABOVE it hold the
+   * registrations themselves (a preset's tool rows), and those are only maskable
+   * from their own layer. Walking the chain is how this works without knowing what
+   * a preset is.
+   */
+  function mountEverywhere(agent) {
+    const id = agent?.id
+    if (typeof id !== 'string') return
+    mount(agent)
+    for (const scope of scopesOf(agent).slice(1)) {
+      mountPresetScope(scope.ctx, agent, id, scope.id)
+    }
   }
 
   /**
@@ -543,7 +622,7 @@ function createRestrictor(scope) {
 
   /** Forget one agent. The restriction itself was owned by its scope. */
   function release(id) {
-    entries.delete(id)
+    entries.delete(`agent:${id}`)
   }
 
   function dispose() {
@@ -563,6 +642,8 @@ function createRestrictor(scope) {
   return {
     mount,
     mountAll,
+    mountEverywhere,
+    mountPresetScope,
     syncAll,
     scheduleSync,
     release,
@@ -860,6 +941,49 @@ function detectParent(agents, child) {
 }
 
 /**
+ * The scopes a tool registration can live in, above and including one agent.
+ *
+ * A tool is visible to an agent when it sits in the global layer or in ANY layer on
+ * the agent's scope chain, and `restrict()` masks exactly those inherited
+ * contributions. So the set of scopes worth mounting is the agent's own scope plus
+ * every scope above it — which is where a PRESET's tool rows live
+ * (`tool-bash`, `tool-fs`, … are registered by the preset's plugin tree, not by the
+ * host composition).
+ *
+ * The chain is walked through Cordis's own links, so nothing here needs to know what
+ * a preset is or how it is mounted: whatever scope handed the agent its tools is
+ * found by the same walk. Two spellings are tried because the published shape only
+ * guarantees one of them: `ctx.fiber.parent` is the documented parent CONTEXT, while
+ * a context's `parent` is a plain field on some fiber shapes. Absence of both is
+ * ordinary — the guard still enforces, and only hiding degrades.
+ * @param agent - the live agent.
+ * @returns `{ ctx, id }[]`, nearest first; empty when the chain is not walkable.
+ */
+function scopesOf(agent) {
+  const scopes = []
+  const seen = new Set()
+  for (let ctx = agent?.ctx; ctx !== undefined && ctx !== null; ctx = nextScopeOf(ctx)) {
+    if (seen.has(ctx)) break
+    seen.add(ctx)
+    if (typeof ctx.plugin !== 'function') continue
+    // A stable identity for the scope. `fiber.uid` is the natural key when
+    // present; the fiber itself, then the context, are the fallbacks. The set above
+    // keeps the walk finite even if a link points back at a visited scope.
+    const id = ctx.fiber?.uid ?? ctx.fiber ?? ctx
+    scopes.push({ ctx, id: String(id) })
+  }
+  return scopes
+}
+
+/** The enclosing context of one scope, by whichever link this Cordis exposes. */
+function nextScopeOf(ctx) {
+  const parent = ctx?.fiber?.parent ?? ctx?.parent
+  // `fiber.parent` is a CONTEXT on the documented shape; guard against a bare fiber
+  // being handed back by an older one, since only a context can mount a plugin.
+  return parent !== undefined && typeof parent.plugin === 'function' ? parent : undefined
+}
+
+/**
  * Services required before `apply` may run.
  *
  * `tools` is a hard dependency: the guard IS the feature, so a deployment without
@@ -873,11 +997,16 @@ export const inject = ['tools']
 
 export function apply(ctx) {
   // Hiding needs `tools` (restrict/schemas) and each agent's scope; the controller
-  // takes the plugin's own context so it can read the GLOBAL schema view.
-  const restrictor = createRestrictor(ctx)
+  // takes the plugin's own context so it can read each agent's schema view.
+  const restrictor = createRestrictor(ctx, ctx.get('agents'))
   ctx.effect(() => () => restrictor.dispose(), 'tools-panel: restriction scopes')
 
   ctx.effect(() => ctx.tools.guard(makeGuard(policies, parents)), 'tools-panel: live guard')
+
+  // Mount on the agent's own scope AND on the scopes above it: a preset's tool rows
+  // are inherited from there, and only a restriction registered on the scope that
+  // HOLDS the tool can mask it.
+  const mountWithAncestors = (agent) => restrictor.mountEverywhere(agent)
 
   // Record the delegation tree and mount one restriction per live agent. Both
   // listeners are registered through the same optional-service probe, so a
@@ -890,7 +1019,7 @@ export function apply(ctx) {
         if (parentId !== undefined) parents.set(agent.id, parentId)
         // Mount at creation so a switch set BEFORE the child existed already covers
         // it; the lazy walk decides what that switch means for this child.
-        restrictor.mount(agent)
+        mountWithAncestors(agent)
       }),
       'tools-panel: delegation tree'
     )
@@ -906,7 +1035,7 @@ export function apply(ctx) {
       }),
       'tools-panel: tree cleanup'
     )
-    restrictor.mountAll(agents.list())
+    for (const agent of agents.list()) mountWithAncestors(agent)
   }
 
   // A tool that appears after the switch was set (an MCP server connecting) must be
@@ -942,6 +1071,7 @@ export {
   policies,
   policyFor,
   saveGroups,
+  scopesOf,
   setDeny,
   snapshot,
   toolsForSession
