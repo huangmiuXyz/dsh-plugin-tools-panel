@@ -74,7 +74,7 @@
  *   one conversation. The deny list stays per-session and in memory.
  */
 
-import { accessSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -489,69 +489,6 @@ function truncateText(value, max) {
   return text.length > max
     ? { text: `${text.slice(0, max - 1)}…`, truncated: true }
     : { text, truncated: false }
-}
-
-/**
- * Add or replace `disable-model-invocation` in a skill's YAML frontmatter.
- *
- * Deliberately NOT a YAML round-trip: a skill file is hand-written prose plus a
- * small frontmatter block, and re-serializing it would reformat the user's file
- * (comments, quoting, key order). This edits exactly one top-level key, keeps the
- * document's line endings and any BOM, and refuses a file without a closed block
- * rather than guessing.
- * @param text - the file's full text.
- * @param enabled - whether the model should see the skill (true = visible).
- * @returns the new text, or undefined when the frontmatter is unusable.
- */
-function patchSkillFrontmatter(text, enabled) {
-  // The KEY is the negation: hiding a skill means writing `disable-model-invocation: true`.
-  const value = enabled ? 'false' : 'true'
-  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : ''
-  const body = bom.length > 0 ? text.slice(1) : text
-  const newline = body.includes('\r\n') ? '\r\n' : '\n'
-  const lines = body.split(/\r?\n/)
-  if (lines.length < 3 || lines[0].trim() !== '---') return undefined
-  let end = -1
-  for (let index = 1; index < lines.length; index += 1) {
-    if (lines[index].trim() === '---') {
-      end = index
-      break
-    }
-  }
-  if (end < 0) return undefined
-  const key = /^disable-model-invocation[ \t]*:/
-  let found = -1
-  for (let index = 1; index < end; index += 1) {
-    if (key.test(lines[index])) {
-      found = index
-      break
-    }
-  }
-  if (found >= 0) {
-    lines[found] = lines[found].replace(
-      /^(disable-model-invocation[ \t]*:)[ \t]*.*$/,
-      `$1 ${value}`
-    )
-  } else {
-    lines.splice(end, 0, `disable-model-invocation: ${value}`)
-  }
-  return `${bom}${lines.join(newline)}`
-}
-
-/** Write a file through a same-directory temp + rename, so a reader never sees a half file. */
-function writeFileAtomic(path, content) {
-  const temp = `${path}.tmp-${process.pid}-${Date.now()}`
-  try {
-    writeFileSync(temp, content, 'utf8')
-    renameSync(temp, path)
-  } catch (error) {
-    try {
-      unlinkSync(temp)
-    } catch {
-      /* the temp file was never created, or is already gone */
-    }
-    throw error
-  }
 }
 
 /**
@@ -1057,16 +994,12 @@ async function cwdFor(host, agent, signal) {
 /**
  * One skill as the tab draws it.
  *
- * `mode` says how a switch would take effect: `file` when the skill has a writable
- * SKILL.md (edit its frontmatter), `shadow` when it is registered at runtime and
- * only a same-name empty registration can hide it. Every row is switchable now;
- * before this, runtime skills — the built-in ones and plugin-injected ones — showed
- * a dead switch with a reason.
+ * Every row is switchable: the switch is a scoped runtime shadow, which works the
+ * same whether or not the skill also has a file. `path` stays for display only.
  */
 function skillRow(skill) {
   const description = typeof skill?.description === 'string' ? skill.description : ''
   const path = typeof skill?.path === 'string' && skill.path.length > 0 ? skill.path : undefined
-  const writable = path !== undefined && isWritableFile(path)
   return {
     name: String(skill?.name ?? ''),
     description: description.length > MAX_SKILL_DESCRIPTION
@@ -1075,21 +1008,9 @@ function skillRow(skill) {
     provider: typeof skill?.provider === 'string' ? skill.provider : undefined,
     source: typeof skill?.source === 'string' ? skill.source : undefined,
     path,
-    mode: writable ? 'file' : 'shadow',
     modelInvocable: skill?.invocation?.modelInvocable !== false,
     userInvocable: skill?.invocation?.userInvocable !== false,
     toggleable: true
-  }
-}
-
-/** Whether a skill's file can actually be rewritten; a bundled/asar path cannot. */
-function isWritableFile(path) {
-  try {
-    if (!statSync(path).isFile()) return false
-    accessSync(path, 2)
-    return true
-  } catch {
-    return false
   }
 }
 
@@ -1165,16 +1086,15 @@ async function refreshSkillCatalog(host) {
 /**
  * Flip one skill off or on.
  *
- * Two mechanisms, chosen by the registry's own row rather than by anything the
- * request says:
- *   - a writable SKILL.md is edited in place (`mode: 'file'`), which is durable,
- *     visible in git, and independent of this plugin;
- *   - a runtime skill (plugin-injected or built-in, no file) is shadowed by an
- *     empty same-name registration in each agent's layer (`mode: 'shadow'`), with
- *     both invocation flags false, so neither the model catalog nor `/name` can
- *     reach it. The name is persisted and rolled back if the re-read disagrees.
+ * ONE mechanism for every skill: a same-name runtime registration in each agent's
+ * layer with BOTH invocation flags false. The nearest layer wins a duplicate, so the
+ * empty shadow hides the real skill from the model catalog (`modelInvocable`) and
+ * from `/name` (`userInvocable`) — neither path can reach it — without editing a
+ * file or any plugin. That is what makes plugin-injected and bundled skills
+ * switchable at all, and it keeps file-backed skills on the same footing instead of
+ * rewriting their frontmatter.
  *
- * The path always comes from the registry's summary, never from the request body.
+ * The disabled set is persisted and rolled back if the re-read disagrees.
  */
 async function toggleSkill(host, sessionId, name, enabled, signal) {
   const listed = await skillsState(host, sessionId, signal)
@@ -1183,51 +1103,6 @@ async function toggleSkill(host, sessionId, name, enabled, signal) {
   }
   const row = listed.skills.find((skill) => skill.name === name)
   if (row === undefined) throw new PanelError(404, `unknown skill "${name}"`)
-
-  if (row.mode === 'file' && typeof row.path === 'string') {
-    const path = row.path
-    let before
-    let first
-    try {
-      before = readFileSync(path, 'utf8')
-      first = statSync(path)
-    } catch (error) {
-      throw new PanelError(409, `could not read ${path}: ${error?.message ?? error}`)
-    }
-    const next = patchSkillFrontmatter(before, enabled)
-    if (next === undefined) {
-      throw new PanelError(409, 'the skill file has no closed frontmatter block to edit')
-    }
-    const again = statSync(path)
-    if (again.mtimeMs !== first.mtimeMs || again.size !== first.size) {
-      throw new PanelError(409, 'the skill file changed while it was being edited; retry')
-    }
-    try {
-      writeFileAtomic(path, next)
-    } catch (error) {
-      throw new PanelError(500, `could not write ${path}: ${error?.message ?? error}`)
-    }
-    // A shadow left over from an earlier install would keep the file switch from
-    // meaning anything; the file is the truth for this skill, so drop it — but only
-    // once the re-read below confirms the file edit actually took effect.
-    await refreshSkillCatalog(host)
-    let after
-    try {
-      after = await skillsState(host, sessionId, signal)
-    } catch {
-      after = undefined
-    }
-    const applied = after?.skills?.find((skill) => skill.name === name)?.modelInvocable === enabled
-    if (applied && skillDisabled.delete(name)) {
-      saveSkillDisabled()
-      try {
-        host.skillShadows?.syncAll?.()
-      } catch {
-        /* the scopes are mounted elsewhere; the file edit already applied */
-      }
-    }
-    return { state: after ?? listed, applied }
-  }
 
   const previous = new Set(skillDisabled)
   if (enabled) skillDisabled.delete(name)
@@ -2186,7 +2061,6 @@ export {
   normalizePromptNames,
   ownerOf,
   parents,
-  patchSkillFrontmatter,
   policies,
   policyFor,
   promptsFile,

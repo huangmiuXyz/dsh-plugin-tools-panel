@@ -97,7 +97,6 @@ window.__ModuleLoader__.load({
       skillsUnavailable: '当前部署没有技能服务，无法在这里管理技能。',
       skillsNoAgent: '会话尚未启动，无法读取技能列表。',
       skillsIncomplete: '技能目录没有读全，列表可能缺少条目。',
-      skillsNoFile: '该技能由插件动态提供，没有可编辑的文件',
       skillsUserOff: '该技能本来就不能手动调用，关闭后完全不可用。',
       skillsWarning: '文件已写入，但技能目录还没刷新；稍后刷新或再试一次。',
       // ---- prompts
@@ -176,7 +175,6 @@ window.__ModuleLoader__.load({
       skillsUnavailable: 'This deployment has no skills service, so skills cannot be managed here.',
       skillsNoAgent: 'This session is not running, so its skills cannot be read.',
       skillsIncomplete: 'The skill catalog was read incompletely; rows may be missing.',
-      skillsNoFile: 'This skill is provided at runtime and has no file to edit',
       skillsUserOff: 'This skill is not user-invocable, so turning it off makes it fully unavailable.',
       skillsWarning: 'The file was written, but the catalog has not refreshed yet; refresh or retry shortly.',
       promptsSearch: 'Search prompt sections',
@@ -2336,7 +2334,7 @@ window.__ModuleLoader__.load({
         }, [active, load])
 
         const toggle = useCallback((row) => {
-          if (activeSession === undefined || row.toggleable !== true) return
+          if (activeSession === undefined) return
           const next = !row.modelInvocable
           const previous = dataRef.current
           setSaving((prev) => new Set(prev).add(row.name))
@@ -2499,8 +2497,8 @@ window.__ModuleLoader__.load({
                                   className: 'dsh-tools-panel-tool-switch',
                                   'aria-checked': row.modelInvocable,
                                   'aria-label': row.name,
-                                  disabled: row.toggleable !== true || busy,
-                                  title: row.toggleable !== true ? t('skillsNoFile') : row.name,
+                                  disabled: busy,
+                                  title: row.name,
                                   onClick: () => toggle(row)
                                 },
                                 h('span', { className: 'dsh-tools-panel-tool-thumb', 'aria-hidden': 'true' })

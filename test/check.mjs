@@ -112,7 +112,6 @@ const {
   loadPrompts,
   normalizeGroups,
   normalizePromptNames,
-  patchSkillFrontmatter,
   promptsFile,
   promptsState,
   replacePromptDisabled,
@@ -1138,50 +1137,6 @@ try {
 
 // --- 4b. skills and prompt sections (protocol 8) ------------------------------
 {
-  // --- the frontmatter patcher: one top-level key, nothing else touched
-  const plain = '---\nname: demo\ndescription: A demo.\n---\n\n# Demo\n'
-  check(
-    'skills: adds the key when absent',
-    patchSkillFrontmatter(plain, false) ===
-      '---\nname: demo\ndescription: A demo.\ndisable-model-invocation: true\n---\n\n# Demo\n',
-    JSON.stringify(patchSkillFrontmatter(plain, false))
-  )
-  check(
-    'skills: enabling writes the negation as false',
-    patchSkillFrontmatter('---\nname: demo\ndisable-model-invocation: true\n---\nbody\n', true).includes(
-      'disable-model-invocation: false'
-    )
-  )
-  check(
-    'skills: disabling writes the negation as true',
-    patchSkillFrontmatter('---\nname: demo\ndisable-model-invocation: false\n---\n', false).includes(
-      'disable-model-invocation: true'
-    )
-  )
-  check(
-    'skills: preserves CRLF',
-    patchSkillFrontmatter('---\r\nname: demo\r\n---\r\nbody\r\n', false).includes(
-      '\r\ndisable-model-invocation: true\r\n'
-    )
-  )
-  check(
-    'skills: preserves a BOM',
-    patchSkillFrontmatter('\uFEFF---\nname: demo\n---\nbody\n', false).startsWith('\uFEFF---')
-  )
-  check('skills: refuses an unclosed block', patchSkillFrontmatter('---\nname: demo\nbody\n', false) === undefined)
-  check('skills: refuses a file with no block', patchSkillFrontmatter('# Demo\n', false) === undefined)
-  check(
-    'skills: does not rewrite an indented lookalike',
-    patchSkillFrontmatter('---\nname: demo\nmeta:\n  disable-model-invocation: false\n---\n', false) ===
-      '---\nname: demo\nmeta:\n  disable-model-invocation: false\ndisable-model-invocation: true\n---\n',
-    JSON.stringify(patchSkillFrontmatter('---\nname: demo\nmeta:\n  disable-model-invocation: false\n---\n', false))
-  )
-  check(
-    'skills: only the targeted key changes',
-    patchSkillFrontmatter('---\nname: demo\ndisable-model-invocation: true\nother: keep\n---\n', true) ===
-      '---\nname: demo\ndisable-model-invocation: false\nother: keep\n---\n'
-  )
-
   // --- the persisted disabled-section set
   check('prompts: normalizes a corrupt list', JSON.stringify(normalizePromptNames([1, ' a ', 'a', '', null])) === '["a"]')
   check(
@@ -1276,8 +1231,8 @@ try {
     check('skills route: one row per skill', listed.state.skills.length === 2, String(listed.state.skills.length))
     const alphaRow = listed.state.skills.find((row) => row.name === 'alpha')
     const virtualRow = listed.state.skills.find((row) => row.name === 'virtual')
-    check('skills route: a file-backed skill switches through its file', alphaRow?.toggleable === true && alphaRow?.mode === 'file')
-    check('skills route: a runtime skill is switchable too', virtualRow?.toggleable === true && virtualRow?.mode === 'shadow')
+    check('skills route: a file-backed skill is switchable', alphaRow?.toggleable === true)
+    check('skills route: a runtime skill is switchable too', virtualRow?.toggleable === true)
     check('skills route: requires a session', (await fetch(`${base2}${SKILLS_ROUTE}`)).status === 400)
     check('skills route: a write requires the header', (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: false }, false)).status === 403)
     check('skills route: a write needs a boolean', (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: 'no' })).status === 400)
@@ -1286,14 +1241,20 @@ try {
     const off = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: false })).json()
     check('skills route: the switch reports it took effect', off.ok === true && off.applied === true, JSON.stringify(off.applied))
     check('skills route: the state says the skill is hidden', off.state.skills.find((row) => row.name === 'alpha')?.modelInvocable === false)
-    check('skills route: the file now hides it from the model', fileEnabled(alphaPath) === false)
     check(
-      'skills route: the frontmatter carries the key',
-      fs.readFileSync(alphaPath, 'utf8').includes('disable-model-invocation: true')
+      'skills route: both invocation paths are off',
+      off.state.skills.find((row) => row.name === 'alpha')?.userInvocable === false
     )
+    check('skills route: the skill file is not touched', fileEnabled(alphaPath) === true)
+    check(
+      'skills route: the file gained no frontmatter key',
+      !fs.readFileSync(alphaPath, 'utf8').includes('disable-model-invocation')
+    )
+    check('skills route: the shadow is mounted for the file-backed skill', host.extras.skills.__shadowCount('root-a') === 1)
 
     const on = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: true })).json()
     check('skills route: the switch can be turned back on', on.applied === true && fileEnabled(alphaPath) === true)
+    check('skills route: enabling removes the shadow', host.extras.skills.__shadowCount('root-a') === 0)
 
     // A runtime skill has no file, so the switch is a scoped shadow with both
     // invocation paths off. This is the switch the panel used to refuse.
@@ -2065,8 +2026,8 @@ try {
       available: true,
       complete: true,
       skills: [
-        { name: 'alpha', description: 'An alpha skill.', provider: 'fs', source: 'project', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true, mode: 'file' },
-        { name: 'virtual', description: 'Registered at runtime.', provider: 'plugin', source: 'plugin', modelInvocable: true, userInvocable: true, toggleable: true, mode: 'shadow' }
+        { name: 'alpha', description: 'An alpha skill.', provider: 'fs', source: 'project', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true },
+        { name: 'virtual', description: 'Registered at runtime.', provider: 'plugin', source: 'plugin', modelInvocable: true, userInvocable: true, toggleable: true }
       ]
     }
     const originalFetch = globalThis.fetch
