@@ -147,6 +147,8 @@ window.__ModuleLoader__.load({
       pluginsTitle: '已安装插件',
       pluginsLoading: '正在读取插件…',
       pluginsEmpty: '这个 profile 没有安装插件。',
+      pluginsSearch: '搜索插件',
+      pluginsNoMatch: '没有匹配的插件',
       pluginsFailed: '读取失败：',
       pluginsUnavailable: '本部署没有可管理的 profile，无法启停插件。',
       pluginsManagementRequired: '宿主基础设施，不可开关',
@@ -221,6 +223,8 @@ window.__ModuleLoader__.load({
       pluginsTitle: 'Installed plugins',
       pluginsLoading: 'Reading plugins…',
       pluginsEmpty: 'This profile has no plugins installed.',
+      pluginsSearch: 'Search plugins',
+      pluginsNoMatch: 'No matching plugins',
       pluginsFailed: 'Could not read plugins: ',
       pluginsUnavailable: 'This deployment has no manageable profile, so plugins cannot be switched.',
       pluginsManagementRequired: 'Host infrastructure — cannot be switched',
@@ -2068,6 +2072,7 @@ window.__ModuleLoader__.load({
       const [pending, setPending] = useState(undefined)
       // The manager's verdict on the last completed switch, kept until reopen.
       const [notice, setNotice] = useState(undefined)
+      const [query, setQuery] = useState('')
 
       const load = useCallback(() => {
         setStatus('loading')
@@ -2191,10 +2196,29 @@ window.__ModuleLoader__.load({
         }
       }, [ctx, active, load])
 
+      const visible = useMemo(() => {
+        const needle = query.trim().toLowerCase()
+        if (needle.length === 0) return rows
+        return rows.filter((row) =>
+          row.name.toLowerCase().includes(needle) ||
+          String(row.title ?? '').toLowerCase().includes(needle)
+        )
+      }, [rows, query])
+
       // Embedded body: the panel supplies the shell, the tab bar and the trigger.
       return h(
         'div',
         { className: 'dsh-tools-panel-tabBody', role: 'tabpanel' },
+                status === 'ready' && rows.length > 0
+                  ? h('input', {
+                      className: 'dsh-tools-panel-tool-search',
+                      type: 'search',
+                      value: query,
+                      placeholder: t('pluginsSearch'),
+                      'aria-label': t('pluginsSearch'),
+                      onChange: (event) => setQuery(event.target.value)
+                    })
+                  : null,
                 status === 'loading' || status === undefined
                   ? h('div', { className: 'dsh-tools-panel-plugin-status' }, h('span', { className: 'dsh-tools-panel-plugin-note' }, t('pluginsLoading')))
                   : status === 'unavailable'
@@ -2207,20 +2231,22 @@ window.__ModuleLoader__.load({
                         )
                       : rows.length === 0
                         ? h('div', { className: 'dsh-tools-panel-plugin-status' }, h('span', { className: 'dsh-tools-panel-plugin-note' }, t('pluginsEmpty')))
-                        : h(
-                            'div',
-                            { className: 'dsh-tools-panel-plugin-list' },
-                            rows.map((row) =>
-                              h(PluginRow, {
-                                key: row.name,
-                                row,
-                                busy: pending === row.name,
-                                onToggle,
-                                onPin,
-                                t
-                              })
-                            )
-                          ),
+                        : visible.length === 0
+                          ? h('div', { className: 'dsh-tools-panel-plugin-status' }, h('span', { className: 'dsh-tools-panel-plugin-note' }, t('pluginsNoMatch')))
+                          : h(
+                              'div',
+                              { className: 'dsh-tools-panel-plugin-list' },
+                              visible.map((row) =>
+                                h(PluginRow, {
+                                  key: row.name,
+                                  row,
+                                  busy: pending === row.name,
+                                  onToggle,
+                                  onPin,
+                                  t
+                                })
+                              )
+                            ),
                 status === 'error'
                   ? h('button', { type: 'button', className: 'dsh-tools-panel-plugin-retry', onClick: load }, t('retry'))
                   : null,

@@ -1678,6 +1678,8 @@ try {
     retry: 'r',
     pluginsLoading: 'pl',
     pluginsEmpty: 'pe',
+    pluginsSearch: '搜索插件',
+    pluginsNoMatch: '没有匹配的插件',
     pluginsUnavailable: 'pu',
     pluginsManagementRequired: 'M',
     pluginsUnaddressable: 'A',
@@ -1902,6 +1904,26 @@ try {
     const shown = textOf(currentTree).join('|')
     check('plugin tab: infrastructure is not offered', !shown.includes('dsh-api-gateway'), shown.slice(0, 120))
     check('plugin tab: a non-plugin package is not offered', !shown.includes('some-library'), shown.slice(0, 120))
+
+    // The plugin list is searchable by package name and by localized title.
+    const pluginSearch = byClass(currentTree, 'dsh-tools-panel-tool-search').find(
+      (node) => node.props.placeholder === '搜索插件'
+    )
+    check('plugin tab: offers a search box', pluginSearch !== undefined)
+    pluginSearch.props.onChange({ target: { value: 'sidebar' } })
+    await pump(view)
+    check(
+      'plugin tab: searching narrows the list',
+      byClass(currentTree, 'dsh-tools-panel-plugin-switch').length === 1,
+      String(byClass(currentTree, 'dsh-tools-panel-plugin-switch').length)
+    )
+    check(
+      'plugin tab: the filtered-out row is gone',
+      !textOf(currentTree).some((text) => text.includes('dsh-client-auto-continue'))
+    )
+    pluginSearch.props.onChange({ target: { value: 'zzz' } })
+    await pump(view)
+    check('plugin tab: no match is stated', textOf(currentTree).some((text) => text.includes('没有匹配的插件')))
   }
 
   // Uninstalled runtime shells must never be offered: composing one kills the Host.
