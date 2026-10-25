@@ -74,12 +74,16 @@
  *   one conversation. The deny list stays per-session and in memory.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 /** Control route the client half reads and writes. Namespaced so it cannot collide. */
 const ROUTE = '/dsh-plugin-tools-panel/state'
+/** The skills tab's route: list the session's skills, toggle one model invocation. */
+const SKILLS_ROUTE = '/dsh-plugin-tools-panel/skills'
+/** The prompt tab's route: list the assembled system prompt sections, toggle one. */
+const PROMPTS_ROUTE = '/dsh-plugin-tools-panel/prompts'
 /**
  * Header the client must send on a state change. A cross-origin page can POST a
  * "simple" request without a preflight, so requiring a custom header is what
@@ -106,9 +110,12 @@ const HEADER = 'x-dsh-plugin-tools-panel'
  * HISTORY: 5 was the four-group revision (read/write/shell/agent). 6 replaced the
  * groups with a per-tool deny list, so the whole state shape changed. 7 added
  * user-defined GROUPS (a persisted, presentation-only grouping of tool names), so
- * the snapshot grew a `groups` field and a POST may carry one.
+ * the snapshot grew a `groups` field and a POST may carry one. 8 added the SKILLS
+ * and PROMPTS routes: a skill toggle rewrites `disable-model-invocation` in the
+ * skill file, and a prompt toggle persists a disabled section name that is
+ * shadowed by an empty same-name section in every live agent's scope.
  */
-const PROTOCOL = 7
+const PROTOCOL = 8
 
 /**
  * Where the user's own group definitions live.
@@ -196,6 +203,185 @@ function normalizeGroups(value) {
     groups.push({ id, name, members })
   }
   return groups
+}
+
+// --- skills and prompt sections (protocol 8) ----------------------------------
+
+/** How much of one prompt section the browser receives for its preview. */
+const MAX_SECTION_TEXT = 4000
+/** How much of one skill description the browser receives. */
+const MAX_SKILL_DESCRIPTION = 1000
+/** How many disabled section names one profile may hold. */
+const MAX_PROMPTS = 200
+/** Bound on the remembered section texts, so a long-lived process cannot grow forever. */
+const MAX_SECTION_CACHE = 500
+
+/**
+ * Where the disabled prompt sections live.
+ *
+ * Same shape and same reasoning as {@link groupsFile}: the switch is the user's
+ * configuration of their own prompt, not a restriction on one conversation, so it
+ * is global and durable. A section name is the whole identity — there is no id to
+ * keep stable across a plugin reload.
+ */
+function promptsFile() {
+  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'dsh-plugin-tools-panel', 'prompts.json')
+}
+
+/**
+ * Validate and normalize a disabled-section list.
+ *
+ * Bounded like every other payload that can arrive over the route. Invalid entries
+ * are dropped rather than rejected wholesale: a corrupt file must degrade to "no
+ * sections disabled", never take the plugin down.
+ * @returns a deduplicated array of section names.
+ */
+function normalizePromptNames(value) {
+  if (!Array.isArray(value)) return []
+  const names = []
+  const seen = new Set()
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const name = entry.trim()
+    if (name.length === 0 || name.length > MAX_NAME || seen.has(name)) continue
+    seen.add(name)
+    names.push(name)
+    if (names.length >= MAX_PROMPTS) break
+  }
+  return names
+}
+
+/** Read the saved disabled-section names; a missing or corrupt file means none. */
+function loadPrompts() {
+  try {
+    const parsed = JSON.parse(readFileSync(promptsFile(), 'utf8'))
+    return normalizePromptNames(parsed?.disabled)
+  } catch {
+    return []
+  }
+}
+
+/** Persist the disabled-section names atomically enough that a crash cannot truncate. */
+function savePrompts(names) {
+  try {
+    const file = promptsFile()
+    mkdirSync(dirname(file), { recursive: true })
+    const temp = `${file}.tmp-${process.pid}`
+    writeFileSync(temp, `${JSON.stringify({ version: 1, disabled: [...names] }, null, 2)}\n`, 'utf8')
+    renameSync(temp, file)
+  } catch {
+    // A read-only home leaves the switch in memory for this process: degraded, but
+    // the panel keeps working, which is the part that matters.
+  }
+}
+
+/** The live disabled set, loaded once at module load and written on every change. */
+let promptDisabled = new Set(loadPrompts())
+
+/** The last non-empty text seen for one section name, so a disabled row still previews. */
+const lastSectionText = new Map()
+
+/** Remember one section's text for the disabled-row preview. */
+function noteSectionText(name, text) {
+  if (text.length === 0) return
+  if (!lastSectionText.has(name) && lastSectionText.size >= MAX_SECTION_CACHE) return
+  lastSectionText.set(name, text)
+}
+
+/** A bounded preview plus the fact that it was cut. */
+function truncateText(value, max) {
+  const text = String(value ?? '')
+  return text.length > max
+    ? { text: `${text.slice(0, max - 1)}…`, truncated: true }
+    : { text, truncated: false }
+}
+
+/**
+ * Add or replace `disable-model-invocation` in a skill's YAML frontmatter.
+ *
+ * Deliberately NOT a YAML round-trip: a skill file is hand-written prose plus a
+ * small frontmatter block, and re-serializing it would reformat the user's file
+ * (comments, quoting, key order). This edits exactly one top-level key, keeps the
+ * document's line endings and any BOM, and refuses a file without a closed block
+ * rather than guessing.
+ * @param text - the file's full text.
+ * @param enabled - whether the model should see the skill (true = visible).
+ * @returns the new text, or undefined when the frontmatter is unusable.
+ */
+function patchSkillFrontmatter(text, enabled) {
+  // The KEY is the negation: hiding a skill means writing `disable-model-invocation: true`.
+  const value = enabled ? 'false' : 'true'
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : ''
+  const body = bom.length > 0 ? text.slice(1) : text
+  const newline = body.includes('\r\n') ? '\r\n' : '\n'
+  const lines = body.split(/\r?\n/)
+  if (lines.length < 3 || lines[0].trim() !== '---') return undefined
+  let end = -1
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === '---') {
+      end = index
+      break
+    }
+  }
+  if (end < 0) return undefined
+  const key = /^disable-model-invocation[ \t]*:/
+  let found = -1
+  for (let index = 1; index < end; index += 1) {
+    if (key.test(lines[index])) {
+      found = index
+      break
+    }
+  }
+  if (found >= 0) {
+    lines[found] = lines[found].replace(
+      /^(disable-model-invocation[ \t]*:)[ \t]*.*$/,
+      `$1 ${value}`
+    )
+  } else {
+    lines.splice(end, 0, `disable-model-invocation: ${value}`)
+  }
+  return `${bom}${lines.join(newline)}`
+}
+
+/** Write a file through a same-directory temp + rename, so a reader never sees a half file. */
+function writeFileAtomic(path, content) {
+  const temp = `${path}.tmp-${process.pid}-${Date.now()}`
+  try {
+    writeFileSync(temp, content, 'utf8')
+    renameSync(temp, path)
+  } catch (error) {
+    try {
+      unlinkSync(temp)
+    } catch {
+      /* the temp file was never created, or is already gone */
+    }
+    throw error
+  }
+}
+
+/**
+ * A refusal this route can explain to the browser.
+ *
+ * `status` is carried rather than inferred so "unknown skill" (404), "no file to
+ * edit" (409) and "the service is missing" (409) are distinguishable on the wire —
+ * the client uses that difference to decide between a retry and a stated fact.
+ */
+class PanelError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+/** One request's abort signal, so an assembly cannot hang the route forever. */
+function requestSignal() {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error('timed out')), 5000)
+  timer?.unref?.()
+  return { signal: controller.signal, done: () => clearTimeout(timer) }
 }
 
 /**
@@ -653,6 +839,459 @@ function createRestrictor(scope, agents) {
   }
 }
 
+// --- skills (protocol 8) ------------------------------------------------------
+
+/** The live agent for one session, or undefined when the session is not running. */
+function agentFor(host, sessionId) {
+  try {
+    return host?.agents?.get?.(sessionId)
+  } catch {
+    return undefined
+  }
+}
+
+/** The working directory a skill lookup needs; falls back to the session header. */
+async function cwdFor(host, agent, signal) {
+  try {
+    const cwd = await host?.workingDirectory?.ensure?.(agent, signal)
+    if (typeof cwd === 'string' && cwd.length > 0) return cwd
+  } catch {
+    /* the service is absent or refused; the header below is the fallback */
+  }
+  const fallback = agent?.session?.header?.cwd
+  return typeof fallback === 'string' && fallback.length > 0 ? fallback : undefined
+}
+
+/** One skill as the tab draws it. `toggleable` is "there is a file to edit". */
+function skillRow(skill) {
+  const description = typeof skill?.description === 'string' ? skill.description : ''
+  const path = typeof skill?.path === 'string' && skill.path.length > 0 ? skill.path : undefined
+  return {
+    name: String(skill?.name ?? ''),
+    description: description.length > MAX_SKILL_DESCRIPTION
+      ? `${description.slice(0, MAX_SKILL_DESCRIPTION - 1)}…`
+      : description,
+    provider: typeof skill?.provider === 'string' ? skill.provider : undefined,
+    source: typeof skill?.source === 'string' ? skill.source : undefined,
+    path,
+    modelInvocable: skill?.invocation?.modelInvocable !== false,
+    userInvocable: skill?.invocation?.userInvocable !== false,
+    toggleable: path !== undefined,
+    ...(path === undefined ? { reason: 'no-file' } : {})
+  }
+}
+
+/** List one session's skills. A missing service is a stated fact, not a throw. */
+async function skillsState(host, sessionId, signal) {
+  const skills = host?.skills
+  const base = { protocol: PROTOCOL, sessionId }
+  if (skills === undefined || typeof skills.snapshot !== 'function') {
+    return { ...base, available: false, reason: 'no-skills-service', skills: [] }
+  }
+  const agent = agentFor(host, sessionId)
+  if (agent === undefined) {
+    return { ...base, available: true, reason: 'no-live-agent', skills: [], complete: false }
+  }
+  const cwd = await cwdFor(host, agent, signal)
+  const snapshot = await skills.snapshot({
+    ...(cwd === undefined ? {} : { cwd }),
+    signal,
+    scope: agent
+  })
+  const rows = Array.isArray(snapshot?.skills)
+    ? snapshot.skills.map(skillRow).filter((row) => row.name.length > 0)
+    : []
+  rows.sort((left, right) => left.name.localeCompare(right.name))
+  return { ...base, available: true, complete: snapshot?.complete !== false, skills: rows }
+}
+
+let skillRefreshSeq = 0
+
+/**
+ * Force the skill registry to re-collect after this plugin rewrote a skill file.
+ *
+ * A first-party `write`/`edit` tool emits `fs/observed`, which is what normally
+ * invalidates the filesystem provider; this panel is not a tool, so it has no such
+ * event to emit and the file watcher's own settling delay would make the switch
+ * look stuck. Registering and disposing an empty provider is a public, honest
+ * mutation of the registry's layers — it clears the collect cache, and the
+ * filesystem provider re-discovers its roots on the next `snapshot()`.
+ */
+async function refreshSkillCatalog(host) {
+  const skills = host?.skills
+  if (skills !== undefined && typeof skills.registerProvider === 'function') {
+    skillRefreshSeq += 1
+    let off
+    try {
+      off = skills.registerProvider(() => ({
+        name: `tools-panel-refresh-${process.pid}-${skillRefreshSeq}`,
+        list: async () => ({ candidates: [], complete: true }),
+        get: async () => undefined
+      }))
+    } catch {
+      off = undefined
+    }
+    if (off !== undefined) {
+      try {
+        off()
+      } catch {
+        /* the layer is already gone */
+      }
+      await Promise.resolve()
+      return
+    }
+  }
+  // No registry control: give the filesystem watcher one settling window instead of
+  // reporting an answer we have not actually observed.
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 250)
+    timer?.unref?.()
+  })
+}
+
+/**
+ * Flip one skill's model visibility by editing its frontmatter.
+ *
+ * The path comes from the registry's own summary, never from the request body: the
+ * route can only touch a file the skill provider already discovered.
+ */
+async function toggleSkill(host, sessionId, name, enabled, signal) {
+  const listed = await skillsState(host, sessionId, signal)
+  if (listed.available !== true) {
+    throw new PanelError(409, 'the skills service is unavailable in this deployment')
+  }
+  const row = listed.skills.find((skill) => skill.name === name)
+  if (row === undefined) throw new PanelError(404, `unknown skill "${name}"`)
+  if (row.toggleable !== true || typeof row.path !== 'string') {
+    throw new PanelError(409, 'this skill is provided at runtime and has no file to edit')
+  }
+  const path = row.path
+  let before
+  let first
+  try {
+    before = readFileSync(path, 'utf8')
+    first = statSync(path)
+  } catch (error) {
+    throw new PanelError(409, `could not read ${path}: ${error?.message ?? error}`)
+  }
+  const next = patchSkillFrontmatter(before, enabled)
+  if (next === undefined) {
+    throw new PanelError(409, 'the skill file has no closed frontmatter block to edit')
+  }
+  const again = statSync(path)
+  if (again.mtimeMs !== first.mtimeMs || again.size !== first.size) {
+    throw new PanelError(409, 'the skill file changed while it was being edited; retry')
+  }
+  try {
+    writeFileAtomic(path, next)
+  } catch (error) {
+    throw new PanelError(500, `could not write ${path}: ${error?.message ?? error}`)
+  }
+  await refreshSkillCatalog(host)
+  let after
+  try {
+    after = await skillsState(host, sessionId, signal)
+  } catch {
+    after = undefined
+  }
+  const applied = after?.skills?.find((skill) => skill.name === name)?.modelInvocable === enabled
+  return { state: after ?? listed, applied }
+}
+
+// --- prompt sections (protocol 8) --------------------------------------------
+
+/**
+ * One assembled section, in the shape the tab draws.
+ *
+ * `liveChars` is the text length in the CURRENT assembly, while `chars` is what the
+ * preview shows (a disabled section still previews its last known text). Keeping
+ * both is what lets the route verify that a shadow really took effect without
+ * mistaking the cached preview for the live prompt.
+ */
+function promptRows(raw) {
+  const live = raw
+    .map((section) => {
+      const name = String(section?.name ?? '')
+      const text = typeof section?.text === 'string' ? section.text : String(section?.text ?? '')
+      return { name, text }
+    })
+    .filter((section) => section.name.length > 0)
+  const sole = live.length === 1
+  const rows = live.map((section) => {
+    const enabled = !promptDisabled.has(section.name)
+    if (enabled && section.text.length > 0) noteSectionText(section.name, section.text)
+    const shown = enabled ? section.text : (lastSectionText.get(section.name) ?? section.text)
+    const cut = truncateText(shown, MAX_SECTION_TEXT)
+    return {
+      name: section.name,
+      text: cut.text,
+      chars: shown.length,
+      truncated: cut.truncated,
+      enabled,
+      present: true,
+      liveChars: section.text.length,
+      // The only section is the whole prompt: switching it off would leave nothing
+      // to send. It can still be switched back ON when it is already off.
+      toggleable: !sole || !enabled,
+      ...(sole && enabled ? { reason: 'sole-section' } : {})
+    }
+  })
+  for (const name of promptDisabled) {
+    if (live.some((section) => section.name === name)) continue
+    const shown = lastSectionText.get(name) ?? ''
+    const cut = truncateText(shown, MAX_SECTION_TEXT)
+    rows.push({
+      name,
+      text: cut.text,
+      chars: shown.length,
+      truncated: cut.truncated,
+      enabled: false,
+      present: false,
+      liveChars: 0,
+      toggleable: true
+    })
+  }
+  return rows
+}
+
+/** Assemble one agent's prompt sections, through the same context shape the loop uses. */
+async function assembleSections(host, agent, signal) {
+  const systemPrompt = host?.systemPrompt
+  if (systemPrompt === undefined || typeof systemPrompt.assemble !== 'function') {
+    throw new PanelError(409, 'the systemPrompt service is unavailable in this deployment')
+  }
+  const assembly = await systemPrompt.assemble({ agent, scope: agent, ...(signal === undefined ? {} : { signal }) })
+  return Array.isArray(assembly?.sections) ? assembly.sections : []
+}
+
+/** The prompt tab's state for one session. */
+async function promptsState(host, sessionId, signal) {
+  const base = {
+    protocol: PROTOCOL,
+    sessionId,
+    disabled: [...promptDisabled].sort(),
+    sections: []
+  }
+  if (host?.systemPrompt === undefined) {
+    return { ...base, available: false, reason: 'no-system-prompt' }
+  }
+  const agent = agentFor(host, sessionId)
+  if (agent === undefined) {
+    return {
+      ...base,
+      available: true,
+      reason: 'no-live-agent',
+      sections: promptRows([])
+    }
+  }
+  let raw
+  try {
+    raw = await assembleSections(host, agent, signal)
+  } catch (error) {
+    if (error instanceof PanelError) {
+      return { ...base, available: false, reason: 'no-system-prompt' }
+    }
+    return {
+      ...base,
+      available: false,
+      reason: 'assemble-failed',
+      error: String(error?.message ?? error)
+    }
+  }
+  return { ...base, available: true, sections: promptRows(raw) }
+}
+
+/** Write one name into the disabled set and re-sync every live agent's shadow. */
+function setPromptDisabled(host, name, enabled) {
+  if (enabled) promptDisabled.delete(name)
+  else promptDisabled.add(name)
+  savePrompts(promptDisabled)
+  host?.prompts?.syncAll?.()
+}
+
+/**
+ * Flip one prompt section off/on, then PROVE the switch took effect.
+ *
+ * An empty same-name section only shadows a section registered in an ancestor
+ * layer; a section the agent itself registered cannot be shadowed, and a section
+ * that was the whole prompt would leave nothing behind. Both are detected from a
+ * fresh assembly and rolled back, because a switch that springs back is exactly
+ * the failure this panel exists to make visible.
+ */
+async function togglePromptSection(host, sessionId, name, enabled, signal) {
+  if (host?.systemPrompt === undefined) {
+    throw new PanelError(409, 'the systemPrompt service is unavailable in this deployment')
+  }
+  const agent = agentFor(host, sessionId)
+  const beforeRaw = agent === undefined ? [] : await assembleSections(host, agent, signal)
+  const before = promptRows(beforeRaw)
+  const beforePresent = before.filter((row) => row.present).length
+  // Disabling a name that is not in the assembly would persist a dead switch, and a
+  // later plugin registering that name would then be off without the user seeing why.
+  if (!enabled && !before.some((row) => row.name === name)) {
+    throw new PanelError(404, `unknown prompt section "${name}"`)
+  }
+  if (!enabled && beforePresent === 1) {
+    throw new PanelError(409, 'this is the only prompt section; switching it off would leave the prompt empty')
+  }
+  setPromptDisabled(host, name, enabled)
+  try {
+    if (agent === undefined) {
+      return { state: await promptsState(host, sessionId, signal), applied: false, reason: 'no-live-agent' }
+    }
+    const afterRaw = await assembleSections(host, agent, signal)
+    const after = promptRows(afterRaw)
+    const afterRow = after.find((row) => row.name === name && row.present)
+    const liveBefore = before.filter((row) => row.present).reduce((sum, row) => sum + row.liveChars, 0)
+    const liveAfter = after.filter((row) => row.present).reduce((sum, row) => sum + row.liveChars, 0)
+    let failure
+    if (!enabled && afterRow !== undefined && afterRow.liveChars > 0) {
+      failure = 'this section is registered inside the agent itself and cannot be shadowed from this panel'
+    }
+    if (!enabled && liveBefore > 0 && liveAfter === 0) {
+      failure = 'switching this section off would leave the prompt empty'
+    }
+    if (failure !== undefined) {
+      setPromptDisabled(host, name, !enabled)
+      throw new PanelError(409, failure)
+    }
+    return { state: await promptsState(host, sessionId, signal), applied: true }
+  } catch (error) {
+    // Any failure after the write must not leave the persisted set disagreeing with
+    // what is actually applied.
+    if (promptDisabled.has(name) !== !enabled) setPromptDisabled(host, name, !enabled)
+    throw error
+  }
+}
+
+/** Put every disabled section back: clear the set and drop every shadow. */
+async function resetPromptSections(host, sessionId, signal) {
+  promptDisabled.clear()
+  savePrompts(promptDisabled)
+  host?.prompts?.syncAll?.()
+  return promptsState(host, sessionId, signal)
+}
+
+/**
+ * Mount one empty-shadow plugin into each live agent's scope.
+ *
+ * `systemPrompt.section()` registers into the CALLING context's layer, so a fiber
+ * mounted on `agent.ctx` writes into that agent's own layer — which is nearer than
+ * the global and preset layers where the injected sections live. The nearest
+ * layer wins a duplicate name, and an empty section is dropped by `renderPrompt`,
+ * so the net effect is "this section is not injected for this agent".
+ */
+function createPromptShadows(scope, agents) {
+  const entries = new Map()
+  let live = true
+  let mountError
+
+  function mount(agent) {
+    if (!live) return
+    const id = agent?.id
+    if (typeof id !== 'string' || entries.has(id)) return
+    const agentCtx = agent?.ctx
+    if (agentCtx === undefined || typeof agentCtx.plugin !== 'function') {
+      mountError = 'agent scope has no ctx.plugin (older registry): prompt shadows unavailable'
+      return
+    }
+    const holder = { sync: () => {} }
+    const plugin = {
+      name: 'dsh-plugin-tools-panel:prompt-shadow',
+      inject: ['systemPrompt'],
+      apply(c) {
+        let stopped = false
+        let applied
+        let disposers = []
+        const clear = () => {
+          for (const off of disposers.splice(0)) {
+            try {
+              off()
+            } catch {
+              /* the layer is already gone */
+            }
+          }
+        }
+        const sync = (names) => {
+          if (stopped) return
+          const signature = names.join('\u0000')
+          if (signature === applied) return
+          applied = signature
+          clear()
+          for (const name of names) {
+            try {
+              disposers.push(c.systemPrompt.section({ name, order: 0, text: '' }))
+            } catch {
+              // A name this agent registered itself cannot be shadowed from its own
+              // layer. The route's verification reports it; the other names still apply.
+            }
+          }
+        }
+        holder.sync = sync
+        try {
+          c.effect(() => () => {
+            stopped = true
+            holder.sync = () => {}
+            clear()
+          })
+        } catch {
+          /* a minimal context without effect: the fiber teardown still runs */
+        }
+        sync([...promptDisabled])
+      }
+    }
+    try {
+      entries.set(id, { holder, fiber: agentCtx.plugin(plugin) })
+      mountError = undefined
+    } catch (error) {
+      mountError = String(error?.message ?? error)
+    }
+  }
+
+  function syncAll() {
+    if (!live) return
+    let list = []
+    try {
+      list = agents?.list?.() ?? []
+    } catch {
+      return
+    }
+    for (const agent of list) {
+      mount(agent)
+      try {
+        entries.get(agent.id)?.holder.sync?.([...promptDisabled])
+      } catch {
+        /* one dead scope must not stop the rest */
+      }
+    }
+  }
+
+  function release(id) {
+    entries.delete(id)
+  }
+
+  function dispose() {
+    live = false
+    for (const entry of entries.values()) {
+      try {
+        entry.fiber?.dispose?.()
+      } catch {
+        /* already gone */
+      }
+    }
+    entries.clear()
+  }
+
+  return {
+    mount,
+    syncAll,
+    release,
+    dispose,
+    get size() { return entries.size },
+    get error() { return mountError }
+  }
+}
+
 // --- http ---------------------------------------------------------------------
 
 function sendJson(res, status, payload) {
@@ -898,6 +1537,171 @@ async function handleState(req, res, host) {
   sendJson(res, 200, { ok: true, state: snapshot(sessionId, host) })
 }
 
+/** A skill or section name as it may appear in a JSON body. */
+function cleanPanelName(value) {
+  if (typeof value !== 'string') return undefined
+  const name = value.trim()
+  if (name.length === 0 || name.length > MAX_NAME) return undefined
+  if (/[\u0000-\u001f\u007f]/.test(name)) return undefined
+  return name
+}
+
+/**
+ * Serve the skills route.
+ *
+ * GET lists the session's skills; POST flips one skill's model visibility by
+ * editing that skill file's frontmatter. The file path always comes from the
+ * registry summary, never from the request.
+ */
+async function handleSkills(req, res, host) {
+  const url = new URL(req.url ?? SKILLS_ROUTE, 'http://localhost')
+  if (req.method === 'GET') {
+    const sessionId = cleanSessionId(url.searchParams.get('sessionId'))
+    if (sessionId === undefined) {
+      sendJson(res, 400, { ok: false, error: 'missing sessionId query parameter' })
+      return
+    }
+    const { signal, done } = requestSignal()
+    try {
+      sendJson(res, 200, { ok: true, state: await skillsState(host, sessionId, signal) })
+    } catch (error) {
+      sendJson(res, error instanceof PanelError ? error.status : 500, {
+        ok: false,
+        error: String(error?.message ?? error)
+      })
+    } finally {
+      done()
+    }
+    return
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { ok: false, error: 'method not allowed' })
+    return
+  }
+  if (req.headers?.[HEADER] === undefined) {
+    sendJson(res, 403, { ok: false, error: `missing ${HEADER} header` })
+    return
+  }
+  let payload
+  try {
+    const body = await readBody(req)
+    payload = body ? JSON.parse(body) : {}
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'bad json body' })
+    return
+  }
+  if (payload === null || typeof payload !== 'object') {
+    sendJson(res, 400, { ok: false, error: 'bad json body' })
+    return
+  }
+  const sessionId = cleanSessionId(payload.sessionId)
+  if (sessionId === undefined) {
+    sendJson(res, 400, { ok: false, error: 'missing sessionId in the request body' })
+    return
+  }
+  const name = cleanPanelName(payload.name)
+  if (name === undefined) {
+    sendJson(res, 400, { ok: false, error: '`name` must be a non-empty skill name' })
+    return
+  }
+  if (typeof payload.enabled !== 'boolean') {
+    sendJson(res, 400, { ok: false, error: '`enabled` must be a boolean' })
+    return
+  }
+  const { signal, done } = requestSignal()
+  try {
+    const answer = await toggleSkill(host, sessionId, name, payload.enabled, signal)
+    sendJson(res, 200, { ok: true, state: answer.state, applied: answer.applied })
+  } catch (error) {
+    sendJson(res, error instanceof PanelError ? error.status : 500, {
+      ok: false,
+      error: String(error?.message ?? error)
+    })
+  } finally {
+    done()
+  }
+}
+
+/**
+ * Serve the prompt-sections route.
+ *
+ * GET lists the sections actually assembled for one session; POST switches one
+ * section off/on (globally, persisted) or resets the whole disabled set. Nothing
+ * here edits a prompt: the switch is an empty same-name shadow in the agent scope.
+ */
+async function handlePrompts(req, res, host) {
+  const url = new URL(req.url ?? PROMPTS_ROUTE, 'http://localhost')
+  if (req.method === 'GET') {
+    const sessionId = cleanSessionId(url.searchParams.get('sessionId'))
+    if (sessionId === undefined) {
+      sendJson(res, 400, { ok: false, error: 'missing sessionId query parameter' })
+      return
+    }
+    const { signal, done } = requestSignal()
+    try {
+      sendJson(res, 200, { ok: true, state: await promptsState(host, sessionId, signal) })
+    } catch (error) {
+      sendJson(res, error instanceof PanelError ? error.status : 500, {
+        ok: false,
+        error: String(error?.message ?? error)
+      })
+    } finally {
+      done()
+    }
+    return
+  }
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { ok: false, error: 'method not allowed' })
+    return
+  }
+  if (req.headers?.[HEADER] === undefined) {
+    sendJson(res, 403, { ok: false, error: `missing ${HEADER} header` })
+    return
+  }
+  let payload
+  try {
+    const body = await readBody(req)
+    payload = body ? JSON.parse(body) : {}
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'bad json body' })
+    return
+  }
+  if (payload === null || typeof payload !== 'object') {
+    sendJson(res, 400, { ok: false, error: 'bad json body' })
+    return
+  }
+  const sessionId = cleanSessionId(payload.sessionId)
+  if (sessionId === undefined) {
+    sendJson(res, 400, { ok: false, error: 'missing sessionId in the request body' })
+    return
+  }
+  const { signal, done } = requestSignal()
+  try {
+    if (payload.reset === true) {
+      sendJson(res, 200, { ok: true, state: await resetPromptSections(host, sessionId, signal) })
+      return
+    }
+    const name = cleanPanelName(payload.name)
+    if (name === undefined) {
+      sendJson(res, 400, { ok: false, error: '`name` must be a non-empty section name' })
+      return
+    }
+    if (typeof payload.enabled !== 'boolean') {
+      sendJson(res, 400, { ok: false, error: '`enabled` must be a boolean' })
+      return
+    }
+    const answer = await togglePromptSection(host, sessionId, name, payload.enabled, signal)
+    sendJson(res, 200, { ok: true, state: answer.state, applied: answer.applied })
+  } catch (error) {
+    sendJson(res, error instanceof PanelError ? error.status : 500, {
+      ok: false,
+      error: String(error?.message ?? error)
+    })
+  } finally {
+    done()
+  }
+}
+
 /**
  * Register the control route.
  *
@@ -912,6 +1716,14 @@ function registerRoute(scope, host, deps) {
   scope.effect(
     () => host.register({ kind: 'exact', path: ROUTE, handler: (req, res) => handleState(req, res, deps) }),
     'tools-panel: control route'
+  )
+  scope.effect(
+    () => host.register({ kind: 'exact', path: SKILLS_ROUTE, handler: (req, res) => handleSkills(req, res, deps) }),
+    'tools-panel: skills route'
+  )
+  scope.effect(
+    () => host.register({ kind: 'exact', path: PROMPTS_ROUTE, handler: (req, res) => handlePrompts(req, res, deps) }),
+    'tools-panel: prompts route'
   )
 }
 
@@ -1001,6 +1813,12 @@ export function apply(ctx) {
   const restrictor = createRestrictor(ctx, ctx.get('agents'))
   ctx.effect(() => () => restrictor.dispose(), 'tools-panel: restriction scopes')
 
+  // The prompt tab's other half: one empty same-name section per disabled section,
+  // mounted inside each live agent's scope. Created even without `agents` so the
+  // route can persist a switch; with no registry it simply has no scopes to mount.
+  const promptShadows = createPromptShadows(ctx, ctx.get('agents'))
+  ctx.effect(() => () => promptShadows.dispose(), 'tools-panel: prompt shadows')
+
   ctx.effect(() => ctx.tools.guard(makeGuard(policies, parents)), 'tools-panel: live guard')
 
   // Mount on the agent's own scope AND on the scopes above it: a preset's tool rows
@@ -1020,6 +1838,7 @@ export function apply(ctx) {
         // Mount at creation so a switch set BEFORE the child existed already covers
         // it; the lazy walk decides what that switch means for this child.
         mountWithAncestors(agent)
+        promptShadows.mount(agent)
       }),
       'tools-panel: delegation tree'
     )
@@ -1032,10 +1851,16 @@ export function apply(ctx) {
         parents.delete(agent.id)
         // The restriction itself was owned by the agent scope and is already gone.
         restrictor.release(agent.id)
+        promptShadows.release(agent.id)
       }),
       'tools-panel: tree cleanup'
     )
-    for (const agent of agents.list()) mountWithAncestors(agent)
+    for (const agent of agents.list()) {
+      mountWithAncestors(agent)
+      promptShadows.mount(agent)
+    }
+    // A section switched off before this process had any agent must apply now.
+    promptShadows.syncAll()
   }
 
   // A tool that appears after the switch was set (an MCP server connecting) must be
@@ -1043,7 +1868,17 @@ export function apply(ctx) {
   // synchronous `tools/change` cannot recurse through this listener.
   ctx.effect(() => ctx.on('tools/change', () => restrictor.scheduleSync()), 'tools-panel: tool set changes')
 
-  const deps = { tools: ctx.tools, agents, restrictor }
+  const deps = {
+    tools: ctx.tools,
+    agents,
+    restrictor,
+    prompts: promptShadows,
+    // Probed per request, not captured at apply time: a service that appears after
+    // this plugin mounts must still answer the tab instead of being reported absent.
+    get skills() { return ctx.get('skills') },
+    get workingDirectory() { return ctx.get('workingDirectory') },
+    get systemPrompt() { return ctx.get('systemPrompt') }
+  }
   const server = ctx.get('webServer')
   if (server !== undefined) registerRoute(ctx, server, deps)
   else ctx.inject(['webServer'], (scope) => registerRoute(scope, scope.webServer, deps))
@@ -1055,26 +1890,52 @@ export {
   MAX_GROUP_NAME,
   MAX_GROUPS,
   MAX_NAME,
+  MAX_PROMPTS,
+  MAX_SECTION_TEXT,
+  MAX_SKILL_DESCRIPTION,
   MAX_TOOLS,
+  PROMPTS_ROUTE,
   PROTOCOL,
   ROUTE,
+  SKILLS_ROUTE,
   cleanDeny,
+  createPromptShadows,
   createRestrictor,
   denyReason,
   denySetFor,
   groupsFile,
   loadGroups,
+  loadPrompts,
   makeGuard,
   normalizeGroups,
+  normalizePromptNames,
   ownerOf,
   parents,
+  patchSkillFrontmatter,
   policies,
   policyFor,
+  promptsFile,
+  promptsState,
   saveGroups,
+  savePrompts,
   scopesOf,
   setDeny,
+  skillsState,
   snapshot,
+  togglePromptSection,
+  toggleSkill,
+  resetPromptSections,
   toolsForSession
+}
+
+/** Test-only: the live disabled-section names. */
+export function getPromptDisabled() {
+  return [...promptDisabled].sort()
+}
+
+/** Test-only: replace the live disabled set without touching disk. */
+export function replacePromptDisabled(names) {
+  promptDisabled = new Set(normalizePromptNames(names))
 }
 
 /** The live group definitions (read-only view; the route replaces the array). */

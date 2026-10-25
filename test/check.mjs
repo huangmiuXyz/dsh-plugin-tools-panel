@@ -30,7 +30,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // Isolate the durable bit of this plugin BEFORE importing it: group definitions are
 // written under `$DSH_HOME/tool-guard/groups.json`, and a test run must never touch
@@ -101,13 +101,29 @@ const {
   policies,
   policyFor,
   MAX_GROUPS,
+  MAX_PROMPTS,
+  MAX_SECTION_TEXT,
+  PROMPTS_ROUTE,
+  SKILLS_ROUTE,
+  getPromptDisabled,
   groupsFile,
+  loadGroups,
+  loadPrompts,
   normalizeGroups,
+  normalizePromptNames,
+  patchSkillFrontmatter,
+  promptsFile,
+  promptsState,
+  replacePromptDisabled,
+  saveGroups,
+  savePrompts,
   setDeny,
   setGroups,
   getGroups,
+  skillsState,
+  togglePromptSection,
   snapshot
-} = await import(path.join(PKG, 'src', 'index.js'))
+} = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 
 // The two halves are loaded independently (the bundle hot-reloads; the host half
 // does not), so their protocol numbers are the ONLY thing keeping a saved edit from
@@ -285,7 +301,7 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
     },
     effect: (fn) => fn()
   }
-  const agentHalf = await import(path.join(PKG, 'src', 'agent.js'))
+  const agentHalf = await import(pathToFileURL(path.join(PKG, 'src', 'agent.js')).href)
   check('agent tool: the half requires only `tools`', JSON.stringify(agentHalf.inject) === '["tools"]', JSON.stringify(agentHalf.inject))
   agentHalf.apply(scope)
   check('agent tool: apply registers exactly one tool', registered.length === 1, String(registered.length))
@@ -463,6 +479,8 @@ function fakeHost() {
   const listeners = new Map()
   const live = []
   const owners = new Map()
+  /** Optional services the panel probes per request (`skills`, `systemPrompt`, …). */
+  const extras = {}
   /**
    * Which layer each tool is registered in — the geometry that actually broke this
    * plugin.
@@ -629,6 +647,18 @@ function fakeHost() {
       plugin(definition) {
         const fiberCtx = {
           tools: scopedTools,
+          // Resolved per CALL: the prompt-shadow plugin is mounted when this agent
+          // appears, while the fake `systemPrompt` service is installed later by the
+          // prompt-section test. A promise-of-a-service would make the mount order
+          // decide whether the test works, which is exactly what a real registry does
+          // not do.
+          systemPrompt: {
+            section(def) {
+              const service = extras.systemPrompt
+              if (service === undefined) throw new Error('no systemPrompt service')
+              return service.__scoped(id)(def)
+            }
+          },
           effect: (fn) => fn(),
           get: () => undefined,
           on: () => () => {}
@@ -700,11 +730,11 @@ function fakeHost() {
         if (at >= 0) list.splice(at, 1)
       }
     },
-    get: (name) => (name === 'webServer' ? webServer : name === 'agents' ? agents : undefined),
+    get: (name) => (name === 'webServer' ? webServer : name === 'agents' ? agents : extras[name]),
     inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
     effect: (fn) => fn()
   }
-  return { agents, ctx, guards, hidden, live, routes, restrictCalls, server, tools }
+  return { agents, ctx, extras, guards, hidden, live, routes, restrictCalls, server, tools }
 }
 
 // The module-level tables are shared with `apply`, so clear them before wiring the
@@ -713,7 +743,7 @@ policies.clear()
 parents.clear()
 
 const host = fakeHost()
-const { apply } = await import(path.join(PKG, 'src', 'index.js'))
+const { apply } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 apply(host.ctx)
 /** Let the deferred `tools/change` re-apply run. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 5))
@@ -1091,6 +1121,264 @@ try {
   await new Promise((resolve) => host.server.close(resolve))
 }
 
+// --- 4b. skills and prompt sections (protocol 8) ------------------------------
+{
+  // --- the frontmatter patcher: one top-level key, nothing else touched
+  const plain = '---\nname: demo\ndescription: A demo.\n---\n\n# Demo\n'
+  check(
+    'skills: adds the key when absent',
+    patchSkillFrontmatter(plain, false) ===
+      '---\nname: demo\ndescription: A demo.\ndisable-model-invocation: true\n---\n\n# Demo\n',
+    JSON.stringify(patchSkillFrontmatter(plain, false))
+  )
+  check(
+    'skills: enabling writes the negation as false',
+    patchSkillFrontmatter('---\nname: demo\ndisable-model-invocation: true\n---\nbody\n', true).includes(
+      'disable-model-invocation: false'
+    )
+  )
+  check(
+    'skills: disabling writes the negation as true',
+    patchSkillFrontmatter('---\nname: demo\ndisable-model-invocation: false\n---\n', false).includes(
+      'disable-model-invocation: true'
+    )
+  )
+  check(
+    'skills: preserves CRLF',
+    patchSkillFrontmatter('---\r\nname: demo\r\n---\r\nbody\r\n', false).includes(
+      '\r\ndisable-model-invocation: true\r\n'
+    )
+  )
+  check(
+    'skills: preserves a BOM',
+    patchSkillFrontmatter('\uFEFF---\nname: demo\n---\nbody\n', false).startsWith('\uFEFF---')
+  )
+  check('skills: refuses an unclosed block', patchSkillFrontmatter('---\nname: demo\nbody\n', false) === undefined)
+  check('skills: refuses a file with no block', patchSkillFrontmatter('# Demo\n', false) === undefined)
+  check(
+    'skills: does not rewrite an indented lookalike',
+    patchSkillFrontmatter('---\nname: demo\nmeta:\n  disable-model-invocation: false\n---\n', false) ===
+      '---\nname: demo\nmeta:\n  disable-model-invocation: false\ndisable-model-invocation: true\n---\n',
+    JSON.stringify(patchSkillFrontmatter('---\nname: demo\nmeta:\n  disable-model-invocation: false\n---\n', false))
+  )
+  check(
+    'skills: only the targeted key changes',
+    patchSkillFrontmatter('---\nname: demo\ndisable-model-invocation: true\nother: keep\n---\n', true) ===
+      '---\nname: demo\ndisable-model-invocation: false\nother: keep\n---\n'
+  )
+
+  // --- the persisted disabled-section set
+  check('prompts: normalizes a corrupt list', JSON.stringify(normalizePromptNames([1, ' a ', 'a', '', null])) === '["a"]')
+  check(
+    'prompts: bounds the list',
+    normalizePromptNames(Array.from({ length: MAX_PROMPTS + 5 }, (_, index) => `s${index}`)).length === MAX_PROMPTS
+  )
+  check('prompts: an unusable payload becomes empty', JSON.stringify(normalizePromptNames({ a: 1 })) === '[]')
+  savePrompts(new Set(['alpha']))
+  check('prompts: the disabled set round-trips through disk', JSON.stringify(loadPrompts()) === '["alpha"]', JSON.stringify(loadPrompts()))
+  savePrompts(new Set())
+  check('prompts: the file lives under DSH_HOME', promptsFile().startsWith(SANDBOX), promptsFile())
+
+  // --- skills over the real route
+  const skillsRoot = fs.mkdtempSync(path.join(SANDBOX, 'skills-'))
+  const alphaPath = path.join(skillsRoot, 'alpha', 'SKILL.md')
+  fs.mkdirSync(path.dirname(alphaPath), { recursive: true })
+  fs.writeFileSync(alphaPath, '---\nname: alpha\ndescription: An alpha skill.\n---\n\nDo alpha.\n')
+  const fileEnabled = (file) => !/^disable-model-invocation:\s*true\s*$/m.test(fs.readFileSync(file, 'utf8'))
+  host.extras.skills = {
+    async snapshot() {
+      return {
+        complete: true,
+        skills: [
+          {
+            name: 'alpha',
+            description: 'An alpha skill.',
+            provider: 'fs',
+            source: 'project',
+            path: alphaPath,
+            invocation: { modelInvocable: fileEnabled(alphaPath), userInvocable: true }
+          },
+          {
+            name: 'virtual',
+            description: 'Registered by a plugin; no file.',
+            provider: 'plugin',
+            source: 'plugin',
+            invocation: { modelInvocable: true, userInvocable: true }
+          }
+        ]
+      }
+    },
+    registerProvider() {
+      return () => {}
+    }
+  }
+  host.extras.workingDirectory = { ensure: async () => skillsRoot }
+
+  await new Promise((resolve) => host.server.listen(0, '127.0.0.1', resolve))
+  const base2 = `http://127.0.0.1:${host.server.address().port}`
+  const skillsGet = (sessionId) => fetch(`${base2}${SKILLS_ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
+  const skillsPost = (body, withHeader = true) =>
+    fetch(`${base2}${SKILLS_ROUTE}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(withHeader ? { [HEADER]: '1' } : {}) },
+      body: JSON.stringify(body)
+    })
+  const promptsGet = (sessionId) => fetch(`${base2}${PROMPTS_ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
+  const promptsPost = (body) =>
+    fetch(`${base2}${PROMPTS_ROUTE}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [HEADER]: '1' },
+      body: JSON.stringify(body)
+    })
+
+  try {
+    const listed = await (await skillsGet('root-a')).json()
+    check('skills route: lists the session', listed.ok === true && listed.state.available === true)
+    check('skills route: carries the protocol', listed.state.protocol === PROTOCOL)
+    check('skills route: one row per skill', listed.state.skills.length === 2, String(listed.state.skills.length))
+    check(
+      'skills route: a file-backed skill is toggleable',
+      listed.state.skills.find((row) => row.name === 'alpha')?.toggleable === true
+    )
+    check(
+      'skills route: a runtime skill is not toggleable',
+      listed.state.skills.find((row) => row.name === 'virtual')?.toggleable === false
+    )
+    check('skills route: requires a session', (await fetch(`${base2}${SKILLS_ROUTE}`)).status === 400)
+    check('skills route: a write requires the header', (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: false }, false)).status === 403)
+    check('skills route: a write needs a boolean', (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: 'no' })).status === 400)
+    check('skills route: an unknown skill is a 404', (await skillsPost({ sessionId: 'root-a', name: 'nope', enabled: false })).status === 404)
+    check('skills route: a runtime skill is refused', (await skillsPost({ sessionId: 'root-a', name: 'virtual', enabled: false })).status === 409)
+
+    const off = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: false })).json()
+    check('skills route: the switch reports it took effect', off.ok === true && off.applied === true, JSON.stringify(off.applied))
+    check('skills route: the state says the skill is hidden', off.state.skills.find((row) => row.name === 'alpha')?.modelInvocable === false)
+    check('skills route: the file now hides it from the model', fileEnabled(alphaPath) === false)
+    check(
+      'skills route: the frontmatter carries the key',
+      fs.readFileSync(alphaPath, 'utf8').includes('disable-model-invocation: true')
+    )
+
+    const on = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: true })).json()
+    check('skills route: the switch can be turned back on', on.applied === true && fileEnabled(alphaPath) === true)
+
+    // --- prompt sections over the same real route
+    const promptGlobal = [
+      { name: 'identity', order: 1, text: 'You are DSH.' },
+      { name: 'tool-notes', order: 2, text: 'Use tools carefully.' },
+      { name: 'workspace', order: 3, text: 'Workspace: /tmp/work' }
+    ]
+    const overlays = new Map()
+    const shadowFails = new Set()
+    host.extras.systemPrompt = {
+      async assemble({ agent }) {
+        const overlay = overlays.get(agent.id) ?? new Map()
+        const merged = new Map()
+        for (const section of promptGlobal) merged.set(section.name, section)
+        for (const [name, definition] of overlay) merged.set(name, definition)
+        return {
+          sections: [...merged.values()]
+            .sort((left, right) => left.order - right.order)
+            .map((section) => ({ name: section.name, text: section.text }))
+        }
+      },
+      __scoped(id) {
+        return (definition) => {
+          if (shadowFails.has(definition.name)) throw new Error('this section cannot be shadowed')
+          const map = overlays.get(id) ?? new Map()
+          overlays.set(id, map)
+          map.set(definition.name, definition)
+          return () => map.delete(definition.name)
+        }
+      }
+    }
+
+    replacePromptDisabled([])
+    const promptList = await (await promptsGet('root-a')).json()
+    check('prompts route: lists the assembled sections', promptList.ok === true && promptList.state.sections.length === 3, String(promptList.state.sections.length))
+    check('prompts route: preserves assembly order', promptList.state.sections.map((row) => row.name).join(',') === 'identity,tool-notes,workspace')
+    check('prompts route: everything starts enabled', promptList.state.sections.every((row) => row.enabled === true))
+    check('prompts route: every section can be switched off', promptList.state.sections.every((row) => row.toggleable === true))
+    check('prompts route: carries the protocol', promptList.state.protocol === PROTOCOL)
+
+    const hidden = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })).json()
+    check('prompts route: the switch reports it took effect', hidden.ok === true && hidden.applied === true)
+    check(
+      'prompts route: the section is now empty in the live prompt',
+      (overlays.get('root-a')?.get('identity')?.text ?? 'not-shadowed') === ''
+    )
+    const hiddenRow = hidden.state.sections.find((row) => row.name === 'identity')
+    check('prompts route: the row is off', hiddenRow?.enabled === false)
+    check('prompts route: the row keeps its preview', hiddenRow?.chars > 0 && hiddenRow?.liveChars === 0, JSON.stringify(hiddenRow))
+    check('prompts route: the other sections still carry text', hidden.state.sections.filter((row) => row.name !== 'identity').every((row) => row.liveChars > 0))
+    check('prompts route: the disabled name is persisted', JSON.stringify(loadPrompts()) === '["identity"]', JSON.stringify(loadPrompts()))
+
+    const shown = await (await promptsGet('root-a')).json()
+    check('prompts route: a fresh read agrees with the switch', shown.state.sections.find((row) => row.name === 'identity')?.enabled === false)
+
+    const restored = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: true })).json()
+    check('prompts route: the switch can be turned back on', restored.applied === true)
+    check('prompts route: the shadow is gone', !(overlays.get('root-a')?.has('identity') ?? false))
+    check('prompts route: the text is back', restored.state.sections.find((row) => row.name === 'identity')?.liveChars > 0)
+
+    // An unknown name must not persist a dead switch.
+    check('prompts route: an unknown section is a 404', (await promptsPost({ sessionId: 'root-a', name: 'nope', enabled: false })).status === 404)
+    check('prompts route: an unknown section persists nothing', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
+
+    // A section that cannot be shadowed is detected and rolled back.
+    shadowFails.add('tool-notes')
+    const refused = await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: false })
+    check('prompts route: an unshadowable section is a 409', refused.status === 409, String(refused.status))
+    check('prompts route: the refusal leaves no disabled name', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
+    check(
+      'prompts route: the section still carries its text',
+      (overlays.get('root-a')?.get('tool-notes')?.text ?? 'still live') !== ''
+    )
+    shadowFails.delete('tool-notes')
+
+    // The reset switch restores every disabled section at once.
+    await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })
+    await promptsPost({ sessionId: 'root-a', name: 'workspace', enabled: false })
+    check('prompts route: two sections are off', getPromptDisabled().length === 2, JSON.stringify(getPromptDisabled()))
+    const reset = await (await promptsPost({ sessionId: 'root-a', reset: true })).json()
+    check('prompts route: reset restores everything', reset.ok === true && getPromptDisabled().length === 0)
+    check('prompts route: reset re-enables every row', reset.state.sections.every((row) => row.enabled === true))
+    check('prompts route: reset persisted the empty set', JSON.stringify(loadPrompts()) === '[]', JSON.stringify(loadPrompts()))
+  } finally {
+    replacePromptDisabled([])
+    savePrompts(new Set())
+    await new Promise((resolve) => host.server.close(resolve))
+  }
+
+  // --- the service-absent and no-session answers (direct, no route)
+  check('skills: a deployment without the service says so', (await skillsState({}, 'x')).available === false)
+  check('skills: no live agent is a stated reason', (await skillsState({ skills: { snapshot: async () => ({ skills: [] }) }, agents: { get: () => undefined } }, 'x')).reason === 'no-live-agent')
+  check('prompts: a deployment without the service says so', (await promptsState({ agents: { get: () => undefined } }, 'x')).available === false)
+  check(
+    'prompts: no live agent is a stated reason',
+    (await promptsState({ systemPrompt: { assemble: async () => ({ sections: [] }) }, agents: { get: () => undefined } }, 'x')).reason === 'no-live-agent'
+  )
+  check('prompts: a preview is bounded', MAX_SECTION_TEXT > 0)
+
+  // --- the sole-section refusal happens BEFORE any write
+  {
+    const soleHost = {
+      agents: { get: () => ({ id: 'solo' }) },
+      systemPrompt: { assemble: async () => ({ sections: [{ name: 'only', order: 1, text: 'x' }] }) },
+      prompts: { syncAll: () => {} }
+    }
+    replacePromptDisabled([])
+    let refused
+    try {
+      await togglePromptSection(soleHost, 'solo', 'only', false)
+    } catch (error) {
+      refused = error
+    }
+    check('prompts: the only section cannot be switched off', refused !== undefined && refused.status === 409, String(refused?.status))
+    check('prompts: the refusal wrote nothing', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
+  }
+}
+
 // --- 5. module-level helpers --------------------------------------------------
 {
   policies.clear()
@@ -1157,6 +1445,8 @@ try {
       state.__refs = new Map()
       state.__refCount = 0
       state.__memo = new Map()
+      state.__callbacks = new Map()
+      state.__effectDeps = new Map()
       hookStates.set(component, state)
     }
     return state
@@ -1177,6 +1467,8 @@ try {
       fresh.__refs = new Map()
       fresh.__refCount = 0
       fresh.__memo = new Map()
+      fresh.__callbacks = new Map()
+      fresh.__effectDeps = new Map()
       hookStates.set(component, fresh)
     }
     hookState = stateFor(component, props)
@@ -1223,9 +1515,31 @@ try {
       return own.__refs.get(key)
     },
     useCallback(fn) {
-      return fn
+      // Memoized by SLOT, like React with a stable dependency list. Without this, a
+      // tab's `useEffect(..., [active, load])` re-ran on every render (a new `load`
+      // identity), so a GET clobbered the state a POST had just returned.
+      const own = hookState
+      const index = hookCursor++
+      const key = 'callback' + index
+      if (!own.__callbacks.has(key)) own.__callbacks.set(key, fn)
+      return own.__callbacks.get(key)
     },
-    useEffect(fn) {
+    useEffect(fn, deps) {
+      // Dependency-aware, like React: `[]` runs once per mount and a stable list runs
+      // only when it changes. Without this, every `pump` re-ran every effect, which
+      // made a tab's GET race its own POST and overwrite the answer.
+      const own = hookState
+      const index = hookCursor++
+      const key = 'effect' + index
+      if (Array.isArray(deps)) {
+        const previous = own.__effectDeps.get(key)
+        const same =
+          previous !== undefined &&
+          previous.length === deps.length &&
+          deps.every((dep, at) => Object.is(dep, previous[at]))
+        if (same) return
+        own.__effectDeps.set(key, [...deps])
+      }
       effects.push(fn)
     },
     /**
@@ -1355,6 +1669,8 @@ try {
   const DICT = {
     title: '工具面板',
     tabTools: '工具',
+    tabSkills: '技能',
+    tabPrompts: '提示词',
     tabPlugins: '插件',
     loading: 'l',
     empty: 'e',
@@ -1509,7 +1825,7 @@ try {
     check('panel: no menu while closed', byClass(view.tree, 'dsh-tools-panel-menu').length === 0)
   }
 
-  // Open: a portal with a two-tab strip, and the DEFAULT tab is plugins.
+  // Open: a portal with a four-tab strip, and the DEFAULT tab is plugins.
   {
     const view = render(Component, { t: tt })
     byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
@@ -1518,12 +1834,13 @@ try {
     check('panel: opening renders one portalled menu', menu.length === 1, String(menu.length))
     check('panel: portalled out of the composer row', currentTree.children.some((child) => child?.container?.tag === 'body'))
     const tabs = byClass(currentTree, 'dsh-tools-panel-tab')
-    check('panel: the menu carries exactly two tabs', tabs.length === 2, String(tabs.length))
+    check('panel: the menu carries exactly four tabs', tabs.length === 4, String(tabs.length))
     check('panel: the tabs are a tablist', byClass(currentTree, 'dsh-tools-panel-tabs')[0]?.props?.role === 'tablist')
     // The user asked for plugins as the default tab.
-    check('panel: the default tab is plugins', tabs[1].props['aria-selected'] === true, tabs.map((tab) => tab.props['aria-selected']).join(','))
+    check('panel: the default tab is plugins', tabs[3].props['aria-selected'] === true, tabs.map((tab) => tab.props['aria-selected']).join(','))
     check('panel: the tools tab is not selected', tabs[0].props['aria-selected'] === false)
-    check('panel: tab ids are stable', tabs[0].props.role === 'tab' && tabs[1].props.role === 'tab')
+    check('panel: the tab order is tools, skills, prompts, plugins', textOf(tabs[0]).join('') === '工具' && textOf(tabs[1]).join('') === '技能' && textOf(tabs[2]).join('') === '提示词' && textOf(tabs[3]).join('') === '插件', tabs.map((tab) => textOf(tab).join('')).join('|'))
+    check('panel: tab ids are stable', tabs.every((tab) => tab.props.role === 'tab'))
   }
 
   // Switching tabs keeps BOTH mounted, and remembers the choice.
@@ -1538,7 +1855,7 @@ try {
     check('panel: clicking a tab selects it', after[0].props['aria-selected'] === true, after.map((tab) => tab.props['aria-selected']).join(','))
     // Both tab bodies exist at all times: the inactive one is hidden with `display`,
     // so its state and its loaded list survive a switch.
-    check('panel: both tab bodies stay mounted', byClass(currentTree, 'dsh-tools-panel-tabBody').length === 2, String(byClass(currentTree, 'dsh-tools-panel-tabBody').length))
+    check('panel: all four tab bodies stay mounted', byClass(currentTree, 'dsh-tools-panel-tabBody').length === 4, String(byClass(currentTree, 'dsh-tools-panel-tabBody').length))
     check('panel: the last tab is persisted', booted.window.localStorage.getItem('dsh-plugin-tools-panel/tab') === 'tools', String(booted.window.localStorage.getItem('dsh-plugin-tools-panel/tab')))
     // A fresh mount restores it.
     const again = render(Component, { t: tt })
@@ -1655,7 +1972,116 @@ try {
       textOf(currentTree).some((s) => s.includes('no plugin manager')),
       textOf(currentTree).slice(0, 8).join('|')
     )
-    check('panel: the tools tab is still there', byClass(currentTree, 'dsh-tools-panel-tab').length === 2)
+    check('panel: the tools tab is still there', byClass(currentTree, 'dsh-tools-panel-tab').length === 4)
+  }
+
+  // The skills tab: one row per skill, one switch per row, and the switch is a POST.
+  {
+    rememberTab('plugins')
+    const calls = []
+    const listed = {
+      protocol: 8,
+      sessionId: 's1',
+      available: true,
+      complete: true,
+      skills: [
+        { name: 'alpha', description: 'An alpha skill.', provider: 'fs', source: 'project', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true },
+        { name: 'virtual', description: 'Registered at runtime.', provider: 'plugin', source: 'plugin', modelInvocable: true, userInvocable: true, toggleable: false }
+      ]
+    }
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url: String(url), init })
+      if (init.method === 'POST') {
+        const body = JSON.parse(init.body)
+        return {
+          status: 200,
+          json: async () => ({
+            ok: true,
+            applied: true,
+            state: {
+              ...listed,
+              skills: listed.skills.map((skill) =>
+                skill.name === body.name ? { ...skill, modelInvocable: body.enabled } : skill
+              )
+            }
+          })
+        }
+      }
+      return { status: 200, json: async () => ({ ok: true, state: listed }) }
+    }
+    try {
+      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
+      const view = render(comp, { t: tt, sessionId: 's1' })
+      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
+      await pump(view)
+      byClass(currentTree, 'dsh-tools-panel-tab')[1].props.onClick()
+      await pump(view)
+      const rows = byClass(currentTree, 'dsh-tools-panel-skill-row')
+      check('skills tab: one row per skill', rows.length === 2, String(rows.length))
+      check('skills tab: the row shows the description', textOf(currentTree).some((text) => text.includes('An alpha skill.')))
+      const switches = byClass(currentTree, 'dsh-tools-panel-tool-switch')
+      const alphaSwitch = switches.find((node) => node.props['aria-label'] === 'alpha')
+      const virtualSwitch = switches.find((node) => node.props['aria-label'] === 'virtual')
+      check('skills tab: a file-backed row is switchable', alphaSwitch?.props.disabled === false)
+      check('skills tab: a runtime row is not switchable', virtualSwitch?.props.disabled === true)
+      check('skills tab: it reads the skills route with the session', calls.some((call) => call.url.includes('/skills?sessionId=s1')), calls.map((call) => call.url).join('|'))
+      alphaSwitch.props.onClick()
+      await pump(view)
+      const post = calls.find((call) => call.init.method === 'POST')
+      check('skills tab: the switch posts the exact skill and state', JSON.parse(post?.init.body ?? '{}').name === 'alpha' && JSON.parse(post?.init.body ?? '{}').enabled === false, post?.init.body)
+      check(
+        'skills tab: the host answer updates the switch',
+        byClass(currentTree, 'dsh-tools-panel-tool-switch').find((node) => node.props['aria-label'] === 'alpha')?.props['aria-checked'] === false,
+        String(byClass(currentTree, 'dsh-tools-panel-tool-switch').find((node) => node.props['aria-label'] === 'alpha')?.props['aria-checked'])
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  // A refusal on the skills route is a stated reason, not a "restart DSH" message.
+  {
+    rememberTab('skills')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init = {}) => {
+      if (init.method === 'POST') {
+        return { status: 409, json: async () => ({ ok: false, error: 'this skill has no file to edit' }) }
+      }
+      return {
+        status: 200,
+        json: async () => ({
+          ok: true,
+          state: {
+            protocol: 8,
+            sessionId: 's1',
+            available: true,
+            skills: [{ name: 'alpha', description: 'd', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true }]
+          }
+        })
+      }
+    }
+    try {
+      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
+      const view = render(comp, { t: tt, sessionId: 's1' })
+      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
+      await pump(view)
+      const sw = byClass(currentTree, 'dsh-tools-panel-tool-switch').find((node) => node.props['aria-label'] === 'alpha')
+      sw.props.onClick()
+      await pump(view)
+      check(
+        'skills tab: a refused write shows the Host reason',
+        textOf(currentTree).some((text) => text.includes('this skill has no file to edit')),
+        textOf(currentTree).slice(-4).join('|')
+      )
+      check('skills tab: a refusal is not mistaken for a version skew', !textOf(currentTree).some((text) => text.includes('staleHost')))
+      check(
+        'skills tab: a refused write rolls the switch back',
+        byClass(currentTree, 'dsh-tools-panel-tool-switch').find((node) => node.props['aria-label'] === 'alpha')?.props['aria-checked'] === true
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   }
 }
 
@@ -1714,9 +2140,9 @@ check('merge: one locale namespace', (clientSource.match(/const NS = /g) ?? []).
 check('merge: the namespace is the panel', clientSource.includes("const NS = 'toolsPanel'"))
 check('merge: one stylesheet id', (clientSource.match(/const CSS_ID = /g) ?? []).length === 1)
 check('merge: one trigger element', (clientSource.match(/className: 'dsh-tools-panel-trigger'/g) ?? []).length === 1)
-check('merge: both tabs are registered', clientSource.includes('tabButton(\'tools\'') && clientSource.includes('tabButton(\'plugins\''))
+check('merge: all four tabs are registered', ['tools', 'skills', 'prompts', 'plugins'].every((id) => clientSource.includes(`tabButton('${id}'`)))
 check('merge: tabs are a tablist', clientSource.includes("role: 'tablist'"))
-check('merge: both tab bodies stay mounted', /display: 'none'/ .test(clientSource))
+check('merge: inactive tab bodies stay mounted', /display: 'none'/.test(clientSource))
 check('merge: no old package id survives', !clientSource.includes("id: 'dsh-tool-guard'") && !clientSource.includes("id: 'dsh-plugin-switch'"))
 check('merge: the old class prefixes are gone', !clientSource.includes('dsh-tool-guard-') && !clientSource.includes('dsh-plugin-switch-'))
 
@@ -1768,7 +2194,7 @@ check(
 )
 check(
   'scroll: every pane carries the class',
-  (clientSource.match(/className: 'dsh-tools-panel-pane'/g) ?? []).length === 2,
+  (clientSource.match(/className: 'dsh-tools-panel-pane'/g) ?? []).length === 4,
   String((clientSource.match(/className: 'dsh-tools-panel-pane'/g) ?? []).length)
 )
 check(

@@ -50,6 +50,10 @@ window.__ModuleLoader__.load({
     const CSS_ID = 'dsh-plugin-tools-panel/ToolsPanel.css'
     /** The host route that owns the tool switch. */
     const ROUTE = '/dsh-plugin-tools-panel/state'
+    /** The skills route: list this session's skills, toggle one model invocation. */
+    const SKILLS_ROUTE = '/dsh-plugin-tools-panel/skills'
+    /** The prompt route: list the assembled system prompt sections, toggle one. */
+    const PROMPTS_ROUTE = '/dsh-plugin-tools-panel/prompts'
     /** Header the Host requires on a write, so a cross-origin POST cannot flip the switch. */
     const HEADER = 'x-dsh-plugin-tools-panel'
     /**
@@ -61,7 +65,7 @@ window.__ModuleLoader__.load({
      * with an OLD host, and without this check that shows up as a switch that flips
      * back on its own.
      */
-    const PROTOCOL = 7
+    const PROTOCOL = 8
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 320
     const MENU_MAX_HEIGHT = 420
@@ -70,7 +74,7 @@ window.__ModuleLoader__.load({
     const POLL_MS = 2000
     /** Where the pinned plugin names are remembered, as a JSON array of names. */
     const PIN_KEY = 'dsh-plugin-tools-panel/pinned'
-    /** Where the last tab is remembered: `'tools'` or `'plugins'`. */
+    /** Where the last tab is remembered: `'tools'`, `'skills'`, `'prompts'` or `'plugins'`. */
     const TAB_KEY = 'dsh-plugin-tools-panel/tab'
     /** The tab a first-ever open shows. */
     const DEFAULT_TAB = 'plugins'
@@ -81,7 +85,42 @@ window.__ModuleLoader__.load({
     const ZH = {
       title: '工具面板',
       tabTools: '工具',
+      tabSkills: '技能',
+      tabPrompts: '提示词',
       tabPlugins: '插件',
+      // ---- skills
+      skillsSearch: '搜索技能',
+      skillsEmpty: '当前会话没有可用的技能',
+      skillsNoMatch: '没有匹配的技能',
+      skillsLoading: '正在读取技能…',
+      skillsFailed: '读取技能失败：',
+      skillsUnavailable: '当前部署没有技能服务，无法在这里管理技能。',
+      skillsNoAgent: '会话尚未启动，无法读取技能列表。',
+      skillsIncomplete: '技能目录没有读全，列表可能缺少条目。',
+      skillsNoFile: '该技能由插件动态提供，没有可编辑的文件',
+      skillsNote: '关闭后模型看不到该技能，但 /技能名 仍可手动调用；改动写入 SKILL.md，对所有会话生效。',
+      skillsUserOff: '该技能本来就不能手动调用，关闭后完全不可用。',
+      skillsWarning: '文件已写入，但技能目录还没刷新；稍后刷新或再试一次。',
+      // ---- prompts
+      promptsSearch: '搜索提示词段落',
+      promptsEmpty: '当前会话没有可管理的提示词段落',
+      promptsNoMatch: '没有匹配的段落',
+      promptsLoading: '正在读取系统提示词…',
+      promptsFailed: '读取提示词失败：',
+      promptsUnavailable: '当前部署没有系统提示词服务，无法列出注入段落。',
+      promptsNoAgent: '会话尚未启动，无法预览注入段落；已关闭的段落仍会保留。',
+      promptsAssembleFailed: '系统提示词装配失败',
+      promptsSole: '这是当前唯一的提示词段落，关闭会让提示词为空',
+      promptsMissing: '当前装配里没有这一段',
+      promptsEmptyText: '（这一段的当前文本为空）',
+      promptsGlobal: '全局',
+      promptsNote: '关闭后这一段不会进入系统提示词，下一条消息生效；改动全局生效，不改任何插件文件。',
+      promptsReset: '全部恢复',
+      promptsResetConfirm: '再点一次恢复',
+      promptsTruncated: '已截断',
+      promptsSaving: '正在应用…',
+      promptsWarning: '设置已保存，但本会话没有立即生效；请刷新重试。',
+      refresh: '刷新',
       // ---- tools
       search: '搜索工具',
       denyAll: '全部禁用',
@@ -126,7 +165,40 @@ window.__ModuleLoader__.load({
     const EN = {
       title: 'Tool panel',
       tabTools: 'Tools',
+      tabSkills: 'Skills',
+      tabPrompts: 'Prompts',
       tabPlugins: 'Plugins',
+      skillsSearch: 'Search skills',
+      skillsEmpty: 'This session has no skills',
+      skillsNoMatch: 'No matching skills',
+      skillsLoading: 'Reading skills…',
+      skillsFailed: 'Could not read skills: ',
+      skillsUnavailable: 'This deployment has no skills service, so skills cannot be managed here.',
+      skillsNoAgent: 'This session is not running, so its skills cannot be read.',
+      skillsIncomplete: 'The skill catalog was read incompletely; rows may be missing.',
+      skillsNoFile: 'This skill is provided at runtime and has no file to edit',
+      skillsNote: 'Turning this off hides the skill from the model, but /name still works. The change is written to SKILL.md and applies to every session.',
+      skillsUserOff: 'This skill is not user-invocable, so turning it off makes it fully unavailable.',
+      skillsWarning: 'The file was written, but the catalog has not refreshed yet; refresh or retry shortly.',
+      promptsSearch: 'Search prompt sections',
+      promptsEmpty: 'This session has no manageable prompt sections',
+      promptsNoMatch: 'No matching sections',
+      promptsLoading: 'Reading the system prompt…',
+      promptsFailed: 'Could not read the prompt: ',
+      promptsUnavailable: 'This deployment has no system prompt service, so injected sections cannot be listed.',
+      promptsNoAgent: 'This session is not running, so injected sections cannot be previewed; disabled sections are kept.',
+      promptsAssembleFailed: 'The system prompt failed to assemble',
+      promptsSole: 'This is the only prompt section; turning it off would leave the prompt empty',
+      promptsMissing: 'Not present in the current assembly',
+      promptsEmptyText: '(this section is currently empty)',
+      promptsGlobal: 'Global',
+      promptsNote: 'Turning a section off removes it from the next system prompt. The switch is global and does not edit any plugin file.',
+      promptsReset: 'Restore all',
+      promptsResetConfirm: 'Click again to restore',
+      promptsTruncated: 'truncated',
+      promptsSaving: 'Applying…',
+      promptsWarning: 'Saved, but this session did not pick it up; refresh and retry.',
+      refresh: 'Refresh',
       search: 'Search tools',
       denyAll: 'Disable all',
       allowAll: 'Enable all',
@@ -199,7 +271,9 @@ window.__ModuleLoader__.load({
     function readTab() {
       try {
         const raw = window.localStorage.getItem(TAB_KEY)
-        return raw === 'tools' || raw === 'plugins' ? raw : DEFAULT_TAB
+        return raw === 'tools' || raw === 'skills' || raw === 'prompts' || raw === 'plugins'
+          ? raw
+          : DEFAULT_TAB
       } catch {
         return DEFAULT_TAB
       }
@@ -227,9 +301,9 @@ window.__ModuleLoader__.load({
      *
      * The protocol check is what keeps a host/bundle version skew from masquerading
      * as a broken switch.
-     * @returns the answer's `state` object.
+     * @returns the answer's full envelope (`{ ok, state, applied? }`).
      */
-    async function call(init, url = ROUTE) {
+    async function request(init, url = ROUTE) {
       const response = await fetch(url, { cache: 'no-store', ...init })
       let payload
       try {
@@ -240,19 +314,26 @@ window.__ModuleLoader__.load({
       if (payload?.ok !== true) {
         // A host old enough to predate the protocol field answers the OLD shape
         // rather than refusing, so the mismatch is detected from the successful
-        // answer below. A 409 from a current host is the other direction of the
-        // same skew, and already carries the restart instruction.
-        throw response.status === 409
+        // answer below. A 409 on the STATE route is the other direction of the same
+        // skew and carries the restart instruction — but on the skills/prompt routes
+        // a 409 is an ordinary refusal (no file, unshadowable section, sole section),
+        // and turning those into "restart DSH" would hide the real reason.
+        throw response.status === 409 && url === ROUTE
           ? new StaleHostError(payload?.error)
           : new Error(payload?.error ?? `the Host answered ${response.status}`)
       }
       if (payload.state?.protocol !== PROTOCOL) {
         throw new StaleHostError(
-          `this page speaks tool-guard protocol ${PROTOCOL} but the Host answered ` +
+          `this page speaks tools-panel protocol ${PROTOCOL} but the Host answered ` +
             `${payload.state?.protocol ?? 'an older revision'}; restart DSH to load the matching host half`
         )
       }
-      return payload.state
+      return payload
+    }
+
+    /** One request, reduced to its `state` object (the shape every tab reads). */
+    async function call(init, url = ROUTE) {
+      return (await request(init, url)).state
     }
 
     /**
@@ -291,6 +372,40 @@ window.__ModuleLoader__.load({
         headers: { 'content-type': 'application/json', [HEADER]: '1' },
         body: JSON.stringify({ sessionId, groups })
       })
+
+    // --- the skills and prompt tabs: talking to the Host --------------------------
+    const readSkills = (sessionId) =>
+      call({ method: 'GET' }, `${SKILLS_ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
+
+    /** One skill's model visibility; the answer also says whether it took effect. */
+    const writeSkill = async (sessionId, name, enabled) => {
+      const answer = await request({
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER]: '1' },
+        body: JSON.stringify({ sessionId, name, enabled })
+      }, SKILLS_ROUTE)
+      return { state: answer.state, applied: answer.applied !== false }
+    }
+
+    const readPrompts = (sessionId) =>
+      call({ method: 'GET' }, `${PROMPTS_ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
+
+    /** One assembled section off/on; the Host verifies and rolls back on a refusal. */
+    const writePrompt = async (sessionId, name, enabled) => {
+      const answer = await request({
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER]: '1' },
+        body: JSON.stringify({ sessionId, name, enabled })
+      }, PROMPTS_ROUTE)
+      return { state: answer.state, applied: answer.applied !== false }
+    }
+
+    const resetPrompts = (sessionId) =>
+      call({
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER]: '1' },
+        body: JSON.stringify({ sessionId, reset: true })
+      }, PROMPTS_ROUTE)
 
     // --- the plugin tab: pins and the manager -------------------------------------
     // --- the pinned set -----------------------------------------------------------
@@ -911,8 +1026,8 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-primary);
   overflow: hidden;
 }
-/* Two equal tabs across the top: a segmented control, not a list of links, because
-   these two views are peers of one panel rather than navigation. */
+/* Four equal tabs across the top: a segmented control, not a list of links, because
+   these views are peers of one panel rather than navigation. */
 .dsh-tools-panel-tabs {
   display: flex;
   gap: 2px;
@@ -963,6 +1078,103 @@ window.__ModuleLoader__.load({
   min-height: 0;
   padding: 4px;
 }
+/* Skills: the tool row with a second, quieter line. The switch stays top-aligned so
+   a two-line description cannot pull it away from the name it belongs to. */
+.dsh-tools-panel-skill-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: var(--dsw-radius-md);
+}
+.dsh-tools-panel-skill-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-tools-panel-skill-meta { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.dsh-tools-panel-skill-desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 15px;
+  word-break: break-word;
+}
+.dsh-tools-panel-skill-rowOff .dsh-tools-panel-tool-name { color: var(--dsw-alias-label-secondary); }
+.dsh-tools-panel-skill-badge {
+  color: var(--dsw-alias-label-caption);
+  font-family: var(--ds-font-family-code);
+  font-size: 10px;
+  line-height: 14px;
+}
+/* Prompts: one column per section. The head is the switch row; the preview is a
+   second line and doubles as the disclosure target, so a long section does not
+   need its own button. */
+.dsh-tools-panel-prompt-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: var(--dsw-radius-md);
+}
+.dsh-tools-panel-prompt-row:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dsh-tools-panel-prompt-rowOff .dsh-tools-panel-prompt-name { color: var(--dsw-alias-label-secondary); }
+.dsh-tools-panel-prompt-rowMissing { opacity: .6; }
+.dsh-tools-panel-prompt-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dsh-tools-panel-prompt-name {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: start;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.dsh-tools-panel-prompt-name:focus-visible { outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary)); outline-offset: 1px; }
+.dsh-tools-panel-prompt-global {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-caption);
+  font-size: 10px;
+  line-height: 14px;
+}
+.dsh-tools-panel-prompt-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 15px;
+  word-break: break-word;
+  cursor: pointer;
+}
+.dsh-tools-panel-prompt-text {
+  max-height: 160px;
+  margin: 2px 0 0;
+  padding: 6px;
+  overflow: auto;
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font-family: var(--ds-font-family-code);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.dsh-tools-panel-prompt-note { color: var(--dsw-alias-label-caption); font-size: 10px; line-height: 14px; }
+.dsh-tools-panel-inlineWarn { color: var(--dsw-alias-state-warn-label); font-size: 11px; line-height: 16px; }
+.dsh-tools-panel-actions { display: flex; align-items: center; gap: 6px; padding: 4px 8px 2px; }
 `
 
     // --- icons ------------------------------------------------------------------
@@ -2038,16 +2250,646 @@ window.__ModuleLoader__.load({
     }
   }
 
+    // --- skills tab -------------------------------------------------------------
+    /**
+     * The skills tab: one row per skill the session can use, one switch per row.
+     *
+     * The switch writes `disable-model-invocation` in the skill's own SKILL.md, so
+     * it is a durable, file-level answer rather than session state. A skill with no
+     * file (registered by a plugin at runtime) has no row switch to offer, so its
+     * switch is disabled and says why instead of pretending.
+     */
+    function makeSkillsTab(ctx) {
+      return function SkillsTab({ t: seat, sessionId, active }) {
+        const t = typeof seat === 'function' ? seat : translateWith(seat ?? copyFor(ctx))
+        const activeSession = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined
+        const [data, setData] = useState(undefined)
+        const [status, setStatus] = useState(undefined)
+        const [error, setError] = useState(undefined)
+        const [stale, setStale] = useState(undefined)
+        const [warning, setWarning] = useState(undefined)
+        const [saving, setSaving] = useState(() => new Set())
+        const [query, setQuery] = useState('')
+        const liveRef = useRef(true)
+        const dataRef = useRef(undefined)
+        useEffect(() => {
+          liveRef.current = true
+          return () => {
+            liveRef.current = false
+          }
+        }, [])
+
+        const load = useCallback((quiet) => {
+          if (activeSession === undefined) {
+            setError('this slot carries no session id')
+            setStatus('error')
+            return
+          }
+          if (!quiet) setStatus('loading')
+          readSkills(activeSession)
+            .then((next) => {
+              if (!liveRef.current) return
+              dataRef.current = next
+              setData(next)
+              setError(undefined)
+              setStale(undefined)
+              setStatus('ready')
+            })
+            .catch((failure) => {
+              if (!liveRef.current) return
+              if (failure instanceof StaleHostError) {
+                setStale(String(failure.message))
+                setData(undefined)
+                setStatus('error')
+                return
+              }
+              if (quiet && dataRef.current !== undefined) return
+              setError(String(failure?.message ?? failure))
+              setStatus('error')
+            })
+        }, [activeSession])
+
+        useEffect(() => {
+          if (active) load()
+        }, [active, load])
+
+        const toggle = useCallback((row) => {
+          if (activeSession === undefined || row.toggleable !== true) return
+          const next = !row.modelInvocable
+          const previous = dataRef.current
+          setSaving((prev) => new Set(prev).add(row.name))
+          setWarning(undefined)
+          setData((prev) => prev === undefined
+            ? prev
+            : {
+                ...prev,
+                skills: prev.skills.map((skill) =>
+                  skill.name === row.name ? { ...skill, modelInvocable: next } : skill
+                )
+              })
+          writeSkill(activeSession, row.name, next)
+            .then((answer) => {
+              if (!liveRef.current) return
+              dataRef.current = answer.state
+              setData(answer.state)
+              setError(undefined)
+              setStale(undefined)
+              if (!answer.applied) setWarning(t('skillsWarning'))
+            })
+            .catch((failure) => {
+              if (!liveRef.current) return
+              if (previous !== undefined) {
+                dataRef.current = previous
+                setData(previous)
+              }
+              if (failure instanceof StaleHostError) {
+                setStale(String(failure.message))
+                setData(undefined)
+                setStatus('error')
+                return
+              }
+              setError(`${t('saveFailed')}${String(failure?.message ?? failure)}`)
+            })
+            .finally(() => {
+              if (!liveRef.current) return
+              setSaving((prev) => {
+                const set = new Set(prev)
+                set.delete(row.name)
+                return set
+              })
+            })
+        }, [activeSession, t])
+
+        const skills = data?.skills ?? []
+        const visible = useMemo(() => {
+          const needle = query.trim().toLowerCase()
+          if (needle.length === 0) return skills
+          return skills.filter((skill) =>
+            skill.name.toLowerCase().includes(needle) ||
+            String(skill.description ?? '').toLowerCase().includes(needle)
+          )
+        }, [skills, query])
+        const emptyText =
+          data?.available === false
+            ? t('skillsUnavailable')
+            : data?.reason === 'no-live-agent'
+              ? t('skillsNoAgent')
+              : skills.length === 0
+                ? t('skillsEmpty')
+                : t('skillsNoMatch')
+
+        return h(
+          'div',
+          { className: 'dsh-tools-panel-tabBody', role: 'tabpanel' },
+          stale !== undefined
+            ? h(
+                'div',
+                { className: 'dsh-tools-panel-tool-status' },
+                h('span', { className: 'dsh-tools-panel-tool-error' }, t('staleHost')),
+                h('span', { className: 'dsh-tools-panel-tool-hint' }, stale)
+              )
+            : [
+                h('input', {
+                  key: 'search',
+                  className: 'dsh-tools-panel-tool-search',
+                  type: 'search',
+                  value: query,
+                  placeholder: t('skillsSearch'),
+                  'aria-label': t('skillsSearch'),
+                  onChange: (event) => setQuery(event.target.value)
+                }),
+                h(
+                  'div',
+                  { key: 'actions', className: 'dsh-tools-panel-actions' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-tools-panel-tool-bulkButton',
+                      disabled: status === 'loading',
+                      onClick: () => load(true)
+                    },
+                    t('refresh')
+                  )
+                ),
+                h(
+                  'div',
+                  { key: 'list', className: 'dsh-tools-panel-tool-list' },
+                  status === 'loading' || (status === undefined && data === undefined)
+                    ? h(
+                        'div',
+                        { className: 'dsh-tools-panel-tool-status' },
+                        h('span', { className: 'dsh-tools-panel-tool-note' }, t('skillsLoading'))
+                      )
+                    : status === 'error'
+                      ? h(
+                          'div',
+                          { className: 'dsh-tools-panel-tool-status' },
+                          h('span', { className: 'dsh-tools-panel-tool-error' }, `${t('skillsFailed')}${error}`),
+                          h(
+                            'button',
+                            { type: 'button', className: 'dsh-tools-panel-tool-retry', onClick: () => load() },
+                            t('retry')
+                          )
+                        )
+                      : visible.length === 0
+                        ? h(
+                            'div',
+                            { className: 'dsh-tools-panel-tool-status' },
+                            h('span', { className: 'dsh-tools-panel-tool-note' }, emptyText)
+                          )
+                        : visible.map((row) => {
+                            const busy = saving.has(row.name)
+                            return h(
+                              'div',
+                              {
+                                key: row.name,
+                                className: row.modelInvocable
+                                  ? 'dsh-tools-panel-skill-row'
+                                  : 'dsh-tools-panel-skill-row dsh-tools-panel-skill-rowOff'
+                              },
+                              h(
+                                'div',
+                                { className: 'dsh-tools-panel-skill-meta' },
+                                h('span', { className: 'dsh-tools-panel-tool-name', title: row.name }, row.name),
+                                row.description === undefined || row.description.length === 0
+                                  ? null
+                                  : h(
+                                      'span',
+                                      { className: 'dsh-tools-panel-skill-desc', title: row.description },
+                                      row.description
+                                    ),
+                                [row.provider, row.source].filter((value) => typeof value === 'string' && value.length > 0).length === 0
+                                  ? null
+                                  : h(
+                                      'span',
+                                      { className: 'dsh-tools-panel-skill-badge' },
+                                      [row.provider, row.source]
+                                        .filter((value) => typeof value === 'string' && value.length > 0)
+                                        .join(' · ')
+                                    )
+                              ),
+                              h(
+                                'button',
+                                {
+                                  type: 'button',
+                                  role: 'switch',
+                                  className: 'dsh-tools-panel-tool-switch',
+                                  'aria-checked': row.modelInvocable,
+                                  'aria-label': row.name,
+                                  disabled: row.toggleable !== true || busy,
+                                  title: row.toggleable !== true ? t('skillsNoFile') : row.name,
+                                  onClick: () => toggle(row)
+                                },
+                                h('span', { className: 'dsh-tools-panel-tool-thumb', 'aria-hidden': 'true' })
+                              )
+                            )
+                          }
+                        )
+                      ),
+                status !== 'error' && error !== undefined
+                  ? h(
+                      'div',
+                      { key: 'saveError', className: 'dsh-tools-panel-tool-status' },
+                      h('span', { className: 'dsh-tools-panel-tool-error' }, `${t('saveFailed')}${error}`)
+                    )
+                  : null,
+                warning === undefined
+                  ? null
+                  : h(
+                      'div',
+                      { key: 'warning', className: 'dsh-tools-panel-tool-status' },
+                      h('span', { className: 'dsh-tools-panel-inlineWarn' }, warning)
+                    ),
+                data?.complete === false
+                  ? h(
+                      'div',
+                      { key: 'incomplete', className: 'dsh-tools-panel-tool-status' },
+                      h('span', { className: 'dsh-tools-panel-tool-note' }, t('skillsIncomplete'))
+                    )
+                  : null,
+                h(
+                  'div',
+                  { key: 'note', className: 'dsh-tools-panel-tool-status' },
+                  h('span', { className: 'dsh-tools-panel-tool-note' }, t('skillsNote'))
+                )
+              ]
+        )
+      }
+    }
+
+    // --- prompts tab ------------------------------------------------------------
+    /**
+     * The prompt tab: the system prompt sections the session actually assembles.
+     *
+     * This is a VIEW of the injection, not an editor: the section text is read-only,
+     * and the switch is an empty same-name shadow in the agent's scope. The list
+     * includes sections injected by other plugins, which is the whole point — the
+     * user can see and stop any injected prompt segment without editing a package.
+     */
+    function makePromptsTab(ctx) {
+      return function PromptsTab({ t: seat, sessionId, active }) {
+        const t = typeof seat === 'function' ? seat : translateWith(seat ?? copyFor(ctx))
+        const activeSession = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined
+        const [data, setData] = useState(undefined)
+        const [status, setStatus] = useState(undefined)
+        const [error, setError] = useState(undefined)
+        const [stale, setStale] = useState(undefined)
+        const [warning, setWarning] = useState(undefined)
+        const [saving, setSaving] = useState(() => new Set())
+        const [expanded, setExpanded] = useState(() => new Set())
+        const [query, setQuery] = useState('')
+        const [resetArmed, setResetArmed] = useState(false)
+        const resetTimer = useRef(undefined)
+        const liveRef = useRef(true)
+        const dataRef = useRef(undefined)
+        useEffect(() => {
+          liveRef.current = true
+          return () => {
+            liveRef.current = false
+            if (resetTimer.current !== undefined) window.clearTimeout(resetTimer.current)
+          }
+        }, [])
+
+        const load = useCallback((quiet) => {
+          if (activeSession === undefined) {
+            setError('this slot carries no session id')
+            setStatus('error')
+            return
+          }
+          if (!quiet) setStatus('loading')
+          readPrompts(activeSession)
+            .then((next) => {
+              if (!liveRef.current) return
+              dataRef.current = next
+              setData(next)
+              setError(undefined)
+              setStale(undefined)
+              setStatus('ready')
+            })
+            .catch((failure) => {
+              if (!liveRef.current) return
+              if (failure instanceof StaleHostError) {
+                setStale(String(failure.message))
+                setData(undefined)
+                setStatus('error')
+                return
+              }
+              if (quiet && dataRef.current !== undefined) return
+              setError(String(failure?.message ?? failure))
+              setStatus('error')
+            })
+        }, [activeSession])
+
+        useEffect(() => {
+          if (active) load()
+        }, [active, load])
+
+        const toggle = useCallback((row) => {
+          if (activeSession === undefined || row.toggleable !== true) return
+          const next = !row.enabled
+          const previous = dataRef.current
+          setSaving((prev) => new Set(prev).add(row.name))
+          setWarning(undefined)
+          setData((prev) => prev === undefined
+            ? prev
+            : {
+                ...prev,
+                sections: prev.sections.map((section) =>
+                  section.name === row.name ? { ...section, enabled: next } : section
+                )
+              })
+          writePrompt(activeSession, row.name, next)
+            .then((answer) => {
+              if (!liveRef.current) return
+              dataRef.current = answer.state
+              setData(answer.state)
+              setError(undefined)
+              setStale(undefined)
+              if (!answer.applied) setWarning(t('promptsWarning'))
+            })
+            .catch((failure) => {
+              if (!liveRef.current) return
+              if (previous !== undefined) {
+                dataRef.current = previous
+                setData(previous)
+              }
+              if (failure instanceof StaleHostError) {
+                setStale(String(failure.message))
+                setData(undefined)
+                setStatus('error')
+                return
+              }
+              setError(`${t('saveFailed')}${String(failure?.message ?? failure)}`)
+            })
+            .finally(() => {
+              if (!liveRef.current) return
+              setSaving((prev) => {
+                const set = new Set(prev)
+                set.delete(row.name)
+                return set
+              })
+            })
+        }, [activeSession, t])
+
+        const reset = useCallback(() => {
+          if (activeSession === undefined) return
+          if (!resetArmed) {
+            setResetArmed(true)
+            if (resetTimer.current !== undefined) window.clearTimeout(resetTimer.current)
+            resetTimer.current = window.setTimeout(() => setResetArmed(false), 3000)
+            return
+          }
+          setResetArmed(false)
+          if (resetTimer.current !== undefined) window.clearTimeout(resetTimer.current)
+          setStatus('loading')
+          resetPrompts(activeSession)
+            .then((next) => {
+              if (!liveRef.current) return
+              dataRef.current = next
+              setData(next)
+              setError(undefined)
+              setStale(undefined)
+              setWarning(undefined)
+              setStatus('ready')
+            })
+            .catch((failure) => {
+              if (!liveRef.current) return
+              if (failure instanceof StaleHostError) {
+                setStale(String(failure.message))
+                setData(undefined)
+                setStatus('error')
+                return
+              }
+              setError(String(failure?.message ?? failure))
+              setStatus('error')
+            })
+        }, [activeSession, resetArmed])
+
+        const sections = data?.sections ?? []
+        const visible = useMemo(() => {
+          const needle = query.trim().toLowerCase()
+          if (needle.length === 0) return sections
+          return sections.filter((section) =>
+            section.name.toLowerCase().includes(needle) ||
+            String(section.text ?? '').toLowerCase().includes(needle)
+          )
+        }, [sections, query])
+        const emptyText =
+          data?.available === false
+            ? t('promptsUnavailable')
+            : sections.length === 0
+              ? t('promptsEmpty')
+              : t('promptsNoMatch')
+
+        return h(
+          'div',
+          { className: 'dsh-tools-panel-tabBody', role: 'tabpanel' },
+          stale !== undefined
+            ? h(
+                'div',
+                { className: 'dsh-tools-panel-tool-status' },
+                h('span', { className: 'dsh-tools-panel-tool-error' }, t('staleHost')),
+                h('span', { className: 'dsh-tools-panel-tool-hint' }, stale)
+              )
+            : [
+                h('input', {
+                  key: 'search',
+                  className: 'dsh-tools-panel-tool-search',
+                  type: 'search',
+                  value: query,
+                  placeholder: t('promptsSearch'),
+                  'aria-label': t('promptsSearch'),
+                  onChange: (event) => setQuery(event.target.value)
+                }),
+                h(
+                  'div',
+                  { key: 'actions', className: 'dsh-tools-panel-actions' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-tools-panel-tool-bulkButton',
+                      disabled: status === 'loading',
+                      onClick: () => load(true)
+                    },
+                    t('refresh')
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-tools-panel-tool-bulkButton',
+                      disabled: status === 'loading' || (data?.disabled?.length ?? 0) === 0,
+                      onClick: reset
+                    },
+                    resetArmed ? t('promptsResetConfirm') : t('promptsReset')
+                  )
+                ),
+                data?.reason === 'no-live-agent'
+                  ? h(
+                      'div',
+                      { key: 'noagent', className: 'dsh-tools-panel-tool-status' },
+                      h('span', { className: 'dsh-tools-panel-tool-note' }, t('promptsNoAgent'))
+                    )
+                  : null,
+                data?.available === false && data?.reason !== 'no-system-prompt'
+                  ? h(
+                      'div',
+                      { key: 'unavailable', className: 'dsh-tools-panel-tool-status' },
+                      h(
+                        'span',
+                        { className: 'dsh-tools-panel-tool-note' },
+                        data.reason === 'assemble-failed'
+                          ? `${t('promptsAssembleFailed')}: ${data.error ?? ''}`
+                          : t('promptsUnavailable')
+                      )
+                    )
+                  : null,
+                h(
+                  'div',
+                  { key: 'list', className: 'dsh-tools-panel-tool-list' },
+                  status === 'loading' || (status === undefined && data === undefined)
+                    ? h(
+                        'div',
+                        { className: 'dsh-tools-panel-tool-status' },
+                        h('span', { className: 'dsh-tools-panel-tool-note' }, t('promptsLoading'))
+                      )
+                    : status === 'error'
+                      ? h(
+                          'div',
+                          { className: 'dsh-tools-panel-tool-status' },
+                          h('span', { className: 'dsh-tools-panel-tool-error' }, `${t('promptsFailed')}${error}`),
+                          h(
+                            'button',
+                            { type: 'button', className: 'dsh-tools-panel-tool-retry', onClick: () => load() },
+                            t('retry')
+                          )
+                        )
+                      : visible.length === 0
+                        ? h(
+                            'div',
+                            { className: 'dsh-tools-panel-tool-status' },
+                            h('span', { className: 'dsh-tools-panel-tool-note' }, emptyText)
+                          )
+                        : visible.map((row) => {
+                            const busy = saving.has(row.name)
+                            const open = expanded.has(row.name)
+                            return h(
+                              'div',
+                              {
+                                key: row.name,
+                                className: [
+                                  'dsh-tools-panel-prompt-row',
+                                  row.enabled ? '' : 'dsh-tools-panel-prompt-rowOff',
+                                  row.present === false ? 'dsh-tools-panel-prompt-rowMissing' : ''
+                                ].filter(Boolean).join(' ')
+                              },
+                              h(
+                                'div',
+                                { className: 'dsh-tools-panel-prompt-head' },
+                                h(
+                                  'button',
+                                  {
+                                    type: 'button',
+                                    className: 'dsh-tools-panel-prompt-name',
+                                    'aria-expanded': open,
+                                    title: row.name,
+                                    onClick: () =>
+                                      setExpanded((prev) => {
+                                        const next = new Set(prev)
+                                        if (next.has(row.name)) next.delete(row.name)
+                                        else next.add(row.name)
+                                        return next
+                                      })
+                                  },
+                                  row.name
+                                ),
+                                h('span', { className: 'dsh-tools-panel-prompt-global' }, t('promptsGlobal')),
+                                h(
+                                  'button',
+                                  {
+                                    type: 'button',
+                                    role: 'switch',
+                                    className: 'dsh-tools-panel-tool-switch',
+                                    'aria-checked': row.enabled,
+                                    'aria-label': row.name,
+                                    disabled: row.toggleable !== true || busy,
+                                    title: row.reason === 'sole-section'
+                                      ? t('promptsSole')
+                                      : row.toggleable !== true
+                                        ? t('promptsSole')
+                                        : row.name,
+                                    onClick: () => toggle(row)
+                                  },
+                                  h('span', { className: 'dsh-tools-panel-tool-thumb', 'aria-hidden': 'true' })
+                                )
+                              ),
+                              h(
+                                'div',
+                                {
+                                  className: 'dsh-tools-panel-prompt-preview',
+                                  onClick: () =>
+                                    setExpanded((prev) => {
+                                      const next = new Set(prev)
+                                      if (next.has(row.name)) next.delete(row.name)
+                                      else next.add(row.name)
+                                      return next
+                                    })
+                                },
+                                row.text.length === 0 ? t('promptsEmptyText') : String(row.text).split('\n')[0]
+                              ),
+                              row.present === false
+                                ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsMissing'))
+                                : null,
+                              open
+                                ? h(
+                                    'pre',
+                                    { className: 'dsh-tools-panel-prompt-text' },
+                                    row.text.length === 0 ? t('promptsEmptyText') : row.text
+                                  )
+                                : null,
+                              open && row.truncated === true
+                                ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsTruncated'))
+                                : null
+                            )
+                          }
+                        )
+                      ),
+                status !== 'error' && error !== undefined
+                  ? h(
+                      'div',
+                      { key: 'saveError', className: 'dsh-tools-panel-tool-status' },
+                      h('span', { className: 'dsh-tools-panel-tool-error' }, `${t('saveFailed')}${error}`)
+                    )
+                  : null,
+                warning === undefined
+                  ? null
+                  : h(
+                      'div',
+                      { key: 'warning', className: 'dsh-tools-panel-tool-status' },
+                      h('span', { className: 'dsh-tools-panel-inlineWarn' }, warning)
+                    ),
+                h(
+                  'div',
+                  { key: 'note', className: 'dsh-tools-panel-tool-status' },
+                  h('span', { className: 'dsh-tools-panel-tool-note' }, t('promptsNote'))
+                )
+              ]
+        )
+      }
+    }
+
     // --- the panel shell ---------------------------------------------------------
     /**
-     * The one control: a trigger, a menu, and two tabs.
+     * The one control: a trigger, a menu, and four tabs.
      *
      * The shell owns only what is COMMON — the open state, the anchor, dismissal, the
      * tab bar, and the menu frame. Each tab keeps its own state and its own Host
      * conversation, so switching tabs does not throw away a search string, a
-     * selection, or a loaded plugin list. Both tabs are mounted the whole time and
-     * merely hidden: unmounting the inactive one would re-read the plugin manager
-     * (every manifest on disk) on every tab switch.
+     * selection, or a loaded plugin list. All four tabs are mounted the whole time and
+     * merely hidden: unmounting an inactive one would re-read its Host data on every
+     * tab switch.
      */
     function makePanel(ctx) {
       return function ToolsPanel({ t: seat, sessionId }) {
@@ -2113,6 +2955,8 @@ window.__ModuleLoader__.load({
         }, [open])
 
         const Tools = useMemo(() => makeToolsTab(ctx), [ctx])
+        const Skills = useMemo(() => makeSkillsTab(ctx), [ctx])
+        const Prompts = useMemo(() => makePromptsTab(ctx), [ctx])
         const Plugins = useMemo(() => makePluginsTab(ctx), [ctx])
 
         /** One tab button. `aria-selected` is the contract a tablist needs. */
@@ -2160,6 +3004,8 @@ window.__ModuleLoader__.load({
                     'div',
                     { className: 'dsh-tools-panel-tabs', role: 'tablist', 'aria-label': t('title') },
                     tabButton('tools', t('tabTools')),
+                    tabButton('skills', t('tabSkills')),
+                    tabButton('prompts', t('tabPrompts')),
                     tabButton('plugins', t('tabPlugins'))
                   ),
                   // Both tabs stay MOUNTED; the inactive one is hidden with `display`
@@ -2177,6 +3023,22 @@ window.__ModuleLoader__.load({
                         style: tab === 'tools' ? undefined : { display: 'none' }
                       },
                       h(Tools, { sessionId, active: tab === 'tools' })
+                    ),
+                    h(
+                      'div',
+                      {
+                        className: 'dsh-tools-panel-pane',
+                        style: tab === 'skills' ? undefined : { display: 'none' }
+                      },
+                      h(Skills, { sessionId, active: tab === 'skills' })
+                    ),
+                    h(
+                      'div',
+                      {
+                        className: 'dsh-tools-panel-pane',
+                        style: tab === 'prompts' ? undefined : { display: 'none' }
+                      },
+                      h(Prompts, { sessionId, active: tab === 'prompts' })
                     ),
                     h(
                       'div',
