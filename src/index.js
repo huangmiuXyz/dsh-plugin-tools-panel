@@ -74,7 +74,7 @@
  *   one conversation. The deny list stays per-session and in memory.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -489,6 +489,42 @@ function truncateText(value, max) {
   return text.length > max
     ? { text: `${text.slice(0, max - 1)}…`, truncated: true }
     : { text, truncated: false }
+}
+
+/** Write a file through a same-directory temp + rename, so a reader never sees a half file. */
+function writeFileAtomic(path, content) {
+  const temp = `${path}.tmp-${process.pid}-${Date.now()}`
+  try {
+    writeFileSync(temp, content, 'utf8')
+    renameSync(temp, path)
+  } catch (error) {
+    try {
+      unlinkSync(temp)
+    } catch {
+      /* the temp file was never created, or is already gone */
+    }
+    throw error
+  }
+}
+
+/**
+ * Turn OFF a `disable-model-invocation` key that a skill's file already carries.
+ *
+ * The switch itself never edits files (it is a scoped shadow). The one exception is
+ * turning a skill ON whose SKILL.md was already marked disabled — by an earlier
+ * version of this panel, or by the skill author. Without clearing that line the
+ * switch could never take effect, so "on" would be a lie. Exactly one top-level key
+ * is touched; the rest of the file is preserved byte for byte.
+ */
+function clearFrontmatterDisable(path) {
+  try {
+    const text = readFileSync(path, 'utf8')
+    const key = /^disable-model-invocation[ \t]*:[ \t]*true[ \t]*$/m
+    if (!key.test(text)) return
+    writeFileAtomic(path, text.replace(key, 'disable-model-invocation: false'))
+  } catch {
+    /* verification below reports what the catalog actually sees */
+  }
 }
 
 /**
@@ -1103,6 +1139,13 @@ async function toggleSkill(host, sessionId, name, enabled, signal) {
   }
   const row = listed.skills.find((skill) => skill.name === name)
   if (row === undefined) throw new PanelError(404, `unknown skill "${name}"`)
+
+  // A shadow can only ADD a disable; it cannot make a file's own `true` key go away.
+  // So enabling a skill that the file itself disables has to clear that one line,
+  // otherwise the switch would report success and change nothing.
+  if (enabled && !skillDisabled.has(name) && row.modelInvocable === false && typeof row.path === 'string') {
+    clearFrontmatterDisable(row.path)
+  }
 
   const previous = new Set(skillDisabled)
   if (enabled) skillDisabled.delete(name)

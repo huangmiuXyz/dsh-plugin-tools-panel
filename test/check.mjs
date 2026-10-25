@@ -1256,6 +1256,30 @@ try {
     check('skills route: the switch can be turned back on', on.applied === true && fileEnabled(alphaPath) === true)
     check('skills route: enabling removes the shadow', host.extras.skills.__shadowCount('root-a') === 0)
 
+    // A skill whose FILE already disables it: a shadow cannot lift that key, so "on"
+    // must clear the one line — otherwise the switch would report success and change
+    // nothing. Everything else in the file stays.
+    fs.writeFileSync(
+      alphaPath,
+      '---\nname: alpha\ndescription: An alpha skill.\ndisable-model-invocation: true\n---\n\nDo alpha.\n'
+    )
+    const fileBlocked = await (await skillsGet('root-a')).json()
+    check(
+      'skills route: a file-disabled skill reads as off',
+      fileBlocked.state.skills.find((row) => row.name === 'alpha')?.modelInvocable === false
+    )
+    const lift = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: true })).json()
+    check(
+      'skills route: enabling clears a file key it cannot shadow',
+      lift.applied === true && fileEnabled(alphaPath) === true,
+      JSON.stringify(lift.applied)
+    )
+    check(
+      'skills route: the rest of that file survives',
+      fs.readFileSync(alphaPath, 'utf8').includes('Do alpha.') &&
+        fs.readFileSync(alphaPath, 'utf8').includes('name: alpha')
+    )
+
     // A runtime skill has no file, so the switch is a scoped shadow with both
     // invocation paths off. This is the switch the panel used to refuse.
     const virtualOff = await (await skillsPost({ sessionId: 'root-a', name: 'virtual', enabled: false })).json()
