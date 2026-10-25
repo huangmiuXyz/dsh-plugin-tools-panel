@@ -98,7 +98,6 @@ window.__ModuleLoader__.load({
       skillsNoAgent: '会话尚未启动，无法读取技能列表。',
       skillsIncomplete: '技能目录没有读全，列表可能缺少条目。',
       skillsNoFile: '该技能由插件动态提供，没有可编辑的文件',
-      skillsNote: '关闭后模型看不到该技能，但 /技能名 仍可手动调用；改动写入 SKILL.md，对所有会话生效。',
       skillsUserOff: '该技能本来就不能手动调用，关闭后完全不可用。',
       skillsWarning: '文件已写入，但技能目录还没刷新；稍后刷新或再试一次。',
       // ---- prompts
@@ -114,7 +113,6 @@ window.__ModuleLoader__.load({
       promptsMissing: '当前装配里没有这一段',
       promptsEmptyText: '（这一段的当前文本为空）',
       promptsGlobal: '全局',
-      promptsNote: '关闭后这一段不会进入系统提示词，下一条消息生效；改动全局生效，不改任何插件文件。',
       promptsReset: '全部恢复',
       promptsResetConfirm: '再点一次恢复',
       promptsTruncated: '已截断',
@@ -177,7 +175,6 @@ window.__ModuleLoader__.load({
       skillsNoAgent: 'This session is not running, so its skills cannot be read.',
       skillsIncomplete: 'The skill catalog was read incompletely; rows may be missing.',
       skillsNoFile: 'This skill is provided at runtime and has no file to edit',
-      skillsNote: 'Turning this off hides the skill from the model, but /name still works. The change is written to SKILL.md and applies to every session.',
       skillsUserOff: 'This skill is not user-invocable, so turning it off makes it fully unavailable.',
       skillsWarning: 'The file was written, but the catalog has not refreshed yet; refresh or retry shortly.',
       promptsSearch: 'Search prompt sections',
@@ -192,7 +189,6 @@ window.__ModuleLoader__.load({
       promptsMissing: 'Not present in the current assembly',
       promptsEmptyText: '(this section is currently empty)',
       promptsGlobal: 'Global',
-      promptsNote: 'Turning a section off removes it from the next system prompt. The switch is global and does not edit any plugin file.',
       promptsReset: 'Restore all',
       promptsResetConfirm: 'Click again to restore',
       promptsTruncated: 'truncated',
@@ -2507,12 +2503,7 @@ window.__ModuleLoader__.load({
                       { key: 'incomplete', className: 'dsh-tools-panel-tool-status' },
                       h('span', { className: 'dsh-tools-panel-tool-note' }, t('skillsIncomplete'))
                     )
-                  : null,
-                h(
-                  'div',
-                  { key: 'note', className: 'dsh-tools-panel-tool-status' },
-                  h('span', { className: 'dsh-tools-panel-tool-note' }, t('skillsNote'))
-                )
+                  : null
               ]
         )
       }
@@ -2869,12 +2860,7 @@ window.__ModuleLoader__.load({
                       'div',
                       { key: 'warning', className: 'dsh-tools-panel-tool-status' },
                       h('span', { className: 'dsh-tools-panel-inlineWarn' }, warning)
-                    ),
-                h(
-                  'div',
-                  { key: 'note', className: 'dsh-tools-panel-tool-status' },
-                  h('span', { className: 'dsh-tools-panel-tool-note' }, t('promptsNote'))
-                )
+                    )
               ]
         )
       }
