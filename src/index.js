@@ -74,7 +74,7 @@
  *   one conversation. The deny list stays per-session and in memory.
  */
 
-import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -280,6 +280,198 @@ function savePrompts(names) {
 
 /** The live disabled set, loaded once at module load and written on every change. */
 let promptDisabled = new Set(loadPrompts())
+
+// --- disabled runtime skills ---------------------------------------------------
+
+/**
+ * Where "this skill is off, but it has no file to edit" lives.
+ *
+ * A file-backed skill is switched by editing its frontmatter. A RUNTIME skill (a
+ * plugin's own registration, the built-in Office skill) has no SKILL.md, so the
+ * switch is a same-name runtime registration in each agent's own layer with BOTH
+ * invocation flags false: the model catalog filters `modelInvocable`, `/name`
+ * filters `userInvocable`, and the nearest-layer duplicate rule makes that empty
+ * shadow win over the real one. The set is global (every live agent gets it) and
+ * durable (this file), so the switch survives a restart.
+ */
+function skillsFile() {
+  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'dsh-plugin-tools-panel', 'skills.json')
+}
+
+/** Read the saved disabled-skill names; a missing or corrupt file means none. */
+function loadSkillDisabled() {
+  try {
+    const parsed = JSON.parse(readFileSync(skillsFile(), 'utf8'))
+    return normalizePromptNames(parsed?.disabled)
+  } catch {
+    return []
+  }
+}
+
+/** Persist the disabled-skill names atomically enough that a crash cannot truncate. */
+function saveSkillDisabled() {
+  try {
+    const file = skillsFile()
+    mkdirSync(dirname(file), { recursive: true })
+    const temp = `${file}.tmp-${process.pid}`
+    writeFileSync(temp, `${JSON.stringify({ version: 1, disabled: [...skillDisabled] }, null, 2)}\n`, 'utf8')
+    renameSync(temp, file)
+  } catch {
+    // A read-only home keeps the switch in memory for this process, which is the
+    // degraded-but-working outcome the prompt switches also accept.
+  }
+}
+
+/** The live disabled-skill set, loaded once at module load and written on every change. */
+let skillDisabled = new Set(loadSkillDisabled())
+
+/**
+ * A runtime skill can only be switched off by a shadow, and a shadow can only be
+ * registered into a live agent's scope. This is that half: one plugin fiber per
+ * agent that keeps a same-name registration alive for every disabled name.
+ */
+function createSkillShadows(scope, agents) {
+  const entries = new Map()
+  let live = true
+  let mountError
+
+  function mount(agent) {
+    if (!live) return
+    const id = agent?.id
+    if (typeof id !== 'string' || entries.has(id)) return
+    const agentCtx = agent?.ctx
+    if (agentCtx === undefined || typeof agentCtx.plugin !== 'function') {
+      mountError = 'agent scope has no ctx.plugin (older registry): skill shadows unavailable'
+      return
+    }
+    const holder = { sync: () => {} }
+    const plugin = {
+      name: 'dsh-plugin-tools-panel:skill-shadow',
+      inject: ['skills'],
+      apply(c) {
+        let stopped = false
+        const disposers = new Map()
+        const clear = () => {
+          for (const off of disposers.values()) {
+            try {
+              off()
+            } catch {
+              /* the layer is already gone */
+            }
+          }
+          disposers.clear()
+        }
+        const sync = (names) => {
+          if (stopped) return
+          const wanted = new Set(names)
+          for (const [name, off] of [...disposers]) {
+            if (wanted.has(name)) continue
+            try {
+              off()
+            } catch {
+              /* the layer is already gone */
+            }
+            disposers.delete(name)
+          }
+          for (const name of wanted) {
+            if (disposers.has(name)) continue
+            try {
+              disposers.set(name, c.skills.register(shadowSkill(name)))
+            } catch (error) {
+              // One name the layer refuses must not cost the others their shadow;
+              // the route's verification reports it.
+              mountError = String(error?.message ?? error)
+            }
+          }
+        }
+        holder.sync = sync
+        try {
+          c.effect(() => () => {
+            stopped = true
+            holder.sync = () => {}
+            clear()
+          })
+        } catch {
+          /* a minimal context without effect: the fiber teardown still runs */
+        }
+        sync([...skillDisabled])
+      }
+    }
+    try {
+      entries.set(id, { holder, fiber: agentCtx.plugin(plugin) })
+      mountError = undefined
+    } catch (error) {
+      mountError = String(error?.message ?? error)
+    }
+  }
+
+  function syncAll() {
+    if (!live) return
+    let list = []
+    try {
+      list = agents?.list?.() ?? []
+    } catch {
+      return
+    }
+    for (const agent of list) {
+      mount(agent)
+      try {
+        entries.get(agent.id)?.holder.sync?.([...skillDisabled])
+      } catch {
+        /* one dead scope must not stop the rest */
+      }
+    }
+  }
+
+  function release(id) {
+    entries.delete(id)
+  }
+
+  function dispose() {
+    live = false
+    for (const entry of entries.values()) {
+      try {
+        entry.fiber?.dispose?.()
+      } catch {
+        /* already gone */
+      }
+    }
+    entries.clear()
+  }
+
+  return {
+    mount,
+    syncAll,
+    release,
+    dispose,
+    get size() { return entries.size },
+    get error() { return mountError }
+  }
+}
+
+/** The empty same-name definition that hides a runtime skill on every boundary. */
+function shadowSkill(name) {
+  return {
+    name,
+    description: skillDescriptions.get(name) ?? 'Disabled in the tools panel.',
+    content: '',
+    source: 'dsh-plugin-tools-panel',
+    invocation: { modelInvocable: false, userInvocable: false }
+  }
+}
+
+/** The last observed description per skill, so a shadowed row still reads like itself. */
+const skillDescriptions = new Map()
+
+/** Remember a real skill's description; a shadow must not overwrite it with its own. */
+function noteSkillDescription(row) {
+  if (row.source === 'dsh-plugin-tools-panel') return
+  if (!skillDescriptions.has(row.name) && skillDescriptions.size >= MAX_SECTION_CACHE) return
+  skillDescriptions.set(row.name, row.description)
+}
 
 /** The last non-empty text seen for one section name, so a disabled row still previews. */
 const lastSectionText = new Map()
@@ -862,10 +1054,19 @@ async function cwdFor(host, agent, signal) {
   return typeof fallback === 'string' && fallback.length > 0 ? fallback : undefined
 }
 
-/** One skill as the tab draws it. `toggleable` is "there is a file to edit". */
+/**
+ * One skill as the tab draws it.
+ *
+ * `mode` says how a switch would take effect: `file` when the skill has a writable
+ * SKILL.md (edit its frontmatter), `shadow` when it is registered at runtime and
+ * only a same-name empty registration can hide it. Every row is switchable now;
+ * before this, runtime skills — the built-in ones and plugin-injected ones — showed
+ * a dead switch with a reason.
+ */
 function skillRow(skill) {
   const description = typeof skill?.description === 'string' ? skill.description : ''
   const path = typeof skill?.path === 'string' && skill.path.length > 0 ? skill.path : undefined
+  const writable = path !== undefined && isWritableFile(path)
   return {
     name: String(skill?.name ?? ''),
     description: description.length > MAX_SKILL_DESCRIPTION
@@ -874,10 +1075,21 @@ function skillRow(skill) {
     provider: typeof skill?.provider === 'string' ? skill.provider : undefined,
     source: typeof skill?.source === 'string' ? skill.source : undefined,
     path,
+    mode: writable ? 'file' : 'shadow',
     modelInvocable: skill?.invocation?.modelInvocable !== false,
     userInvocable: skill?.invocation?.userInvocable !== false,
-    toggleable: path !== undefined,
-    ...(path === undefined ? { reason: 'no-file' } : {})
+    toggleable: true
+  }
+}
+
+/** Whether a skill's file can actually be rewritten; a bundled/asar path cannot. */
+function isWritableFile(path) {
+  try {
+    if (!statSync(path).isFile()) return false
+    accessSync(path, 2)
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -901,6 +1113,7 @@ async function skillsState(host, sessionId, signal) {
   const rows = Array.isArray(snapshot?.skills)
     ? snapshot.skills.map(skillRow).filter((row) => row.name.length > 0)
     : []
+  for (const row of rows) noteSkillDescription(row)
   rows.sort((left, right) => left.name.localeCompare(right.name))
   return { ...base, available: true, complete: snapshot?.complete !== false, skills: rows }
 }
@@ -950,10 +1163,18 @@ async function refreshSkillCatalog(host) {
 }
 
 /**
- * Flip one skill's model visibility by editing its frontmatter.
+ * Flip one skill off or on.
  *
- * The path comes from the registry's own summary, never from the request body: the
- * route can only touch a file the skill provider already discovered.
+ * Two mechanisms, chosen by the registry's own row rather than by anything the
+ * request says:
+ *   - a writable SKILL.md is edited in place (`mode: 'file'`), which is durable,
+ *     visible in git, and independent of this plugin;
+ *   - a runtime skill (plugin-injected or built-in, no file) is shadowed by an
+ *     empty same-name registration in each agent's layer (`mode: 'shadow'`), with
+ *     both invocation flags false, so neither the model catalog nor `/name` can
+ *     reach it. The name is persisted and rolled back if the re-read disagrees.
+ *
+ * The path always comes from the registry's summary, never from the request body.
  */
 async function toggleSkill(host, sessionId, name, enabled, signal) {
   const listed = await skillsState(host, sessionId, signal)
@@ -962,30 +1183,60 @@ async function toggleSkill(host, sessionId, name, enabled, signal) {
   }
   const row = listed.skills.find((skill) => skill.name === name)
   if (row === undefined) throw new PanelError(404, `unknown skill "${name}"`)
-  if (row.toggleable !== true || typeof row.path !== 'string') {
-    throw new PanelError(409, 'this skill is provided at runtime and has no file to edit')
+
+  if (row.mode === 'file' && typeof row.path === 'string') {
+    const path = row.path
+    let before
+    let first
+    try {
+      before = readFileSync(path, 'utf8')
+      first = statSync(path)
+    } catch (error) {
+      throw new PanelError(409, `could not read ${path}: ${error?.message ?? error}`)
+    }
+    const next = patchSkillFrontmatter(before, enabled)
+    if (next === undefined) {
+      throw new PanelError(409, 'the skill file has no closed frontmatter block to edit')
+    }
+    const again = statSync(path)
+    if (again.mtimeMs !== first.mtimeMs || again.size !== first.size) {
+      throw new PanelError(409, 'the skill file changed while it was being edited; retry')
+    }
+    try {
+      writeFileAtomic(path, next)
+    } catch (error) {
+      throw new PanelError(500, `could not write ${path}: ${error?.message ?? error}`)
+    }
+    // A shadow left over from an earlier install would keep the file switch from
+    // meaning anything; the file is the truth for this skill, so drop it — but only
+    // once the re-read below confirms the file edit actually took effect.
+    await refreshSkillCatalog(host)
+    let after
+    try {
+      after = await skillsState(host, sessionId, signal)
+    } catch {
+      after = undefined
+    }
+    const applied = after?.skills?.find((skill) => skill.name === name)?.modelInvocable === enabled
+    if (applied && skillDisabled.delete(name)) {
+      saveSkillDisabled()
+      try {
+        host.skillShadows?.syncAll?.()
+      } catch {
+        /* the scopes are mounted elsewhere; the file edit already applied */
+      }
+    }
+    return { state: after ?? listed, applied }
   }
-  const path = row.path
-  let before
-  let first
+
+  const previous = new Set(skillDisabled)
+  if (enabled) skillDisabled.delete(name)
+  else skillDisabled.add(name)
+  saveSkillDisabled()
   try {
-    before = readFileSync(path, 'utf8')
-    first = statSync(path)
-  } catch (error) {
-    throw new PanelError(409, `could not read ${path}: ${error?.message ?? error}`)
-  }
-  const next = patchSkillFrontmatter(before, enabled)
-  if (next === undefined) {
-    throw new PanelError(409, 'the skill file has no closed frontmatter block to edit')
-  }
-  const again = statSync(path)
-  if (again.mtimeMs !== first.mtimeMs || again.size !== first.size) {
-    throw new PanelError(409, 'the skill file changed while it was being edited; retry')
-  }
-  try {
-    writeFileAtomic(path, next)
-  } catch (error) {
-    throw new PanelError(500, `could not write ${path}: ${error?.message ?? error}`)
+    host.skillShadows?.syncAll?.()
+  } catch {
+    /* verification below reports what the catalog actually sees */
   }
   await refreshSkillCatalog(host)
   let after
@@ -995,6 +1246,16 @@ async function toggleSkill(host, sessionId, name, enabled, signal) {
     after = undefined
   }
   const applied = after?.skills?.find((skill) => skill.name === name)?.modelInvocable === enabled
+  if (!applied) {
+    // A switch the catalog did not take must not survive in the file either.
+    skillDisabled = previous
+    saveSkillDisabled()
+    try {
+      host.skillShadows?.syncAll?.()
+    } catch {
+      /* nothing left to sync */
+    }
+  }
   return { state: after ?? listed, applied }
 }
 
@@ -1819,6 +2080,13 @@ export function apply(ctx) {
   const promptShadows = createPromptShadows(ctx, ctx.get('agents'))
   ctx.effect(() => () => promptShadows.dispose(), 'tools-panel: prompt shadows')
 
+  // The skills tab's other half: a same-name runtime registration with both
+  // invocation flags off, mounted inside each live agent's scope. It is what makes
+  // the runtime skills (plugin-injected, bundled) switchable at all — they have no
+  // SKILL.md to edit.
+  const skillShadows = createSkillShadows(ctx, ctx.get('agents'))
+  ctx.effect(() => () => skillShadows.dispose(), 'tools-panel: skill shadows')
+
   ctx.effect(() => ctx.tools.guard(makeGuard(policies, parents)), 'tools-panel: live guard')
 
   // Mount on the agent's own scope AND on the scopes above it: a preset's tool rows
@@ -1839,6 +2107,7 @@ export function apply(ctx) {
         // it; the lazy walk decides what that switch means for this child.
         mountWithAncestors(agent)
         promptShadows.mount(agent)
+        skillShadows.mount(agent)
       }),
       'tools-panel: delegation tree'
     )
@@ -1852,15 +2121,18 @@ export function apply(ctx) {
         // The restriction itself was owned by the agent scope and is already gone.
         restrictor.release(agent.id)
         promptShadows.release(agent.id)
+        skillShadows.release(agent.id)
       }),
       'tools-panel: tree cleanup'
     )
     for (const agent of agents.list()) {
       mountWithAncestors(agent)
       promptShadows.mount(agent)
+      skillShadows.mount(agent)
     }
     // A section switched off before this process had any agent must apply now.
     promptShadows.syncAll()
+    skillShadows.syncAll()
   }
 
   // A tool that appears after the switch was set (an MCP server connecting) must be
@@ -1873,6 +2145,7 @@ export function apply(ctx) {
     agents,
     restrictor,
     prompts: promptShadows,
+    skillShadows,
     // Probed per request, not captured at apply time: a service that appears after
     // this plugin mounts must still answer the tab instead of being reported absent.
     get skills() { return ctx.get('skills') },
@@ -1901,11 +2174,13 @@ export {
   cleanDeny,
   createPromptShadows,
   createRestrictor,
+  createSkillShadows,
   denyReason,
   denySetFor,
   groupsFile,
   loadGroups,
   loadPrompts,
+  loadSkillDisabled,
   makeGuard,
   normalizeGroups,
   normalizePromptNames,
@@ -1918,8 +2193,10 @@ export {
   promptsState,
   saveGroups,
   savePrompts,
+  saveSkillDisabled,
   scopesOf,
   setDeny,
+  skillsFile,
   skillsState,
   snapshot,
   togglePromptSection,
@@ -1936,6 +2213,16 @@ export function getPromptDisabled() {
 /** Test-only: replace the live disabled set without touching disk. */
 export function replacePromptDisabled(names) {
   promptDisabled = new Set(normalizePromptNames(names))
+}
+
+/** Test-only: the live disabled-skill names. */
+export function getSkillDisabled() {
+  return [...skillDisabled].sort()
+}
+
+/** Test-only: replace the live disabled-skill set without touching disk. */
+export function replaceSkillDisabled(names) {
+  skillDisabled = new Set(normalizePromptNames(names))
 }
 
 /** The live group definitions (read-only view; the route replaces the array). */

@@ -106,6 +106,7 @@ const {
   PROMPTS_ROUTE,
   SKILLS_ROUTE,
   getPromptDisabled,
+  getSkillDisabled,
   groupsFile,
   loadGroups,
   loadPrompts,
@@ -115,11 +116,13 @@ const {
   promptsFile,
   promptsState,
   replacePromptDisabled,
+  replaceSkillDisabled,
   saveGroups,
   savePrompts,
   setDeny,
   setGroups,
   getGroups,
+  skillsFile,
   skillsState,
   togglePromptSection,
   snapshot
@@ -659,6 +662,18 @@ function fakeHost() {
               return service.__scoped(id)(def)
             }
           },
+          // Resolved per CALL for the same reason as `systemPrompt`: the skill-shadow
+          // fiber is mounted when the agent appears, while the fake `skills` service is
+          // installed later by the skills-route test.
+          skills: {
+            register(def) {
+              const service = extras.skills
+              if (service === undefined || typeof service.__register !== 'function') {
+                throw new Error('no skills service')
+              }
+              return service.__register(id, def)
+            }
+          },
           effect: (fn) => fn(),
           get: () => undefined,
           on: () => () => {}
@@ -1185,31 +1200,53 @@ try {
   fs.mkdirSync(path.dirname(alphaPath), { recursive: true })
   fs.writeFileSync(alphaPath, '---\nname: alpha\ndescription: An alpha skill.\n---\n\nDo alpha.\n')
   const fileEnabled = (file) => !/^disable-model-invocation:\s*true\s*$/m.test(fs.readFileSync(file, 'utf8'))
+  const skillShadowDefs = new Map()
   host.extras.skills = {
-    async snapshot() {
-      return {
-        complete: true,
-        skills: [
-          {
-            name: 'alpha',
-            description: 'An alpha skill.',
-            provider: 'fs',
-            source: 'project',
-            path: alphaPath,
-            invocation: { modelInvocable: fileEnabled(alphaPath), userInvocable: true }
-          },
-          {
-            name: 'virtual',
-            description: 'Registered by a plugin; no file.',
-            provider: 'plugin',
-            source: 'plugin',
-            invocation: { modelInvocable: true, userInvocable: true }
-          }
-        ]
-      }
+    async snapshot({ scope }) {
+      const base = [
+        {
+          name: 'alpha',
+          description: 'An alpha skill.',
+          provider: 'fs',
+          source: 'project',
+          path: alphaPath,
+          invocation: { modelInvocable: fileEnabled(alphaPath), userInvocable: true }
+        },
+        {
+          name: 'virtual',
+          description: 'Registered by a plugin; no file.',
+          provider: 'plugin',
+          source: 'plugin',
+          invocation: { modelInvocable: true, userInvocable: true }
+        }
+      ]
+      const merged = new Map(base.map((skill) => [skill.name, skill]))
+      for (const def of skillShadowDefs.get(scope?.id)?.values() ?? []) merged.set(def.name, def)
+      return { complete: true, skills: [...merged.values()] }
     },
     registerProvider() {
       return () => {}
+    },
+    // The registry's scoped registration, faked: one same-name definition per agent.
+    // Nearest layer wins, which is exactly what makes the shadow effective.
+    __register(agentId, def) {
+      if (def.invocation?.modelInvocable !== false || def.invocation?.userInvocable !== false) {
+        throw new Error('a shadow must turn both invocation paths off')
+      }
+      const map = skillShadowDefs.get(agentId) ?? new Map()
+      skillShadowDefs.set(agentId, map)
+      map.set(def.name, {
+        name: def.name,
+        description: def.description,
+        provider: 'runtime',
+        source: def.source,
+        invocation: { ...def.invocation }
+      })
+      return () => map.delete(def.name)
+    },
+    /** Test-only: how many shadows one agent currently holds. */
+    __shadowCount(agentId) {
+      return skillShadowDefs.get(agentId)?.size ?? 0
     }
   }
   host.extras.workingDirectory = { ensure: async () => skillsRoot }
@@ -1232,23 +1269,19 @@ try {
     })
 
   try {
+    replaceSkillDisabled([])
     const listed = await (await skillsGet('root-a')).json()
     check('skills route: lists the session', listed.ok === true && listed.state.available === true)
     check('skills route: carries the protocol', listed.state.protocol === PROTOCOL)
     check('skills route: one row per skill', listed.state.skills.length === 2, String(listed.state.skills.length))
-    check(
-      'skills route: a file-backed skill is toggleable',
-      listed.state.skills.find((row) => row.name === 'alpha')?.toggleable === true
-    )
-    check(
-      'skills route: a runtime skill is not toggleable',
-      listed.state.skills.find((row) => row.name === 'virtual')?.toggleable === false
-    )
+    const alphaRow = listed.state.skills.find((row) => row.name === 'alpha')
+    const virtualRow = listed.state.skills.find((row) => row.name === 'virtual')
+    check('skills route: a file-backed skill switches through its file', alphaRow?.toggleable === true && alphaRow?.mode === 'file')
+    check('skills route: a runtime skill is switchable too', virtualRow?.toggleable === true && virtualRow?.mode === 'shadow')
     check('skills route: requires a session', (await fetch(`${base2}${SKILLS_ROUTE}`)).status === 400)
     check('skills route: a write requires the header', (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: false }, false)).status === 403)
     check('skills route: a write needs a boolean', (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: 'no' })).status === 400)
     check('skills route: an unknown skill is a 404', (await skillsPost({ sessionId: 'root-a', name: 'nope', enabled: false })).status === 404)
-    check('skills route: a runtime skill is refused', (await skillsPost({ sessionId: 'root-a', name: 'virtual', enabled: false })).status === 409)
 
     const off = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: false })).json()
     check('skills route: the switch reports it took effect', off.ok === true && off.applied === true, JSON.stringify(off.applied))
@@ -1261,6 +1294,31 @@ try {
 
     const on = await (await skillsPost({ sessionId: 'root-a', name: 'alpha', enabled: true })).json()
     check('skills route: the switch can be turned back on', on.applied === true && fileEnabled(alphaPath) === true)
+
+    // A runtime skill has no file, so the switch is a scoped shadow with both
+    // invocation paths off. This is the switch the panel used to refuse.
+    const virtualOff = await (await skillsPost({ sessionId: 'root-a', name: 'virtual', enabled: false })).json()
+    check('skills route: a runtime skill can be switched off', virtualOff.ok === true && virtualOff.applied === true, JSON.stringify(virtualOff))
+    const hiddenSkillRow = virtualOff.state.skills.find((row) => row.name === 'virtual')
+    check(
+      'skills route: the shadow hides it from both paths',
+      hiddenSkillRow?.modelInvocable === false && hiddenSkillRow?.userInvocable === false,
+      JSON.stringify(hiddenSkillRow)
+    )
+    check(
+      'skills route: the disabled name is persisted',
+      JSON.parse(fs.readFileSync(skillsFile(), 'utf8')).disabled.includes('virtual')
+    )
+    check('skills route: the shadow is mounted on the session agent', host.extras.skills.__shadowCount('root-a') === 1)
+    check('skills route: the shadow is remembered in memory', getSkillDisabled().includes('virtual'))
+
+    const virtualOn = await (await skillsPost({ sessionId: 'root-a', name: 'virtual', enabled: true })).json()
+    check(
+      'skills route: a runtime skill can be switched back on',
+      virtualOn.applied === true && virtualOn.state.skills.find((row) => row.name === 'virtual')?.modelInvocable === true
+    )
+    check('skills route: enabling drops the shadow', host.extras.skills.__shadowCount('root-a') === 0)
+    check('skills route: the persisted set is clean again', getSkillDisabled().length === 0)
 
     // --- prompt sections over the same real route
     const promptGlobal = [
@@ -2007,8 +2065,8 @@ try {
       available: true,
       complete: true,
       skills: [
-        { name: 'alpha', description: 'An alpha skill.', provider: 'fs', source: 'project', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true },
-        { name: 'virtual', description: 'Registered at runtime.', provider: 'plugin', source: 'plugin', modelInvocable: true, userInvocable: true, toggleable: false }
+        { name: 'alpha', description: 'An alpha skill.', provider: 'fs', source: 'project', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true, mode: 'file' },
+        { name: 'virtual', description: 'Registered at runtime.', provider: 'plugin', source: 'plugin', modelInvocable: true, userInvocable: true, toggleable: true, mode: 'shadow' }
       ]
     }
     const originalFetch = globalThis.fetch
@@ -2046,7 +2104,7 @@ try {
       const alphaSwitch = switches.find((node) => node.props['aria-label'] === 'alpha')
       const virtualSwitch = switches.find((node) => node.props['aria-label'] === 'virtual')
       check('skills tab: a file-backed row is switchable', alphaSwitch?.props.disabled === false)
-      check('skills tab: a runtime row is not switchable', virtualSwitch?.props.disabled === true)
+      check('skills tab: a runtime row is switchable too', virtualSwitch?.props.disabled === false)
       check('skills tab: it reads the skills route with the session', calls.some((call) => call.url.includes('/skills?sessionId=s1')), calls.map((call) => call.url).join('|'))
       alphaSwitch.props.onClick()
       await pump(view)

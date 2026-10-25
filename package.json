@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-tools-panel",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "One composer panel with four tabs: a per-tool live kill switch, per-skill model visibility, per-section system-prompt injection switches, and a plugin on/off switch for the whole profile. · 输入框工具条上的一个面板，四个 tab：逐个工具的实时开关、技能的模型可见性、系统提示词段落的注入开关，以及整个 profile 的插件启停。",
   "license": "MIT",
