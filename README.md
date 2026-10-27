@@ -23,7 +23,7 @@ MCP 服务器就多几行，预设没挂工具就一行都没有、显示"没有
    模型看不到就不会调它，顺带省下每个请求的 schema 体积。`restrict()` 只能按作用域生效
    （宿主拒绝无作用域的全局限制），所以给每个 agent 的 `agent.ctx` **以及它上面的每一层
    作用域**（预设自己那一层）各挂一个极小插件来注册。
-2. **拦截（兜底）**——`ctx.tools.guard()` 每次调用重新解析该会话的禁用集合。作用域内注册的
+2. **拦截（兜底）**——`ctx.tools.guard()` 每次调用重新解析禁用集合。作用域内注册的
    工具 `restrict()` 遮不住，这类由 guard 拦，回执：
 
 ```
@@ -56,8 +56,12 @@ agent 共用同一个预设不会重复挂。
 的策略：组开关是从成员的禁用状态**算出来的**，所以组和工具不可能矛盾。一个工具可以同时在多个组里；被组收走的工具不再出现在下面的扁平
 列表，所以组是容器不是过滤器。组可重命名、可删除，删组不动任何开关。
 
-**分组定义写盘**（`$DSH_HOME/dsh-plugin-tools-panel/groups.json`），重启还在；**禁用状态只在
-内存**，重启恢复全开。两者刻意不同：前者是你对自己工具列表的整理，后者是一次性刹车。
+**分组定义和禁用状态都写盘**：分组在 `groups.json`，禁用在 `tools.json`（都在
+`$DSH_HOME/dsh-plugin-tools-panel/` 下），**重启后都还在**。
+
+禁用是**全局的**：关掉一个工具，所有会话（含子 agent）都不再能用它，不只是当前这个对话。
+这是刻意和技能、提示词两个 tab 对齐的——三个 tab 用的是同一种开关，就不该有三种不同的
+生命周期。旧版本是"仅本会话、只在内存、重启全开"的紧急刹车，那个语义已经去掉。
 
 ### 技能
 
@@ -106,11 +110,12 @@ localStorage）。不可开关的行会写明原因：宿主基础设施（`mana
 
 ## 作用范围
 
-禁用集合属于一个会话，并**向下继承**：主会话禁用后，它派生的全部子会话（`subagent`、
-`workflow` 里的 `agent()`，以及更深层）一起被拦；否则"派个子 agent 去干"就是一步绕过。
-继承是调用时沿父链**惰性解析**的，所以在子 agent 已经存在之后再限制父会话也照样生效，
-放开父会话则一次性放开所有没有自己策略的后代。从子会话里改，改的是它所属主会话的策略，
-界面会写"继承自主会话"。
+禁用集合是**整个 profile 的**，没有会话维度：关掉一个工具，当前会话、它派生的子会话
+（`subagent`、`workflow` 里的 `agent()`）、以及之后新建的任何会话，都一起被拦。所以
+"派个子 agent 去干"不是绕过，换一个会话也不是。
+
+三个 tab 的语义现在是一致的：都是"这个环境里我不要什么"，都写盘、都重启还在。区别只在
+禁用的对象——工具按名字、技能按名字、提示词段落按名字。
 
 ## 界面细节
 
@@ -154,9 +159,9 @@ tab 时才跑；技能/提示词 tab 在第一次变成活动 tab 时读一次�
 `GET /dsh-plugin-tools-panel/state?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 8, "sessionId": "…", "ownerId": "…", "inherited": false,
+  "protocol": 9, "sessionId": "…",
   "tools": ["bash", "…"],          // 本会话可见（含已禁用），已排序
-  "denied": ["write"],             // 当前生效的禁用集合
+  "denied": ["write"],             // 全局生效的禁用集合（写盘，重启还在）
   "groups": [{ "id": "g1", "name": "编辑", "members": ["write", "edit"] }],
   "scopes": 4,                     // 挂了限制的 agent 作用域数
   "masked": 1,                     // 真的从模型视图里消失的禁用名个数
@@ -173,7 +178,7 @@ tab 时才跑；技能/提示词 tab 在第一次变成活动 tab 时读一次�
 `GET /dsh-plugin-tools-panel/skills?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 8, "sessionId": "…", "available": true, "complete": true,
+  "protocol": 9, "sessionId": "…", "available": true, "complete": true,
   "skills": [{
     "name": "blender-modeling", "description": "…", "provider": "fs", "source": "user",
     "path": "/home/…/SKILL.md",        // 真实文件路径；没有它就没有可写的开关
@@ -191,7 +196,7 @@ frontmatter 没闭合 → `409`。必须带同一个请求头。
 `GET /dsh-plugin-tools-panel/prompts?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 8, "sessionId": "…", "available": true, "disabled": ["workspace"],
+  "protocol": 9, "sessionId": "…", "available": true, "disabled": ["workspace"],
   "sections": [{
     "name": "identity", "text": "…（≤4000 字，超出截断）", "chars": 128,
     "truncated": false, "enabled": true, "present": true, "liveChars": 128,
@@ -218,8 +223,8 @@ JSON 就能定位的证据，界面上不显示。
 node test/check.mjs
 ```
 
-377 条断言，覆盖：清单与 patch、两个半边都不引入外部包（`node:` 内置模块除外，本包用
-`link:` 安装）、逐工具判定、继承、分组规范化与落盘、请求体清洗、真实 `node:http` 服务器跑
+373 条断言，覆盖：清单与 patch、两个半边都不引入外部包（`node:` 内置模块除外，本包用
+`link:` 安装）、逐工具判定、全局禁用集合的规范化与落盘（含重启后仍生效）、分组规范化与落盘、请求体清洗、真实 `node:http` 服务器跑
 通的整条链路（缺头 403、`deny` 非数组 400、两字段全无 409、未知工具名不炸整份限制、晚注册
 工具也会被隐藏），以及用**伪 React 渲染器**跑通的界面：一个触发器、四个 tab、tab 记忆、
 四个 tab 都保持挂载、插件 Remote 调用、过滤未安装运行时、插件搜索与空结果、收藏置顶持久化、

@@ -95,11 +95,14 @@ const {
   ROUTE,
   cleanDeny,
   denySetFor,
+  getToolBlocked,
+  getToolDisabled,
+  getToolLast,
+  loadTools,
   makeGuard,
-  ownerOf,
-  parents,
-  policies,
-  policyFor,
+  replaceToolDisabled,
+  saveTools,
+  toolsFile,
   MAX_GROUPS,
   MAX_PROMPTS,
   MAX_SECTION_TEXT,
@@ -155,13 +158,6 @@ check(
 )
 
 {
-  // A policy record as the host stores it.
-  const record = (deny = [], extra = {}) => ({
-    deny: new Set(deny),
-    blocked: 0,
-    last: undefined,
-    ...extra
-  })
   const call = (name, sessionId) => ({
     name,
     callId: 'call-1',
@@ -169,80 +165,53 @@ check(
     signal: new AbortController().signal,
     ...(sessionId === undefined ? {} : { agent: { id: sessionId } })
   })
-  const freshPolicies = (entries = {}) =>
-    new Map(Object.entries(entries).map(([id, patch]) => [id, record(patch)]))
-  const freshTree = (entries = {}) => new Map(Object.entries(entries))
 
-  const table = freshPolicies()
-  const guard = makeGuard(table, freshTree())
+  // The set is global: the guard reads the live module-level set, so a test drives it
+  // through the same replace helper the route uses.
+  replaceToolDisabled([])
+  const guard = makeGuard()
   check('guard: allows everything while nothing is denied', guard(call('write', 's1')) === undefined)
-  table.set('s1', record(['write']))
+  replaceToolDisabled(['write'])
   const reason = guard(call('write', 's1'))
   check('guard: denies a denied tool', typeof reason === 'string', String(reason))
   check('guard: denial names the tool', reason.includes('"write"'), reason)
   check('guard: denial uses the requested wording', reason.includes('此操作已被用户实时禁用'), reason)
   check('guard: denial tells the model not to retry', reason.includes('Do not retry'), reason)
-  check('guard: counts the denial', table.get('s1').blocked === 1, String(table.get('s1').blocked))
-  check('guard: records the last denial with its session', table.get('s1').last?.tool === 'write')
-  // PER-TOOL is the whole point: one name denied says nothing about any other name,
-  // including names that used to live in the same group as it.
+  check('guard: counts the denial', getToolBlocked() === 1, String(getToolBlocked()))
+  check('guard: records the last denial with its session', getToolLast()?.tool === 'write')
+
+  // PER-TOOL is the whole point: one name denied says nothing about any other name.
   check('guard: denying one write tool leaves another allowed', guard(call('edit', 's1')) === undefined)
   check('guard: and leaves bash allowed', guard(call('bash', 's1')) === undefined)
-  table.set('s1', record(['bash']))
+  replaceToolDisabled(['bash'])
   check('guard: the denied name is the only one refused', guard(call('write', 's1')) === undefined)
   check('guard: and it is still refused', typeof guard(call('bash', 's1')) === 'string')
   // Any name at all can be denied — the registry decides what exists, not this list.
-  table.set('s1', record(['mcp__github__create_issue']))
+  replaceToolDisabled(['mcp__github__create_issue'])
   check('guard: an MCP tool is deniable by name', typeof guard(call('mcp__github__create_issue', 's1')) === 'string')
-  table.delete('s1')
+  replaceToolDisabled([])
   check('guard: allows again as soon as the list is empty', guard(call('bash', 's1')) === undefined)
 
-  // Scoping: restricting one session must not touch another.
-  const scoped = freshPolicies()
-  const scopedGuard = makeGuard(scoped, freshTree())
-  scoped.set('s1', record(['write']))
-  check('scope: the restricted session is denied', typeof scopedGuard(call('write', 's1')) === 'string')
-  check('scope: an unrelated session is untouched', scopedGuard(call('write', 's2')) === undefined)
-  scoped.set('s2', record(['read']))
-  check(
-    'scope: each session keeps its own list',
-    scopedGuard(call('read', 's1')) === undefined && typeof scopedGuard(call('read', 's2')) === 'string'
-  )
+  // GLOBAL scope: the same denial governs every session, including one that did not
+  // exist when the switch was written. There is no per-session list any more.
+  replaceToolDisabled(['write'])
+  check('scope: one session is denied', typeof guard(call('write', 's1')) === 'string')
+  check('scope: an unrelated session is denied too', typeof guard(call('write', 's2')) === 'string')
+  check('scope: a session created later is denied', typeof guard(call('write', 'brand-new')) === 'string')
+  check('scope: and other names stay allowed everywhere', guard(call('read', 's2')) === undefined)
 
-  // Inheritance: a restriction reaches what the session spawned, however deep, and
-  // whether or not the child existed when the list was written.
-  const tree = freshTree({ child: 'root', grand: 'child' })
-  const inherited = freshPolicies()
-  const inheritGuard = makeGuard(inherited, tree)
-  check('inherit: an unrestricted tree allows everything', inheritGuard(call('write', 'grand')) === undefined)
-  inherited.set('root', record(['write']))
-  check('inherit: the root is denied', typeof inheritGuard(call('write', 'root')) === 'string')
-  check('inherit: the child inherits', typeof inheritGuard(call('write', 'child')) === 'string')
-  check('inherit: the grandchild inherits', typeof inheritGuard(call('write', 'grand')) === 'string')
-  check('inherit: the inherited denial leaves other names alone', inheritGuard(call('edit', 'grand')) === undefined)
-  inherited.delete('root')
-  check('inherit: releasing the root releases the grandchild', inheritGuard(call('write', 'grand')) === undefined)
+  // An agentless call is governed as well: there is no session dimension to exempt.
+  check('scope: an agentless call is governed by the global set', typeof guard(call('write', undefined)) === 'string')
+  replaceToolDisabled([])
 
-  // A child may hold its own list; the NEAREST one wins.
-  const nearest = freshPolicies()
-  const nearestGuard = makeGuard(nearest, freshTree({ child: 'root' }))
-  nearest.set('root', record(['read']))
-  check('inherit: the child sees the parent list', typeof nearestGuard(call('read', 'child')) === 'string')
-  nearest.set('child', record(['bash']))
-  check("inherit: the child's own list wins over the parent's", nearestGuard(call('read', 'child')) === undefined)
-  check("inherit: and the child's own restriction applies", typeof nearestGuard(call('bash', 'child')) === 'string')
-  check('inherit: the parent keeps its own list', typeof nearestGuard(call('read', 'root')) === 'string')
-
-  // Out of scope: no agent, no policy, nothing to deny for.
-  const empty = freshPolicies()
-  check('scope: an agentless call is not governed', makeGuard(empty, freshTree())(call('write', undefined)) === undefined)
-
-  // A cycle would hang the guard, which runs synchronously inside the pipeline.
-  const cyclic = freshPolicies()
-  const cycleGuard = makeGuard(cyclic, freshTree({ a: 'b', b: 'a' }))
-  check('safety: a parent cycle terminates', cycleGuard(call('write', 'a')) === undefined)
-  cyclic.set('a', record(['write']))
-  check('safety: a parent cycle still resolves the restriction', typeof cycleGuard(call('write', 'a')) === 'string')
+  // The guard must read the LIVE set, not one captured at construction: a switch
+  // flipped after the guard was registered has to take effect immediately.
+  const liveGuard = makeGuard()
+  check('live: a freshly built guard allows', liveGuard(call('write', 's1')) === undefined)
+  replaceToolDisabled(['write'])
+  check('live: a later switch is seen by the existing guard', typeof liveGuard(call('write', 's1')) === 'string')
+  replaceToolDisabled([])
+  check('live: releasing is seen by the existing guard', liveGuard(call('write', 's1')) === undefined)
 }
 
 // --- 3. request validation ----------------------------------------------------
@@ -751,10 +720,9 @@ function fakeHost() {
   return { agents, ctx, extras, guards, hidden, live, routes, restrictCalls, server, tools }
 }
 
-// The module-level tables are shared with `apply`, so clear them before wiring the
-// fake host; the assertions below read them directly.
-policies.clear()
-parents.clear()
+// The module-level set is shared with `apply`, so clear it before wiring the fake
+// host; the assertions below read it directly.
+replaceToolDisabled([])
 
 const host = fakeHost()
 const { apply } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
@@ -784,9 +752,6 @@ try {
   host.agents.spawn('root-b', undefined, 'other')
   host.agents.spawn('child-a', 'root-a')
   host.agents.spawn('grand-a', 'child-a')
-  check('tree: the child link was recorded', parents.get('child-a') === 'root-a', String(parents.get('child-a')))
-  check('tree: the grandchild link was recorded', parents.get('grand-a') === 'child-a', String(parents.get('grand-a')))
-  check('tree: a top-level session has no link', !parents.has('root-a'))
 
   {
     const answer = await get('root-a')
@@ -795,7 +760,6 @@ try {
     check('route: GET starts with nothing denied', Array.isArray(payload.state?.denied) && payload.state.denied.length === 0)
     check('route: the snapshot advertises its protocol', payload.state?.protocol === PROTOCOL, String(payload.state?.protocol))
     check('route: the snapshot names the session', payload.state?.sessionId === 'root-a')
-    check('route: a fresh session is not inherited', payload.state?.inherited === false)
     // THE feature: the list is read from the registry, not hard-coded.
     check(
       'route: the tool list comes from the registry',
@@ -879,26 +843,26 @@ try {
     check('live: another name is untouched', guard({ name: 'edit', agent: { id: 'root-a' } }) === undefined)
   }
   {
-    // THE scoping promise, over the wire: a second session is unaffected.
+    // GLOBAL scope over the wire: a switch written from one session governs every
+    // session, including a sibling and a descendant that never touched the panel.
+    // That is the deliberate change from the old per-session panic switch.
     const payload = await (await get('root-b')).json()
-    check('live: another session is untouched', payload.state?.denied?.length === 0)
+    check('live: another session reports the same list', payload.state?.denied?.[0] === 'write', JSON.stringify(payload.state?.denied))
     check(
-      'live: and its visible tools are whole',
-      host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('write')
+      'live: and its visible tools are masked too',
+      !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('write')
     )
   }
   {
-    // Inheritance over the wire: the child and grandchild follow the root, which is
-    // what stops "delegate it to a subagent" being a way around the switch.
+    // Every agent in the profile is covered, descendants included: delegation is not
+    // a way around the switch.
     const guard = host.guards[0]
-    check('live: the child inherits the denial', typeof guard({ name: 'write', agent: { id: 'child-a' } }) === 'string')
-    check('live: the grandchild inherits the denial', typeof guard({ name: 'write', agent: { id: 'grand-a' } }) === 'string')
+    check('live: the child is denied', typeof guard({ name: 'write', agent: { id: 'child-a' } }) === 'string')
+    check('live: the grandchild is denied', typeof guard({ name: 'write', agent: { id: 'grand-a' } }) === 'string')
     const payload = await (await get('grand-a')).json()
-    check('live: an inheriting session reports its owner', payload.state?.ownerId === 'root-a', String(payload.state?.ownerId))
-    check('live: and is flagged as inherited', payload.state?.inherited === true)
-    check('live: the inherited list is what it reports', payload.state?.denied?.[0] === 'write')
-    // The hide reaches the descendants too: a subagent is not a way around the
-    // switch, so its own scope is masked as well.
+    check('live: a descendant reports the same global list', payload.state?.denied?.[0] === 'write')
+    check('live: and carries no owner, because the list is not per-session', payload.state?.ownerId === undefined)
+    check('live: and is not flagged as inherited', payload.state?.inherited === undefined)
     check(
       'live: the child cannot even see the denied tool',
       !host.tools.schemas({ id: 'child-a' }).map((s) => s.name).includes('write')
@@ -947,9 +911,11 @@ try {
     // use it — a second agent must not produce a second mask. The count is bounded
     // by the number of preset layers, not by the number of agents.
     const presetLayers = presetCalls.map((call) => call.id)
+    // The deny set is global, so BOTH live presets are masked (root-a's and
+    // root-b's "other") — but each exactly once, however many agents use it.
     check(
-      'layers: the preset layer is masked once, not per agent',
-      new Set(presetLayers).size <= 1,
+      'layers: each preset layer is masked once, not per agent',
+      new Set(presetLayers).size === 2 && new Set(presetLayers).size < host.live.length,
       `${new Set(presetLayers).size} layer(s) for ${host.live.length} agent(s)`
     )
     check(
@@ -991,8 +957,9 @@ try {
     for (const name of ['write', 'edit', 'grep', 'todo_write']) {
       check(`live: ${name} is still allowed`, guard({ name, agent: { id: 'root-a' } }) === undefined)
     }
-    // Read stays denied for the session's descendants but never leaks to a sibling.
-    check('live: the sibling session may still read', guard({ name: 'read', agent: { id: 'root-b' } }) === undefined)
+    // The list is global, so a name denied here is denied for every session —
+    // siblings included. That is the deliberate difference from the old model.
+    check('live: the sibling session is denied too', typeof guard({ name: 'read', agent: { id: 'root-b' } }) === 'string')
   }
   {
     // A name that is NOT a global registry tool cannot be masked by `restrict()`
@@ -1009,11 +976,10 @@ try {
     await post({ sessionId: 'root-b', deny: [] })
   }
   {
-    // An empty list drops the policy entry entirely, so a session returns to "no
-    // policy" rather than carrying an empty record it does not need.
+    // An empty list means "nothing denied anywhere", not an empty record per session.
     await post({ sessionId: 'root-a', deny: [] })
-    check('route: an empty list drops the policy entry', !policies.has('root-a'))
-    check('live: and the descendants are released', host.guards[0]({ name: 'read', agent: { id: 'grand-a' } }) === undefined)
+    check('route: an empty list clears the global set', getToolDisabled().length === 0, JSON.stringify(getToolDisabled()))
+    check('live: and every session is released', host.guards[0]({ name: 'read', agent: { id: 'grand-a' } }) === undefined)
     check(
       'restrict: and the scope is unmasked again',
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
@@ -1021,14 +987,20 @@ try {
   }
   {
     // Counters are diagnostics: they prove the guard ran, and they survive the round
-    // trip. Re-established here because dropping a policy drops its counters too.
+    // trip. They are global now, alongside the set they describe.
     await post({ sessionId: 'root-a', deny: ['read'] })
     const guard = host.guards[0]
     guard({ name: 'read', agent: { id: 'root-a' } })
     guard({ name: 'read', agent: { id: 'root-a' } })
     const payload = await (await get('root-a')).json()
-    check('route: the counter survives the round trip', payload.state?.blocked === 2, String(payload.state?.blocked))
-    check('route: the last denial names its tool', payload.state?.last?.tool === 'read')
+    // The counter is global and monotonic: it counts every refusal this process has
+    // made, so the assertion is "it moved by two", not "it equals two".
+    const before = payload.state.blocked
+    guard({ name: 'read', agent: { id: 'root-a' } })
+    guard({ name: 'read', agent: { id: 'root-a' } })
+    const after = await (await get('root-a')).json()
+    check('route: the counter survives the round trip', after.state.blocked === before + 2, `${before} -> ${after.state.blocked}`)
+    check('route: the last denial names its tool', after.state?.last?.tool === 'read')
     await post({ sessionId: 'root-a', deny: [] })
   }
   {
@@ -1107,25 +1079,26 @@ try {
       'tools/change: the late tool is hidden once it registers',
       !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('mcp__late__tool')
     )
+    // The set is global, so the late tool is masked for EVERY session once it
+    // registers — including one that never had the switch written from it.
     check(
-      'tools/change: and it was visible before the switch was set',
-      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('mcp__late__tool')
+      'tools/change: and it is masked for other sessions too',
+      !host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('mcp__late__tool')
     )
     await post({ sessionId: 'root-b', deny: [] })
   }
   {
-    // Disposal forgets the LINK but keeps the POLICY: the restriction is a user
-    // decision about a session, while a finished child should not linger in the walk.
+    // Disposing an agent unmounts its scope restriction, but the global set — the
+    // user's decision — stays: a session that closes and resumes is still restricted.
     await post({ sessionId: 'root-a', deny: ['write'] })
     check(
       'teardown: the child is restricted before disposal',
       typeof host.guards[0]({ name: 'write', agent: { id: 'child-a' } }) === 'string'
     )
     host.agents.dispose('child-a')
-    check('teardown: the link is forgotten', !parents.has('child-a'))
-    check('teardown: the policy survives', policies.has('root-a'))
+    check('teardown: the set survives a disposed agent', getToolDisabled().includes('write'), JSON.stringify(getToolDisabled()))
     check(
-      'teardown: the root is still restricted',
+      'teardown: the remaining agent is still restricted',
       typeof host.guards[0]({ name: 'write', agent: { id: 'root-a' } }) === 'string'
     )
     await post({ sessionId: 'root-a', deny: [] })
@@ -1424,23 +1397,49 @@ try {
 
 // --- 5. module-level helpers --------------------------------------------------
 {
-  policies.clear()
-  parents.clear()
-  check('owner: an unrestricted session owns itself', ownerOf('solo') === 'solo')
-  policies.set('p', { deny: new Set(['write']), blocked: 0 })
-  parents.set('c', 'p')
-  check('owner: a child resolves to its restricted parent', ownerOf('c') === 'p')
-  check('policyFor: the child gets the parent policy', policyFor('c').deny.has('write'))
-  check('policyFor: an unrelated session gets nothing', policyFor('x') === undefined)
-  check('denySetFor: an unrelated session gets the shared empty set', denySetFor('x') === EMPTY_DENY)
+  replaceToolDisabled([])
+  check('denySetFor: an empty set is returned as-is', denySetFor().size === 0)
+  check('denySetFor: it is the live set, not a copy', denySetFor() === denySetFor())
+  replaceToolDisabled(['write', 'bash'])
+  check('denySetFor: it reports the global names', denySetFor().has('write') && denySetFor().has('bash'))
   const snap = snapshot('c')
   check('snapshot: names the asking session', snap.sessionId === 'c')
-  check('snapshot: names the owning session', snap.ownerId === 'p')
-  check('snapshot: flags inheritance', snap.inherited === true)
+  check('snapshot: has no owning session', snap.ownerId === undefined)
+  check('snapshot: has no inheritance flag', snap.inherited === undefined)
   check('snapshot: carries the protocol', snap.protocol === PROTOCOL)
-  check('snapshot: an unrestricted session reports nothing denied', snapshot('free').denied.length === 0)
-  policies.clear()
-  parents.clear()
+  check('snapshot: reports the global list', JSON.stringify(snap.denied) === '["bash","write"]', JSON.stringify(snap.denied))
+  replaceToolDisabled([])
+  check('snapshot: an empty set reports nothing denied', snapshot('free').denied.length === 0)
+}
+
+// --- 5a. the persisted tool set ----------------------------------------------
+{
+  check('tools: a corrupt list is normalized', JSON.stringify(normalizePromptNames([1, ' a ', 'a', '', null])) === '["a"]')
+  replaceToolDisabled(['alpha', 'beta'])
+  saveTools()
+  check('tools: the set round-trips through disk', JSON.stringify(loadTools()) === '["alpha","beta"]', JSON.stringify(loadTools()))
+  check('tools: the file lives under DSH_HOME', toolsFile().startsWith(SANDBOX), toolsFile())
+  const saved = JSON.parse(fs.readFileSync(toolsFile(), 'utf8'))
+  check('tools: the saved file carries the version', saved.version === 1, String(saved.version))
+  check('tools: and the names the set held', JSON.stringify(saved.disabled) === '["alpha","beta"]', JSON.stringify(saved.disabled))
+  replaceToolDisabled([])
+  saveTools()
+  check('tools: clearing writes an empty list', JSON.stringify(loadTools()) === '[]', JSON.stringify(loadTools()))
+
+  // THE promise of this revision: a switch survives a process restart. A fresh load
+  // of the module reads the file back and the guard enforces it again, with no
+  // session id involved anywhere.
+  replaceToolDisabled(['write', 'bash'])
+  saveTools()
+  check(
+    'tools: a switch survives a reload',
+    JSON.stringify(loadTools().sort()) === '["bash","write"]',
+    JSON.stringify(loadTools())
+  )
+  check('tools: the reloaded names are enforced', makeGuard()({ name: 'write', agent: { id: 'any' } }) !== undefined)
+  check('tools: and an allowed name is not', makeGuard()({ name: 'read', agent: { id: 'any' } }) === undefined)
+  replaceToolDisabled([])
+  saveTools()
 }
 
 
@@ -2045,7 +2044,7 @@ try {
     rememberTab('plugins')
     const calls = []
     const listed = {
-      protocol: 8,
+      protocol: PROTOCOL,
       sessionId: 's1',
       available: true,
       complete: true,
@@ -2118,7 +2117,7 @@ try {
         json: async () => ({
           ok: true,
           state: {
-            protocol: 8,
+            protocol: PROTOCOL,
             sessionId: 's1',
             available: true,
             skills: [{ name: 'alpha', description: 'd', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true }]
@@ -2186,9 +2185,16 @@ check('client: takes the slot sessionId seat', /\{\s*t: seat,\s*sessionId\s*\}/.
 check('client: sends the session on GET', clientSource.includes('?sessionId='))
 check('client: sends the session on POST', clientSource.includes('...patch, sessionId') || clientSource.includes('sessionId, deny'))
 check('client: does not hardcode a session id', !/sessionId:\s*['"]/.test(clientSource))
-// The inherited notice: editing a subagent's list edits its parent, so the menu has
-// to say so rather than let that read as an unrelated session changing.
-check('client: surfaces an inherited policy', clientSource.includes("t('inherited')"))
+// The scope badge: the deny set is global and durable, so the menu has to say that a
+// switch affects every conversation and survives a restart.
+check(
+  'client: surfaces the global scope',
+  clientSource.includes("t('toolsGlobal')") &&
+    clientSource.includes("toolsGlobal: '全局 · 重启后仍生效'") &&
+    clientSource.includes("toolsGlobal: 'Global · survives a restart'"),
+  'a scope badge the switches cannot imply on their own'
+)
+check('client: no longer claims a per-session inheritance', !clientSource.includes("t('inherited')"))
 check('client: the icon-only trigger keeps an accessible name', clientSource.includes("'aria-label': t('title')"))
 check(
   'client: every t() key exists in a dictionary',
@@ -2247,10 +2253,10 @@ check(
   'clearSelection -> 取消创建 / Cancel'
 )
 
-// The count badge was removed at the user's request; the inherited notice stays,
-// because that one says whose policy these switches are.
+// The count badge was removed at the user's request; the scope badge stays, because
+// that one says what the switches cannot: they apply profile-wide and persist.
 check('panel: no count badge', !/tool-count/.test(clientSource) && !/\$\{denied\.size\}\//.test(clientSource))
-check('panel: the inherited notice stays', clientSource.includes("t('inherited')"))
+check('panel: the scope badge stays', clientSource.includes("t('toolsGlobal')"))
 
 check(
   'scroll: the tab pane is a flex participant',

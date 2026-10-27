@@ -65,7 +65,7 @@ window.__ModuleLoader__.load({
      * with an OLD host, and without this check that shows up as a switch that flips
      * back on its own.
      */
-    const PROTOCOL = 8
+    const PROTOCOL = 9
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 320
     const MENU_MAX_HEIGHT = 420
@@ -129,7 +129,7 @@ window.__ModuleLoader__.load({
       retry: '重试',
       saveFailed: '开关未保存：',
       staleHost: '宿主端还是旧版本，开关改动不会生效。请重启 DSH。',
-      inherited: '继承自主会话',
+      toolsGlobal: '全局 · 重启后仍生效',
       newGroup: '建组',
       newGroupTitle: '把勾选的工具建成一组',
       groupName: '分组名称',
@@ -205,7 +205,7 @@ window.__ModuleLoader__.load({
       retry: 'Retry',
       saveFailed: 'The switch was not saved: ',
       staleHost: 'The Host half is an older revision, so switch changes cannot take effect. Restart DSH.',
-      inherited: 'Inherited from the parent session',
+      toolsGlobal: 'Global · survives a restart',
       newGroup: 'Group',
       newGroupTitle: 'Group the selected tools',
       groupName: 'Group name',
@@ -639,7 +639,7 @@ window.__ModuleLoader__.load({
   gap: 8px;
   padding: 6px 8px 2px;
 }
-.dsh-tools-panel-tool-inherited { color: var(--dsw-alias-state-warn-primary, var(--dsw-alias-brand-primary)); font-size: 11px; line-height: 16px; }
+.dsh-tools-panel-tool-scope { color: var(--dsw-alias-label-caption); font-size: 11px; line-height: 16px; }
 .dsh-tools-panel-tool-search {
   box-sizing: border-box;
   margin: 2px 4px 4px;
@@ -1814,15 +1814,14 @@ window.__ModuleLoader__.load({
                   // The shell draws the title and the tabs, and the count was removed
                   // at the user's request: the switches already show what is off, so
                   // the number was a second, redundant readout taking a whole row.
-                  // Kept here (not deleted) is the inherited notice — that one says
-                  // something the switches cannot: whose policy this is.
-                  data?.inherited === true
-                    ? h(
-                        'div',
-                        { className: 'dsh-tools-panel-tool-header' },
-                        h('span', { className: 'dsh-tools-panel-tool-inherited' }, t('inherited'))
-                      )
-                    : null,
+                  // The scope badge replaces the old inherited notice: the deny set is
+                  // global now, so what the switches cannot say is that turning one off
+                  // affects every conversation and survives a restart.
+                  h(
+                    'div',
+                    { className: 'dsh-tools-panel-tool-header' },
+                    h('span', { className: 'dsh-tools-panel-tool-scope' }, t('toolsGlobal'))
+                  ),
                   // A protocol mismatch hides the list entirely rather than showing
                   // it as inert. An operable-looking switch that cannot take effect is
                   // exactly the trap this notice exists to end: the user clicks, the

@@ -11,8 +11,8 @@
  * WHAT A GROUP IS (and is not)
  *   A name plus a list of tool names, shown in the panel's Tools tab. It is
  *   ORGANIZATION, not policy: being in a group never disables a tool, and one tool
- *   may sit in several groups. The per-session deny list is a different thing and
- *   is not touched from here.
+ *   may sit in several groups. The global deny set is a different thing and is not
+ *   touched from here.
  *
  * WHY ONE TOOL AND NOT FIVE
  *   Six tools that all edit one small JSON document would each cost a schema in

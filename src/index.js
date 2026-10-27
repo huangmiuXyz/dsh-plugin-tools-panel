@@ -1,9 +1,9 @@
 /**
- * Tool guard, host half: a live, per-session, PER-TOOL kill-switch.
+ * Tool guard, host half: a live, GLOBAL, PER-TOOL kill-switch.
  *
  * WHAT THE SWITCH IS
- *   A session carries a DENY LIST of tool names. Nothing else: there are no kinds,
- *   no groups, and no built-in table of which tool belongs to which group. The list
+ *   The profile carries a DENY SET of tool names. Nothing else: there are no kinds,
+ *   no groups, and no built-in table of which tool belongs to which group. The set
  *   is edited by the composer control and read by this half on every call, so the
  *   next tool call already sees it — no reload, no restart, not even a re-render.
  *
@@ -33,19 +33,18 @@
  *   seeing every tool and was told "do not retry" on each attempt; that burned a
  *   step per refusal. Hiding the tool removes that loop instead of describing it.
  *
- * SCOPE: ONE SESSION, PLUS WHAT IT SPAWNED
- *   A deny list is held by ONE session. Every agent descended from it resolves to
- *   the same list, so restricting a session restricts the subagents it delegates
- *   to; otherwise delegating would be a one-step way around the switch. Inheritance
- *   is resolved LAZILY at call time by walking the parent chain, so a child created
- *   later inherits with no extra work and releasing a parent releases every
- *   descendant at once.
+ * SCOPE: THE WHOLE PROFILE
+ *   The deny set has NO session dimension. A name denied here is denied for every
+ *   agent in this profile, including subagents and sessions created later. That is
+ *   what makes this tab behave like the skills and prompts tabs: one durable answer
+ *   about the environment, not a restriction on one conversation.
  *
- *   The per-agent restriction is re-applied whenever the list changes (and when an
- *   agent is created), because a mounted scope does not re-read anything by itself.
+ *   The restriction is re-applied to every live agent whenever the set changes (and
+ *   when an agent is created), because a mounted scope does not re-read anything by
+ *   itself.
  *
- *   A call with NO agent is not governed: it has no session to carry a list, so
- *   there is nothing the user could have switched off for it.
+ *   A call with NO agent is governed too: the set is global, so there is no session
+ *   to consult and nothing to exempt.
  *
  * WHAT POPULATES THE LIST
  *   The control lists the tools the session can actually see, read from the
@@ -56,10 +55,11 @@
  *   invisible to `schemas()` — otherwise a denied tool could never be re-enabled.
  *
  * PERSISTENCE
- *   Deny lists live in this process's memory only. A DSH restart clears every
- *   switch back to "nothing denied". That is deliberate for a panic switch — a
- *   restriction the user forgot about should not survive a restart — but it does
- *   mean the switch is not durable configuration.
+ *   The deny set is DURABLE and global: one file under `DSH_HOME`, written on every
+ *   change and read back at load. A switch survives a restart, exactly like a
+ *   disabled skill or a disabled prompt section. This was deliberately changed from
+ *   an in-memory per-session panic switch: three tabs with one switch control must
+ *   not mean three different lifetimes.
  *
  * GROUPS (added in protocol 7)
  *   A user can name a set of tools and get one row for it. Groups are
@@ -70,8 +70,8 @@
  *   than stored.
  *
  *   Group definitions are DURABLE and global (one file under `DSH_HOME`), because
- *   they are the user's organization of their own tool list, not a restriction on
- *   one conversation. The deny list stays per-session and in memory.
+ *   they are the user's organization of their own tool list. The deny list is now
+ *   durable and global for the same reason.
  */
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -113,27 +113,68 @@ const HEADER = 'x-dsh-plugin-tools-panel'
  * the snapshot grew a `groups` field and a POST may carry one. 8 added the SKILLS
  * and PROMPTS routes: a skill toggle rewrites `disable-model-invocation` in the
  * skill file, and a prompt toggle persists a disabled section name that is
- * shadowed by an empty same-name section in every live agent's scope.
+ * shadowed by an empty same-name section in every live agent's scope. 9 made the
+ * TOOL deny set global and durable: the snapshot lost `ownerId`/`inherited` and
+ * gained a persisted `tools.json`, so a client must not assume a per-session list.
  */
-const PROTOCOL = 8
+const PROTOCOL = 9
 
 /**
  * Where the user's own group definitions live.
  *
- * Groups are NOT session state: they are the user's organization of their tool
- * list, so they are global and durable, unlike the deny list (per session, memory
- * only — a panic switch must not survive a restart). A group is a name plus member
- * names; a tool may sit in several groups, and a group's switch is only a bulk
- * action over its members' deny state.
+ * Groups are NOT policy: they are the user's organization of their tool list, so
+ * they are global and durable, exactly like the deny set now is. A group is a name
+ * plus member names; a tool may sit in several groups, and a group's switch is only
+ * a bulk action over its members' deny state.
  *
  * `DSH_HOME` is set in every profile-launched process; the homedir fallback keeps a
  * bare `dsh` invocation from writing to `/`.
  */
-function groupsFile() {
+function panelDir() {
   const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.length > 0
     ? process.env.DSH_HOME
     : join(homedir(), '.dsh')
-  return join(home, 'dsh-plugin-tools-panel', 'groups.json')
+  return join(home, 'dsh-plugin-tools-panel')
+}
+
+/** Where the denied tool names live. Global and durable, like skills and prompts. */
+function toolsFile() {
+  return join(panelDir(), 'tools.json')
+}
+
+function groupsFile() {
+  return join(panelDir(), 'groups.json')
+}
+
+/**
+ * Read the saved denied tool names.
+ *
+ * A missing file is "nothing denied yet", and a corrupt one is treated the same way
+ * rather than throwing: losing the switch must never take the plugin — and
+ * therefore the kill switch — down with it.
+ * @returns a deduplicated array of tool names.
+ */
+function loadTools() {
+  try {
+    const parsed = JSON.parse(readFileSync(toolsFile(), 'utf8'))
+    return normalizePromptNames(parsed?.disabled)
+  } catch {
+    return []
+  }
+}
+
+/** Persist the denied tool names atomically enough that a crash cannot truncate. */
+function saveTools() {
+  try {
+    const file = toolsFile()
+    mkdirSync(dirname(file), { recursive: true })
+    const temp = `${file}.tmp-${process.pid}`
+    writeFileSync(temp, `${JSON.stringify({ version: 1, disabled: [...denied] }, null, 2)}\n`, 'utf8')
+    renameSync(temp, file)
+  } catch {
+    // A read-only home keeps the switch in memory for this process: degraded, but
+    // the panel keeps working, which is the part that matters.
+  }
 }
 
 /**
@@ -561,17 +602,24 @@ const MAX_GROUPS = 100
 const MAX_GROUP_NAME = 60
 
 /**
- * The live switch, per session.
+ * The live switch, GLOBAL and by name.
  *
- * A session appears here only once something is denied; absence means every tool
- * is allowed. `blocked` and `last` are diagnostics: they distinguish a restriction
- * that is working from one that was configured but never fired. The control does
- * not print them, but they stay on the snapshot because reading one JSON response
- * is the fastest way to answer "is this guard actually running" — and because a
- * NAME that had to fall back to the guard (a scope-local tool that `restrict()`
- * cannot mask) shows up there rather than disappearing silently.
+ * A name appears here only once it is denied; absence means that tool is allowed
+ * everywhere. There is no session dimension at all: a name denied in this panel is
+ * denied for every agent in this profile, which is what makes the tools tab behave
+ * like the skills and prompts tabs (one durable answer about the environment, not a
+ * per-conversation restriction).
+ *
+ * `blocked` and `last` are diagnostics: they distinguish a restriction that is
+ * working from one that was configured but never fired. The control does not print
+ * them, but they stay on the snapshot because reading one JSON response is the
+ * fastest way to answer "is this guard actually running" — and because a NAME that
+ * had to fall back to the guard (a scope-local tool that `restrict()` cannot mask)
+ * shows up there rather than disappearing silently.
  */
-const policies = new Map()
+let denied = new Set(loadTools())
+let blocked = 0
+let lastDenial
 
 /**
  * The user's group definitions, loaded once at module load and written back on every
@@ -579,60 +627,12 @@ const policies = new Map()
  */
 let groups = loadGroups()
 
-/**
- * Who spawned whom, for every live agent — restricted or not.
- *
- * Separate from `policies` on purpose: a link must be recorded even while both
- * ends are unrestricted, because a session can be restricted LATER, and by then
- * the cheapest moment to answer "who is the parent" has already passed.
- */
-const parents = new Map()
-
-/** A session with no policy at all. Shared, because it must never be mutated. */
+/** No names denied. Shared, because it must never be mutated. */
 const EMPTY_DENY = new Set()
 
-/**
- * The session whose policy governs one session: itself, or its nearest restricted
- * ancestor.
- *
- * Walking up rather than copying a policy down is what makes restriction behave as
- * one unit across a delegation tree — a parent restricted after a child was
- * created still governs that child, and releasing the parent releases every
- * descendant that had no restriction of its own.
- *
- * The `seen` guard is not defensive padding: a cycle would hang the GUARD, which
- * runs synchronously inside the tool pipeline where a hang cannot be timed out.
- * @param table - the policy map to read.
- * @param tree - the child→parent map.
- * @param sessionId - the session asking.
- * @returns the id of the session that holds the applicable policy.
- */
-function ownerIn(table, tree, sessionId) {
-  let current = sessionId
-  const seen = new Set()
-  while (typeof current === 'string' && !seen.has(current)) {
-    if (table.has(current)) return current
-    seen.add(current)
-    current = tree.get(current)
-  }
-  // Nobody above holds a policy. This session is the one that will hold the next
-  // edit, so it is its own owner.
-  return sessionId
-}
-
-/** `ownerIn` over the live tables. */
-function ownerOf(sessionId) {
-  return ownerIn(policies, parents, sessionId)
-}
-
-/** The effective policy for one session, whether held by it or inherited. */
-function policyFor(sessionId) {
-  return policies.get(ownerOf(sessionId))
-}
-
-/** The exact set of denied names that governs one session (never mutated here). */
-function denySetFor(sessionId) {
-  return policyFor(sessionId)?.deny ?? EMPTY_DENY
+/** The exact set of denied names (never mutated by a caller). */
+function denySetFor() {
+  return denied
 }
 
 /**
@@ -658,27 +658,18 @@ function denyReason(name) {
 }
 
 /**
- * Build the synchronous guard over one live policy table.
+ * Build the synchronous guard.
  *
- * A factory rather than a module-level function so the guard reads the same table
- * the HTTP handler mutates, and so a test can drive an isolated copy.
- * @param table - the policy map to read.
- * @param tree - the child→parent map used to resolve inheritance.
+ * Reads the live module-level set rather than a captured one: `setDeny` REPLACES
+ * the set on every edit, so a closure over the old value would enforce a list that
+ * no longer exists.
  * @returns the guard, in the `ctx.tools.guard()` shape.
  */
-function makeGuard(table, tree) {
+function makeGuard() {
   return function guard(exec) {
-    const sessionId = exec.agent?.id
-    // No agent means no session to carry a list: nothing was switched off for this
-    // call, so it is out of scope rather than implicitly denied.
-    if (typeof sessionId !== 'string') return undefined
-    // Resolve the owner ONCE and reuse it: the walk runs inside the pipeline, and
-    // asking for the owner twice per call is work with no second answer.
-    const ownerId = ownerIn(table, tree, sessionId)
-    const record = table.get(ownerId)
-    if (record === undefined || !record.deny.has(exec.name)) return undefined
-    record.blocked += 1
-    record.last = { tool: exec.name, at: new Date().toISOString(), sessionId }
+    if (!denied.has(exec.name)) return undefined
+    blocked += 1
+    lastDenial = { tool: exec.name, at: new Date().toISOString(), sessionId: exec.agent?.id }
     return denyReason(exec.name)
   }
 }
@@ -686,13 +677,13 @@ function makeGuard(table, tree) {
 // --- per-agent hiding ---------------------------------------------------------
 
 /**
- * Mount a deny list into agent scopes and keep it in step with the policy table.
+ * Mount the deny set into agent scopes and keep it in step with the live set.
  *
- * The `tools` contract refuses an unscoped `restrict()` — a process-wide mask over
- * every agent is not what a per-session switch means — so the only supported way is
- * to register the restriction from a context that IS scoped to the agent. Cordis
- * calls that mounting a fiber into `agent.ctx`; the fiber is owned by the agent
- * scope, so the restriction is removed when the agent goes away.
+ * The `tools` contract refuses an unscoped `restrict()`, so even a global deny set
+ * has to be registered from a context that IS scoped to an agent — there is no
+ * process-wide mask to install. Cordis calls that mounting a fiber into `agent.ctx`;
+ * the fiber is owned by the agent scope, so the restriction is removed when the
+ * agent goes away. Every live agent therefore carries the same mask.
  *
  * WHY A PRESET-SCOPE FIBER IS MOUNTED TOO
  *   `restrict()` masks what a scope INHERITS, never what its own layer registers
@@ -741,16 +732,14 @@ function createRestrictor(scope, agents) {
   }
 
   /**
-   * The deny list that applies to one agent, cut down to names hiding can mask.
-   * @param agentId - the session whose policy applies (after inheritance).
+   * The deny list, cut down to names hiding can mask for one agent.
    * @param known - the maskable names for that agent, or undefined when unavailable.
    * @returns the names to mask, or undefined to leave the applied set untouched.
    */
-  function wantedFor(agentId, known) {
+  function wantedFor(known) {
     if (known === undefined) return undefined
-    const deny = denySetFor(agentId)
-    if (deny.size === 0) return []
-    return [...deny].filter((name) => known.has(name)).sort()
+    if (denied.size === 0) return []
+    return [...denied].filter((name) => known.has(name)).sort()
   }
 
   /**
@@ -761,7 +750,7 @@ function createRestrictor(scope, agents) {
    * live in the preset's own layer and are inherited by every agent that uses it.
    * @param key - stable identity for this scope; used to avoid a double mount.
    * @param target - `{ ctx, agent, agentId }`; `agent` is what `schemas()` is read
-   * for and `agentId` is the session whose policy applies.
+   * for. `agentId` only keeps the entry addressable for later re-syncs.
    * @param mount - how to install the fiber into that scope.
    */
   function mountScope(key, target, mount) {
@@ -795,14 +784,13 @@ function createRestrictor(scope, agents) {
 
         /**
          * Re-apply this scope's restriction.
-         * @param agentId - the session whose policy this scope serves.
          * @param known - the maskable names, when the caller already computed them
          * for a whole pass. Omitted on the initial mount, where there is no shared
          * pass, and the scope then reads them for its own agent.
          */
-        const sync = (agentId, known) => {
+        const sync = (known) => {
           if (stopped) return
-          const names = wantedFor(agentId, known ?? visibleNamesOf(target.agent))
+          const names = wantedFor(known ?? visibleNamesOf(target.agent))
           // No answer from the registry: keep whatever is applied. Clearing here
           // would make a tool the user switched off callable again.
           if (names === undefined) return
@@ -851,7 +839,7 @@ function createRestrictor(scope, agents) {
         } catch {
           // A minimal context without `effect`: the fiber teardown still runs.
         }
-        sync(target.agentId)
+        sync()
       }
     }
 
@@ -902,7 +890,7 @@ function createRestrictor(scope, agents) {
     )
   }
 
-  /** Re-read the policy for every mounted scope. */
+  /** Re-read the deny set for every mounted scope. */
   function syncAll() {
     if (!live) return
     // One visibility read per agent, not one per scope: the maskable set is a
@@ -917,7 +905,7 @@ function createRestrictor(scope, agents) {
         views.set(agentId, agent === undefined ? undefined : visibleNamesOf(agent))
       }
       try {
-        entry.holder.sync(agentId, views.get(agentId))
+        entry.holder.sync(views.get(agentId))
       } catch {
         // A throwing scope must not stop the other agents from being updated.
       }
@@ -1555,11 +1543,11 @@ function toolsForSession(sessionId, host) {
       /* a registry that cannot answer leaves the denied names below */
     }
   }
-  return [...new Set([...visible, ...denySetFor(sessionId)])].sort()
+  return [...new Set([...visible, ...denySetFor()])].sort()
 }
 
 /**
- * How many of the session's denied names the registry no longer offers to it.
+ * How many of the denied names the registry no longer offers to this session.
  *
  * This is the ONLY observable difference between "hidden" and "merely guarded": a
  * name that is denied but still in `schemas(agent)` was not masked (a scope-local
@@ -1567,7 +1555,6 @@ function toolsForSession(sessionId, host) {
  * snapshot is what makes that distinction answerable without a debugger.
  */
 function maskedCount(sessionId, host) {
-  const denied = denySetFor(sessionId)
   if (denied.size === 0) return 0
   const agent = host.agents?.get?.(sessionId)
   if (agent === undefined) return 0
@@ -1582,22 +1569,18 @@ function maskedCount(sessionId, host) {
 }
 
 /**
- * The snapshot the control renders for ONE session.
+ * The snapshot the control renders.
  *
- * `ownerId` is sent because the control needs to say when a list it is showing is
- * actually held by an ancestor: without that, a subagent's menu would look like the
- * place the restriction was set.
+ * The deny list is GLOBAL, so `sessionId` no longer selects a policy — it only
+ * selects which session's visible tool list is reported, so the menu still shows
+ * exactly the tools that conversation can call.
  */
 function snapshot(sessionId, host) {
-  const ownerId = ownerOf(sessionId)
-  const record = policies.get(ownerId)
   return {
     protocol: PROTOCOL,
     sessionId,
-    ownerId,
-    inherited: ownerId !== sessionId,
-    tools: host === undefined ? [...(record?.deny ?? [])].sort() : toolsForSession(sessionId, host),
-    denied: record === undefined ? [] : [...record.deny].sort(),
+    tools: host === undefined ? [...denied].sort() : toolsForSession(sessionId, host),
+    denied: [...denied].sort(),
     // Diagnostics, not UI: how many agent scopes currently carry a restriction (so
     // "is hiding mounted at all" is one JSON read), why the last mount/apply failed,
     // and how many denied names are really gone from the model's schema list.
@@ -1606,32 +1589,21 @@ function snapshot(sessionId, host) {
     masked: host === undefined ? undefined : maskedCount(sessionId, host),
     // The user's groups, copied so a caller cannot mutate the live definitions.
     groups: groups.map((group) => ({ id: group.id, name: group.name, members: [...group.members] })),
-    blocked: record?.blocked ?? 0,
-    last: record?.last
+    blocked,
+    last: lastDenial
   }
 }
 
 /**
- * Write one session's deny list, then re-apply hiding to every live agent.
+ * Replace the denied set, persist it, then re-apply hiding to every live agent.
  *
  * The list is replaced wholesale rather than patched per name: the control already
  * knows the complete set, a whole-list write is idempotent, and two windows racing
  * on one name cannot leave a half-updated list behind.
  */
-function setDeny(sessionId, names, restrictor) {
-  const ownerId = ownerOf(sessionId)
-  const current = policies.get(ownerId)
-  if (names.length === 0) {
-    // Nothing is denied, so there is no policy to hold. Dropping the entry is what
-    // lets a later-created descendant inherit "allowed" by simple absence.
-    policies.delete(ownerId)
-  } else {
-    policies.set(ownerId, {
-      deny: new Set(names),
-      blocked: current?.blocked ?? 0,
-      last: current?.last
-    })
-  }
+function setDeny(names, restrictor) {
+  denied = new Set(names)
+  saveTools()
   restrictor?.syncAll()
 }
 
@@ -1708,10 +1680,8 @@ async function handleState(req, res, host) {
       sendJson(res, 400, { ok: false, error: '`deny` must be an array of tool names' })
       return
     }
-    // The edit lands on the session that OWNS the policy, not necessarily the one
-    // that asked. A subagent showing an inherited list must be able to release it,
-    // and releasing it for the whole tree is what the user means by "this session".
-    setDeny(sessionId, names, host.restrictor)
+    // The deny list is global, so the edit applies to every live agent at once.
+    setDeny(names, host.restrictor)
   }
   sendJson(res, 200, { ok: true, state: snapshot(sessionId, host) })
 }
@@ -1907,31 +1877,6 @@ function registerRoute(scope, host, deps) {
 }
 
 /**
- * Record who spawned one agent, so a restriction can reach it later.
- *
- * `isOwnedBy` is the authoritative answer and needs no assumption about listener
- * ordering or about a causal-parent ambient being in scope at this moment. Scanning
- * every live agent is O(live agents) and runs once per creation, which is the
- * cheapest reliable way to ask the registry a question it answers per candidate.
- *
- * A failure here is swallowed into "no known parent": the consequence is that a
- * restriction may not reach that one child, which is strictly better than failing
- * agent creation.
- * @returns the parent's id, or undefined for a top-level agent.
- */
-function detectParent(agents, child) {
-  try {
-    for (const candidate of agents.list()) {
-      if (candidate.id === child.id) continue
-      if (agents.isOwnedBy(child.id, candidate)) return candidate.id
-    }
-  } catch {
-    /* an older registry without isOwnedBy: leave the tree flat */
-  }
-  return undefined
-}
-
-/**
  * The scopes a tool registration can live in, above and including one agent.
  *
  * A tool is visible to an agent when it sits in the global layer or in ANY layer on
@@ -2005,43 +1950,35 @@ export function apply(ctx) {
   const skillShadows = createSkillShadows(ctx, ctx.get('agents'))
   ctx.effect(() => () => skillShadows.dispose(), 'tools-panel: skill shadows')
 
-  ctx.effect(() => ctx.tools.guard(makeGuard(policies, parents)), 'tools-panel: live guard')
+  ctx.effect(() => ctx.tools.guard(makeGuard()), 'tools-panel: live guard')
 
   // Mount on the agent's own scope AND on the scopes above it: a preset's tool rows
   // are inherited from there, and only a restriction registered on the scope that
   // HOLDS the tool can mask it.
   const mountWithAncestors = (agent) => restrictor.mountEverywhere(agent)
 
-  // Record the delegation tree and mount one restriction per live agent. Both
-  // listeners are registered through the same optional-service probe, so a
-  // deployment without `agents` keeps the guard and simply has a flat tree.
+  // Mount one restriction per live agent. The deny list is global, so there is no
+  // delegation tree to record: every agent reads the same set.
   const agents = ctx.get('agents')
   if (agents !== undefined) {
     ctx.effect(
       () => ctx.on('agent/created', ({ agent }) => {
-        const parentId = detectParent(agents, agent)
-        if (parentId !== undefined) parents.set(agent.id, parentId)
         // Mount at creation so a switch set BEFORE the child existed already covers
-        // it; the lazy walk decides what that switch means for this child.
+        // it.
         mountWithAncestors(agent)
         promptShadows.mount(agent)
         skillShadows.mount(agent)
       }),
-      'tools-panel: delegation tree'
+      'tools-panel: agent mounts'
     )
     ctx.effect(
       () => ctx.on('agent/disposed', ({ agent }) => {
-        // The LINK goes, the POLICY stays: the restriction is an explicit user
-        // decision about a session, and a session that closes and resumes later
-        // should still be restricted. Keeping the link would instead keep a
-        // finished child in the walk forever.
-        parents.delete(agent.id)
         // The restriction itself was owned by the agent scope and is already gone.
         restrictor.release(agent.id)
         promptShadows.release(agent.id)
         skillShadows.release(agent.id)
       }),
-      'tools-panel: tree cleanup'
+      'tools-panel: agent cleanup'
     )
     for (const agent of agents.list()) {
       mountWithAncestors(agent)
@@ -2099,18 +2036,16 @@ export {
   loadGroups,
   loadPrompts,
   loadSkillDisabled,
+  loadTools,
   makeGuard,
   normalizeGroups,
   normalizePromptNames,
-  ownerOf,
-  parents,
-  policies,
-  policyFor,
   promptsFile,
   promptsState,
   saveGroups,
   savePrompts,
   saveSkillDisabled,
+  saveTools,
   scopesOf,
   setDeny,
   skillsFile,
@@ -2119,6 +2054,7 @@ export {
   togglePromptSection,
   toggleSkill,
   resetPromptSections,
+  toolsFile,
   toolsForSession
 }
 
@@ -2140,6 +2076,26 @@ export function getSkillDisabled() {
 /** Test-only: replace the live disabled-skill set without touching disk. */
 export function replaceSkillDisabled(names) {
   skillDisabled = new Set(normalizePromptNames(names))
+}
+
+/** Test-only: the live denied tool names. */
+export function getToolDisabled() {
+  return [...denied].sort()
+}
+
+/** Test-only: replace the live denied set without touching disk. */
+export function replaceToolDisabled(names) {
+  denied = new Set(normalizePromptNames(names))
+}
+
+/** Test-only: how many calls the guard has refused. */
+export function getToolBlocked() {
+  return blocked
+}
+
+/** Test-only: the last refusal the guard recorded. */
+export function getToolLast() {
+  return lastDenial
 }
 
 /** The live group definitions (read-only view; the route replaces the array). */
