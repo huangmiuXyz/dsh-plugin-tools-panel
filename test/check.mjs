@@ -466,13 +466,16 @@ function fakeHost() {
    */
   const PRESET_TOOLS = ['read', 'write', 'edit', 'bash', 'grep', 'todo_write', 'mcp__github__search']
   const GLOBAL_TOOLS = ['working_directory', 'cordis_inspect_list', 'cordis_inspect_call']
-  /** Which names are currently hidden per agent id — what `restrict()` changed. */
-  const hidden = new Map()
-  /** Which names are hidden per PRESET name — the layer above the agent. */
+  /**
+   * Names registered in an AGENT'S OWN layer, which `restrict()` refuses.
+   *
+   * The real registry derives `restrictableNames` from inherited contributions and
+   * excludes the scope's own registrations, so these are exactly the names the panel
+   * can never hide — it must fall back to the guard and must not re-probe them.
+   */
+  const LOCAL_TOOLS = []
   /** Agents whose preset mounts no tools: a scope view with nothing in it. */
   const noTools = new Set()
-  /** Every restriction call, in order, so the checks can read what was applied. */
-  const restrictCalls = []
   /**
    * Every preset ever minted, keyed by preset NAME so agents on the same preset
    * share one layer. `hidden` is the preset's own mask and `ctx` is the scope
@@ -496,13 +499,89 @@ function fakeHost() {
     }
   }
 
-  /** The names visible to one agent: both layers, minus what is masked on either. */
-  function visibleFor(agentId, preset) {
+  /**
+   * What the MODEL currently sees, per agent, computed by the plugin's own listeners.
+   *
+   * The assembly waterfall is ASYNC, so the fake cannot answer `schemas()` by running
+   * it on demand. Instead the real listeners are drained ahead of time into this
+   * cache, and `schemas()` stays synchronous. Every assertion in this file runs after
+   * a route round-trip or an explicit `settle()`, both of which call `refresh()`.
+   *
+   * Running the plugin's actual listeners (rather than re-implementing "everything
+   * minus the deny set") is what keeps the fake a harness: a filter deleted from the
+   * plugin has to show up as a test failure, not be papered over by the mirror.
+   */
+  /**
+   * The section names the fake's global prompt layer registers.
+   *
+   * The prompt filter removes names from `assembly.sections`; without a non-empty
+   * section list there would be nothing to remove and the prompt assertions would
+   * pass vacuously. The prompt-route tests install a richer `systemPrompt` service,
+   * but the FILTER only needs the name list, so this stays a plain array.
+   */
+  const promptSections = ['identity', 'rules', 'style']
+
+  const modelView = new Map()
+
+  /** The scope-less `system-prompt/assemble` listeners, in registration order. */
+  const assembleListeners = []
+
+  /** Names registered for one agent, before any plugin filter runs. */
+  function registeredFor(agentId) {
     if (noTools.has(agentId)) return []
-    const shared = presets.get(preset)
-    const gone = new Set([...(hidden.get(agentId) ?? []), ...(shared?.hidden ?? [])])
-    return [...GLOBAL_TOOLS, ...PRESET_TOOLS].filter((name) => !gone.has(name))
+    return [...GLOBAL_TOOLS, ...PRESET_TOOLS, ...LOCAL_TOOLS]
   }
+
+  /**
+   * Run the real waterfall for one agent and cache what comes out.
+   *
+   * Mirrors the host: each listener gets `(assembly, context, next)` and may return a
+   * replacement; the outermost value wins. Sections are included so the prompt
+   * filter is exercised through the same path, which is why one drain serves both.
+   */
+  async function refresh() {
+    for (const agent of live) {
+      const names = registeredFor(agent.id)
+      const assembly = {
+        tools: names.map((name) => ({ name })),
+        sections: promptSections.map((name) => ({ name, text: `text of ${name}` }))
+      }
+      let result = assembly
+      for (const listener of assembleListeners) {
+        // `next()` must hand each listener what the previous one produced, which is
+        // what the host's `waterfall` does with its shifting callback list.
+        result = await listener(result, { scope: agent }, () => Promise.resolve(result))
+      }
+      modelView.set(agent.id, {
+        tools: (result.tools ?? assembly.tools).map((schema) => schema.name),
+        sections: (result.sections ?? assembly.sections).map((section) => section.name)
+      })
+    }
+  }
+
+  /**
+   * The names one agent can CALL, as the model ends up seeing them.
+   *
+   * Falls back to the unfiltered registry list when no drain has happened yet, so a
+   * caller that reads before the first `refresh()` still gets a sane answer.
+   */
+  function visibleFor(agentId) {
+    const cached = modelView.get(agentId)
+    if (cached !== undefined) return cached.tools
+    return registeredFor(agentId)
+  }
+
+  /**
+   * Fire one registry event, the way the real service's `ctx.emit` does.
+   *
+   * `restrict()` uses this on apply and on dispose, so the fake reproduces the
+   * notification that turns a self-filtering deny list into a feedback loop.
+   * @param name - the event name.
+   */
+  function emit(name) {
+    for (const listener of listeners.get(name) ?? []) listener()
+  }
+
 
   /** The `tools` service, scoped when it belongs to one agent's context. */
   const tools = {
@@ -542,6 +621,28 @@ function fakeHost() {
     __register(name) {
       PRESET_TOOLS.push(name)
       for (const listener of listeners.get('tools/change') ?? []) listener()
+    },
+    /**
+     * Test-only: fire `tools/change` without changing anything, the way any unrelated
+     * registry mutation does. The convergence check re-fires it to prove the panel
+     * reaches a fixed point instead of answering every notification with a
+     * tear-down/re-apply pair.
+     */
+    __notify() {
+      emit('tools/change')
+    },
+    /**
+     * Test-only: a name in the agent's OWN layer, which `restrict()` can never mask.
+     *
+     * The real registry resolves `restrictableNames` from INHERITED contributions
+     * only, so a scope's own registrations fail the call with "unknown global tool".
+     * The fake models that by rejecting names that are not in the inherited tables —
+     * registering one here is how the "don't re-probe a permanent failure" path gets
+     * exercised.
+     */
+    __registerLocal(name) {
+      LOCAL_TOOLS.push(name)
+      emit('tools/change')
     }
   }
 
@@ -563,61 +664,26 @@ function fakeHost() {
   function makeAgent(id, preset = 'standard') {
     let shared = presets.get(preset)
     if (shared === undefined) {
-      shared = { presetId: `${preset}-${nextPresetId++}`, hidden: new Set() }
+      shared = { presetId: `${preset}-${nextPresetId++}` }
       presets.set(preset, shared)
     }
-    const presetId = shared.presetId
-    const scopedTools = {
-      guard: tools.guard,
-      /** Restrict the names THIS agent can see — its own layer's mask. */
-      restrict(filter) {
-        const names = filter?.deny ?? []
-        if (names.length === 0) throw new Error('empty restriction')
-        for (const name of names) {
-          if (!GLOBAL_TOOLS.includes(name) && !PRESET_TOOLS.includes(name)) {
-            throw new Error(`unknown global tool: ${name}`)
-          }
-        }
-        restrictCalls.push({ id, names, layer: 'agent' })
-        const applied = new Set(hidden.get(id) ?? [])
-        for (const name of names) applied.add(name)
-        hidden.set(id, applied)
-        return () => {
-          const set = new Set(hidden.get(id) ?? [])
-          for (const name of names) set.delete(name)
-          hidden.set(id, set)
-        }
-      },
-      schemas: (scope) => tools.schemas(scope ?? { id })
-    }
-    /** The same contract one layer up, masking the PRESET's own registrations. */
-    const presetTools = {
-      guard: tools.guard,
-      restrict(filter) {
-        const names = filter?.deny ?? []
-        if (names.length === 0) throw new Error('empty restriction')
-        for (const name of names) {
-          if (!PRESET_TOOLS.includes(name)) throw new Error(`unknown global tool: ${name}`)
-        }
-        restrictCalls.push({ id: presetId, names, layer: 'preset' })
-        // The mask belongs to the PRESET, not to this agent: every agent sharing the
-        // preset sees the same layer, so a second agent must not get its own copy.
-        for (const name of names) shared.hidden.add(name)
-        return () => {
-          for (const name of names) shared.hidden.delete(name)
-        }
-      },
-      schemas: (scope) => tools.schemas(scope ?? { id })
-    }
     const agent = { id, preset }
-    agent.presetId = presetId
+    agent.presetId = shared.presetId
     agent.ctx = {
       // `fiber.uid` is the scope's identity and `fiber.parent` is the enclosing
-      // CONTEXT — the documented Cordis shape, which is what the plugin walks.
+      // CONTEXT — the documented Cordis shape. The tool filter no longer walks this
+      // chain (it is registered once, without a scope), but the prompt and skill
+      // shadows still mount per agent, so the scope has to be a real mount point.
       fiber: { uid: id, parent: undefined },
       plugin(definition) {
         const fiberCtx = {
-          tools: scopedTools,
+          tools: {
+            guard: tools.guard,
+            // No `restrict()`: the mechanism is gone. Leaving it out is deliberate —
+            // if the plugin ever called it again, this fake would fail loudly instead
+            // of silently accepting the call.
+            schemas: (argument) => tools.schemas(argument ?? { id })
+          },
           // Resolved per CALL: the prompt-shadow plugin is mounted when this agent
           // appears, while the fake `systemPrompt` service is installed later by the
           // prompt-section test. A promise-of-a-service would make the mount order
@@ -647,31 +713,9 @@ function fakeHost() {
           on: () => () => {}
         }
         definition.apply?.(fiberCtx)
-        return {
-          dispose() {
-            hidden.delete(id)
-          }
-        }
-      }
-    }
-    // The preset scope above it. `fiber.parent` is the link the plugin's walk follows.
-    // Shared per preset: a second agent on the same preset points at the SAME object,
-    // so the plugin's "already mounted" check has a real second agent to dedupe.
-    const presetCtx = shared.ctx ?? {
-      fiber: { uid: presetId, parent: undefined },
-      plugin(definition) {
-        const fiberCtx = {
-          tools: presetTools,
-          effect: (fn) => fn(),
-          get: () => undefined,
-          on: () => () => {}
-        }
-        definition.apply?.(fiberCtx)
         return { dispose() {} }
       }
     }
-    shared.ctx = presetCtx
-    agent.ctx.fiber.parent = presetCtx
     return agent
   }
 
@@ -708,6 +752,9 @@ function fakeHost() {
       const list = listeners.get(name) ?? []
       list.push(listener)
       listeners.set(name, list)
+      // The plugin registers its schema filter this way. Capturing it here is what
+      // lets `schemas()` run the REAL filter instead of a hand-copied mirror.
+      if (name === 'system-prompt/assemble') assembleListeners.push(listener)
       return () => {
         const at = list.indexOf(listener)
         if (at >= 0) list.splice(at, 1)
@@ -717,7 +764,7 @@ function fakeHost() {
     inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
     effect: (fn) => fn()
   }
-  return { agents, ctx, extras, guards, hidden, live, routes, restrictCalls, server, tools }
+  return { agents, assembleListeners, ctx, extras, guards, live, refresh, routes, server, tools }
 }
 
 // The module-level set is shared with `apply`, so clear it before wiring the fake
@@ -727,8 +774,17 @@ replaceToolDisabled([])
 const host = fakeHost()
 const { apply } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 apply(host.ctx)
-/** Let the deferred `tools/change` re-apply run. */
-const settle = () => new Promise((resolve) => setTimeout(resolve, 5))
+/**
+ * Let deferred work land, then re-drain the real assembly listeners.
+ *
+ * Two things need waiting on: the plugin's own microtasks, and the
+ * `system-prompt/assemble` listeners whose result `schemas()` reports. Draining here
+ * is what keeps every `schemas()` read after a route call meaningful.
+ */
+const settle = async () => {
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await host.refresh()
+}
 check('apply: registers exactly one guard', host.guards.length === 1, String(host.guards.length))
 check('apply: registers the control route', host.routes.has(ROUTE), ROUTE)
 
@@ -736,12 +792,22 @@ await new Promise((resolve) => host.server.listen(0, '127.0.0.1', resolve))
 const base = `http://127.0.0.1:${host.server.address().port}`
 const get = (sessionId) =>
   fetch(sessionId === undefined ? `${base}${ROUTE}` : `${base}${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
-const post = (body, withHeader = true) =>
-  fetch(`${base}${ROUTE}`, {
+/**
+ * POST the control route, then re-drain the assembly listeners.
+ *
+ * The drain is part of the helper on purpose: every `schemas()` assertion after a
+ * switch is a question about what the model would see NEXT, and the answer only
+ * exists once the plugin's listeners have run again.
+ */
+const post = async (body, withHeader = true) => {
+  const answer = await fetch(`${base}${ROUTE}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(withHeader ? { [HEADER]: '1' } : {}) },
     body: JSON.stringify(body)
   })
+  await host.refresh()
+  return answer
+}
 
 try {
   // Two independent sessions, plus a delegated child and grandchild under the first.
@@ -898,26 +964,13 @@ try {
       !seen.includes('working_directory'),
       seen.join(',')
     )
-    // The mask must actually have been applied on the PRESET layer, not only read
-    // as an agent-scope restriction. This is the assertion that fails on the old
-    // single-mount code: without it the preset rows simply stay visible.
-    const presetCalls = host.restrictCalls.filter((call) => call.layer === 'preset')
-    check(
-      'layers: the restriction reached the preset layer',
-      presetCalls.some((call) => call.names.includes('bash')),
-      JSON.stringify(presetCalls.map((call) => call.names))
-    )
-    // The preset layer is mounted ONCE for the whole preset, however many agents
-    // use it — a second agent must not produce a second mask. The count is bounded
-    // by the number of preset layers, not by the number of agents.
-    const presetLayers = presetCalls.map((call) => call.id)
-    // The deny set is global, so BOTH live presets are masked (root-a's and
-    // root-b's "other") — but each exactly once, however many agents use it.
-    check(
-      'layers: each preset layer is masked once, not per agent',
-      new Set(presetLayers).size === 2 && new Set(presetLayers).size < host.live.length,
-      `${new Set(presetLayers).size} layer(s) for ${host.live.length} agent(s)`
-    )
+    // The MECHANISM that used to be asserted here — "the restriction reached the
+    // preset layer", "each preset layer is masked exactly once" — is gone with
+    // `restrict()`. There are no per-scope restrictions to count any more: one
+    // process-wide filter removes the name wherever it was registered, so a preset
+    // row and an agent-local row are handled identically. What still has to hold is
+    // the OUTCOME, which the checks above and below assert: the name is not in the
+    // list the model sees, and the untouched names still are.
     check(
       'layers: the other preset tools stay visible',
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
@@ -933,6 +986,42 @@ try {
       'layers: and the global tool is visible again',
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('working_directory')
     )
+  }
+  {
+    // THE oscillation regression, kept as a guard against reintroducing it.
+    //
+    // The old implementation asked `schemas()` — the POST-restriction view — which
+    // tool names it should deny. Its own action removed names from that view, so the
+    // next pass computed a different answer, the signature changed, the restriction
+    // was lifted, the names returned, and `restrict()`/its disposer each emitted
+    // `tools/change` and started it again. Every tool flipped off and on about once
+    // a tick per mounted scope, which the user saw as the tool list being repeatedly
+    // removed and re-added.
+    //
+    // The replacement cannot express that loop: the filter reads the deny set and
+    // writes nothing, so it has no feedback path. The check below pins the OUTCOME —
+    // stability across repeated notifications — so a future change that starts
+    // mutating during assembly fails here instead of in the UI.
+    await (await post({ sessionId: 'root-a', deny: ['bash', 'grep'] })).json()
+    await settle()
+    const snapshotAfterSet = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
+    for (let round = 0; round < 3; round += 1) {
+      host.tools.__notify()
+      await settle()
+    }
+    const snapshotAfterNoise = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
+    check(
+      'convergence: the visible list is stable across repeated tools/change',
+      snapshotAfterNoise.join(',') === snapshotAfterSet.join(','),
+      `${snapshotAfterSet.length} -> ${snapshotAfterNoise.length} names`
+    )
+    check(
+      'convergence: and the denied tools stay hidden throughout',
+      !snapshotAfterNoise.includes('bash') && !snapshotAfterNoise.includes('grep'),
+      snapshotAfterNoise.join(',')
+    )
+    await (await post({ sessionId: 'root-a', deny: [] })).json()
+    await settle()
   }
   {
     // Editing from the child edits the ROOT: releasing there must release the whole
@@ -1102,6 +1191,78 @@ try {
       typeof host.guards[0]({ name: 'write', agent: { id: 'root-a' } }) === 'string'
     )
     await post({ sessionId: 'root-a', deny: [] })
+    await settle()
+  }
+  {
+    // THE bug this rewrite fixes, stated as an outcome.
+    //
+    // A tool registered into the AGENT'S OWN layer is invisible to
+    // `tools.restrict()`: restrictions only filter INHERITED contributions, and that
+    // exemption is deliberate — it is how the delegation runtime hands a child its
+    // own tools. So the old implementation could not remove `subagent`,
+    // `send_team`, the `team_task_*` family, `wait_agent`, `interrupt_agent`,
+    // `list_agents` or `list_subagent_models`, and the panel showed their switches
+    // off while the model kept being offered them. That gap is what the user
+    // reported as "tools are not blocked".
+    //
+    // The schema filter does not care which layer registered a name, so it must
+    // remove these exactly like any other denied tool.
+    const scopeLocal = ['scope_local_probe_a', 'scope_local_probe_b']
+    host.tools.__registerLocal(scopeLocal[0])
+    host.tools.__registerLocal(scopeLocal[1])
+    await post({ sessionId: 'root-a', deny: scopeLocal })
+    await settle()
+    const seenByModel = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
+    check(
+      'scope-local: a tool registered in the agent own layer IS removed',
+      !seenByModel.includes(scopeLocal[0]),
+      seenByModel.join(',')
+    )
+    check(
+      'scope-local: and so is the second one',
+      !seenByModel.includes(scopeLocal[1]),
+      seenByModel.join(',')
+    )
+    check(
+      'scope-local: the untouched tools are still offered',
+      seenByModel.includes('read') && seenByModel.includes('working_directory'),
+      seenByModel.join(',')
+    )
+    // The guard is a separate, cheaper backstop and must stay: it is what stops a
+    // call the model makes from history or through a PTC sub-dispatch.
+    check(
+      'scope-local: the guard still refuses the name independently of the filter',
+      typeof host.guards[0]({ name: scopeLocal[0], agent: { id: 'root-a' } }) === 'string'
+    )
+    await post({ sessionId: 'root-a', deny: [] })
+    await settle()
+  }
+  {
+    // A PRESET scope is shared by every agent on that preset, and it outlives each
+    // of them. Its entry used to be left behind forever after the agents were
+    // disposed — one leaked entry per agent ever created, each re-read by `syncAll`
+    // on every `tools/change`. The map must be bounded by LIVE agents, not by the
+    // agents this process has ever run.
+    //
+    // Spawn a run of agents on the same preset, then dispose them all; the scope
+    // count must come back down to what the still-live agents need.
+    const scopeCount = async () => (await (await get('root-a')).json()).state?.scopes
+    const baseline = await scopeCount()
+    const churn = []
+    for (let index = 0; index < 6; index += 1) churn.push(host.agents.spawn(`churn-${index}`, undefined, 'churny'))
+    await settle()
+    const whileLive = await scopeCount()
+    for (const agent of churn) host.agents.dispose(agent.id)
+    await settle()
+    const afterDisposal = await scopeCount()
+    // EXACT equality, not "went down": one leaked preset entry is the whole bug, so a
+    // loose `<` comparison lets it through. The churn agents were the only users of
+    // that preset, so every entry they caused must be gone.
+    check(
+      'leak: disposing agents returns the scope count to the live baseline',
+      afterDisposal === baseline,
+      `${whileLive} while live -> ${afterDisposal} after disposal, baseline ${baseline}`
+    )
     await settle()
   }
 } finally {
@@ -1292,11 +1453,22 @@ try {
         const merged = new Map()
         for (const section of promptGlobal) merged.set(section.name, section)
         for (const [name, definition] of overlay) merged.set(name, definition)
-        return {
+        const assembly = {
           sections: [...merged.values()]
             .sort((left, right) => left.order - right.order)
             .map((section) => ({ name: section.name, text: section.text }))
         }
+        // Run the plugin's REAL `system-prompt/assemble` listeners, exactly as the
+        // host does. Without this the fake would answer from the raw registry and the
+        // panel's verification step would see nothing removed — the filter would be
+        // untested here, and a deleted filter would still pass.
+        let result = assembly
+        for (const listener of host.assembleListeners) {
+          result = await listener(result, { scope: agent }, () => Promise.resolve(result))
+        }
+        // Mirror the host's post-waterfall rule: a `complete` section is re-imposed.
+        // No section in this fixture is complete, so nothing is restored.
+        return result
       },
       __scoped(id) {
         return (definition) => {
@@ -1319,9 +1491,19 @@ try {
 
     const hidden = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })).json()
     check('prompts route: the switch reports it took effect', hidden.ok === true && hidden.applied === true)
+    // The mechanism changed from "register an empty same-name section" to "remove the
+    // section from the assembled list", so the observable is absence from the
+    // assembly. The overlay check is kept as the NEGATIVE half: the plugin must not
+    // have fallen back to shadowing either.
+    const afterHide = await host.extras.systemPrompt.assemble({ agent: host.agents.get('root-a') })
     check(
-      'prompts route: the section is now empty in the live prompt',
-      (overlays.get('root-a')?.get('identity')?.text ?? 'not-shadowed') === ''
+      'prompts route: the section is gone from the live prompt',
+      !afterHide.sections.some((section) => section.name === 'identity'),
+      afterHide.sections.map((section) => section.name).join(',')
+    )
+    check(
+      'prompts route: and no shadow was registered for it',
+      !(overlays.get('root-a')?.has('identity') ?? false)
     )
     const hiddenRow = hidden.state.sections.find((row) => row.name === 'identity')
     check('prompts route: the row is off', hiddenRow?.enabled === false)
@@ -1334,23 +1516,36 @@ try {
 
     const restored = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: true })).json()
     check('prompts route: the switch can be turned back on', restored.applied === true)
-    check('prompts route: the shadow is gone', !(overlays.get('root-a')?.has('identity') ?? false))
+    check('prompts route: no shadow was ever registered', !(overlays.get('root-a')?.has('identity') ?? false))
     check('prompts route: the text is back', restored.state.sections.find((row) => row.name === 'identity')?.liveChars > 0)
 
     // An unknown name must not persist a dead switch.
     check('prompts route: an unknown section is a 404', (await promptsPost({ sessionId: 'root-a', name: 'nope', enabled: false })).status === 404)
     check('prompts route: an unknown section persists nothing', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
 
-    // A section that cannot be shadowed is detected and rolled back.
+    // THE improvement, asserted directly. A section the agent registered ITSELF lives
+    // in the agent's own layer, which the old same-name shadow could not overwrite —
+    // that was the 409 this block used to demand. The filter removes sections from
+    // the assembled list instead, so there is no layer to be wrong about and the
+    // switch now succeeds. `shadowFails` still marks the name, proving the outcome no
+    // longer depends on shadowing at all.
     shadowFails.add('tool-notes')
-    const refused = await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: false })
-    check('prompts route: an unshadowable section is a 409', refused.status === 409, String(refused.status))
-    check('prompts route: the refusal leaves no disabled name', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
+    const selfRegisteredAnswer = await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: false })
+    const selfRegistered = await selfRegisteredAnswer.json()
     check(
-      'prompts route: the section still carries its text',
-      (overlays.get('root-a')?.get('tool-notes')?.text ?? 'still live') !== ''
+      'prompts route: a self-registered section can now be switched off',
+      selfRegisteredAnswer.status === 200 && selfRegistered.applied === true,
+      JSON.stringify(selfRegistered)
+    )
+    check('prompts route: and the disabled name is recorded', getPromptDisabled().includes('tool-notes'), JSON.stringify(getPromptDisabled()))
+    check(
+      'prompts route: the filter removed it from the assembled prompt',
+      !(await host.extras.systemPrompt.assemble({ agent: host.agents.get('root-a') }))
+        .sections.some((section) => section.name === 'tool-notes')
     )
     shadowFails.delete('tool-notes')
+    // Put it back so the reset assertions below start from a clean set.
+    await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: true })
 
     // The reset switch restores every disabled section at once.
     await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })
