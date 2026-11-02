@@ -79,6 +79,15 @@ const clientSource = fs.readFileSync(path.join(PKG, 'src', 'client.js'), 'utf8')
 const hostImports = [...hostSource.matchAll(/^\s*import\s[^\n]*?from\s+'([^']+)'/gm)].map((m) => m[1])
 const hostPackages = hostImports.filter((name) => !name.startsWith('node:'))
 check('host half: imports no package', hostPackages.length === 0, hostPackages.join(', ') || hostImports.join(', '))
+// Cordis throws `cannot get property "X" without inject` on a PROPERTY access to a
+// service this context did not declare; `get()` is exempt. A property read here once
+// crashed the whole activate — no guard, no routes, the panel answering 404 — so the
+// shape is pinned: optional services are read through `get` only.
+check(
+  'host half: reads optional services through get()',
+  !/\b(?:ctx|scope|target)\??\.(?:systemPrompt|skills|workingDirectory)\b(?!\s*:)/.test(hostSource),
+  'property access throws without inject'
+)
 const clientImports = [...clientSource.matchAll(/require\('([^']+)'\)/g)].map((m) => m[1])
 check(
   'client half: only react require() calls',
@@ -124,7 +133,18 @@ const {
   skillsFile,
   skillsState,
   togglePromptSection,
-  snapshot
+  snapshot,
+  GET_TOOLS,
+  MAX_GROUP_PROMPT,
+  createDeferredTools,
+  deferredIndexText,
+  deferredNamesFor,
+  hiddenSetFor,
+  lockedGroupsFor,
+  normalizeGroupPrompt,
+  replaceGroups,
+  unlockGroup,
+  unlockedFor
 } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 
 // The two halves are loaded independently (the bundle hot-reloads; the host half
@@ -274,6 +294,23 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
   check('groups: an absent value is "not sent"', normalizeGroups(undefined) === undefined)
   check('groups: the array is bounded', normalizeGroups(Array.from({ length: MAX_GROUPS + 1 }, () => ({ name: 'x' }))) === undefined)
 
+  // Progressive-disclosure fields: opt-in, typed, trimmed and bounded. The prompt
+  // goes into the model's system prompt, so a hostile or sloppy value must not
+  // survive into it.
+  const disclosed = normalizeGroups([
+    { name: 'git', members: ['a'], disclosure: true, prompt: '  Git stuff  ' },
+    { name: 'plain', members: ['b'], disclosure: 'yes', prompt: 42 }
+  ])
+  check('groups: disclosure is kept', disclosed[0].disclosure === true, JSON.stringify(disclosed[0]))
+  check('groups: anything but true reads as off', disclosed[1].disclosure === false)
+  check('groups: the prompt is trimmed', disclosed[0].prompt === 'Git stuff', disclosed[0].prompt)
+  check('groups: a non-string prompt is empty', disclosed[1].prompt === '')
+  check(
+    'groups: the prompt is bounded',
+    normalizeGroupPrompt('x'.repeat(MAX_GROUP_PROMPT + 50)).length === MAX_GROUP_PROMPT
+  )
+  check('groups: control characters are stripped', !normalizeGroupPrompt('a\u0000b\u0007c').includes('\u0000'))
+
   // The snapshot carries the groups, and it carries a COPY: a caller that mutates
   // the answer must not corrupt the live definitions the next request reads.
   setGroups([{ id: 'g1', name: 'bundle', members: ['read', 'write'] }])
@@ -282,6 +319,16 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
   snap.groups[0].members.push('bash')
   snap.groups[0].name = 'mutated'
   check('groups: the snapshot is a copy', getGroups()[0].name === 'bundle' && getGroups()[0].members.length === 2)
+  // The index is a `- ` list: a name or prompt carrying a newline must not end its
+  // own bullet and turn the rest of the prompt into free text for the model.
+  setGroups([
+    { id: 'g-multi', name: 'multi\nline', members: ['a', 'b'], disclosure: true, prompt: 'first\nsecond' }
+  ])
+  const indexText = deferredIndexText('nobody')
+  check('index: one bullet per group', (indexText.match(/^- /gm) ?? []).length === 1, indexText)
+  check('index: a newline in the prompt is collapsed', !indexText.includes('\nsecond'), indexText)
+  check('index: a newline in the name is collapsed', !indexText.includes('\nline'), indexText)
+
   setGroups([])
   check('groups: clearing works', snapshot('nobody').groups.length === 0)
 }
@@ -350,6 +397,22 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
     check('agent tool: create dedupes members', JSON.stringify(answer.groups[0]?.members) === '["bash","edit"]', JSON.stringify(answer.groups[0]?.members))
     check('agent tool: create persists through replaceGroups', getGroups()[0]?.name === 'Git')
     check('agent tool: create reports the count', answer.groups[0]?.memberCount === 2, String(answer.groups[0]?.memberCount))
+  }
+  {
+    const answer = await call({ action: 'set_disclosure', group: 'Git', disclosure: true, prompt: '  Git operations  ' })
+    check('agent tool: set_disclosure flips the switch', answer.groups[0]?.disclosure === true, JSON.stringify(answer.groups[0]))
+    check('agent tool: set_disclosure stores the trimmed prompt', answer.groups[0]?.prompt === 'Git operations', String(answer.groups[0]?.prompt))
+    const stored = getGroups()[0]
+    check('agent tool: set_disclosure persists both fields', stored?.disclosure === true && stored?.prompt === 'Git operations', JSON.stringify(stored))
+    const off = await call({ action: 'set_disclosure', group: 'Git', disclosure: false })
+    check('agent tool: set_disclosure can turn it off and keep the prompt', off.groups[0]?.disclosure === false && off.groups[0]?.prompt === 'Git operations', JSON.stringify(off.groups[0]))
+    let refused
+    try {
+      await call({ action: 'set_disclosure', group: 'Git' })
+    } catch (failure) {
+      refused = String(failure?.message ?? failure)
+    }
+    check('agent tool: set_disclosure with neither field is refused', typeof refused === 'string' && refused.includes('needs'), String(refused))
   }
   {
     const before = await call({ action: 'list' })
@@ -477,6 +540,8 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
  */
 function fakeHost() {
   const guards = []
+  /** Every tool this host's registry currently holds — the plugin's own rows. */
+  const registered = []
   const routes = new Map()
   const listeners = new Map()
   const live = []
@@ -527,12 +592,35 @@ function fakeHost() {
     }
   }
 
+  /**
+   * The model-facing shape of one fake tool.
+   *
+   * Descriptions and parameters are present on purpose: they are what must NOT leak
+   * into a `get_tools` answer (the unlocked tools carry them in the tool list
+   * instead), so a stripped fake would let a leaking answer pass.
+   */
+  const schemaOf = (name) => ({
+    name,
+    description: `${name} does something.`,
+    parameters: { type: 'object', additionalProperties: false, properties: { path: { type: 'string' } } }
+  })
+
   /** The names visible to one agent: both layers, minus what is masked on either. */
   function visibleFor(agentId, preset) {
     if (noTools.has(agentId)) return []
     const shared = presets.get(preset)
     const gone = new Set([...(hidden.get(agentId) ?? []), ...(shared?.hidden ?? [])])
     return [...GLOBAL_TOOLS, ...PRESET_TOOLS].filter((name) => !gone.has(name))
+  }
+
+  /**
+   * Fire `tools/change`, the way the real registry does on every registration,
+   * restriction, and restriction disposal. Emission is what makes the panel's
+   * deferred re-apply pass run at all — and what turns a wanted set derived from
+   * the live view into an endless clear/re-apply cycle.
+   */
+  function announceToolChange() {
+    for (const listener of listeners.get('tools/change') ?? []) listener()
   }
 
   /** The `tools` service, scoped when it belongs to one agent's context. */
@@ -542,6 +630,22 @@ function fakeHost() {
       return () => {
         const index = guards.indexOf(fn)
         if (index >= 0) guards.splice(index, 1)
+      }
+    },
+    /**
+     * Register a tool, returning its exact disposer.
+     *
+     * Mirrors the real contract: a registration announces `tools/change`, and the
+     * disposer unregisters it and announces again. `get_tools` is mounted and
+     * unmounted at runtime, so the fake has to model both directions.
+     */
+    register(definition) {
+      registered.push(definition)
+      announceToolChange()
+      return () => {
+        const at = registered.indexOf(definition)
+        if (at >= 0) registered.splice(at, 1)
+        announceToolChange()
       }
     },
     /**
@@ -560,9 +664,9 @@ function fakeHost() {
      * this session can call, whatever the reason it cannot call anything.
      */
     schemas(scope) {
-      if (scope === undefined) return GLOBAL_TOOLS.map((name) => ({ name }))
+      if (scope === undefined) return GLOBAL_TOOLS.map(schemaOf)
       const agent = live.find((entry) => entry.id === scope.id)
-      return visibleFor(scope.id, agent?.preset).map((name) => ({ name }))
+      return visibleFor(scope.id, agent?.preset).map(schemaOf)
     },
     /**
      * Test-only: register a tool later and fire `tools/change`, the way a real
@@ -572,7 +676,15 @@ function fakeHost() {
      */
     __register(name) {
       PRESET_TOOLS.push(name)
-      for (const listener of listeners.get('tools/change') ?? []) listener()
+      announceToolChange()
+    },
+    /**
+     * Test-only: emit `tools/change` without changing anything. This is the event a
+     * `restrict()` (and its disposer) emits, so it is what re-enters the panel's
+     * deferred re-apply pass.
+     */
+    __change() {
+      announceToolChange()
     }
   }
 
@@ -613,10 +725,14 @@ function fakeHost() {
         const applied = new Set(hidden.get(id) ?? [])
         for (const name of names) applied.add(name)
         hidden.set(id, applied)
+        // The real contract emits on the way in; the panel's `schemas()` read after
+        // this point no longer contains these names.
+        announceToolChange()
         return () => {
           const set = new Set(hidden.get(id) ?? [])
           for (const name of names) set.delete(name)
           hidden.set(id, set)
+          announceToolChange()
         }
       },
       schemas: (scope) => tools.schemas(scope ?? { id })
@@ -634,8 +750,10 @@ function fakeHost() {
         // The mask belongs to the PRESET, not to this agent: every agent sharing the
         // preset sees the same layer, so a second agent must not get its own copy.
         for (const name of names) shared.hidden.add(name)
+        announceToolChange()
         return () => {
           for (const name of names) shared.hidden.delete(name)
+          announceToolChange()
         }
       },
       schemas: (scope) => tools.schemas(scope ?? { id })
@@ -748,7 +866,7 @@ function fakeHost() {
     inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
     effect: (fn) => fn()
   }
-  return { agents, ctx, extras, guards, hidden, live, routes, restrictCalls, server, tools }
+  return { agents, ctx, extras, guards, registered, hidden, live, routes, restrictCalls, server, tools }
 }
 
 // The module-level tables are shared with `apply`, so clear them before wiring the
@@ -967,6 +1085,166 @@ try {
       'layers: and the global tool is visible again',
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('working_directory')
     )
+  }
+  {
+    // THE oscillation. `restrict()` hides a tool by REMOVING it from `schemas()`,
+    // and it emits `tools/change` — the very event that schedules the panel's next
+    // re-apply pass. A wanted set filtered against that live view therefore reads
+    // its own mask as "this tool is gone", clears it, re-exposes the tool, and
+    // re-applies on the next tick, forever: the model sees a tool list that grows
+    // and shrinks between rounds. The fake now emits on the way in AND out of a
+    // restriction, so this block runs the loop instead of a single pass.
+    const applied = await (await post({ sessionId: 'root-a', deny: ['read', 'bash'] })).json()
+    check('stability: the switch takes effect at once', applied.state?.denied?.length === 2)
+    const calls = host.restrictCalls.length
+    for (let round = 0; round < 3; round += 1) {
+      // Each of these is the event a re-apply would emit, plus the event a clear
+      // would emit: enough rounds that an oscillation cannot hide behind parity.
+      host.tools.__change()
+      await settle()
+    }
+    const names = host.tools.schemas({ id: 'root-a' }).map((s) => s.name)
+    check('stability: a pass does not clear its own mask', !names.includes('read') && !names.includes('bash'), names.join(','))
+    check(
+      'stability: and does not re-apply an unchanged set',
+      host.restrictCalls.length === calls,
+      `${host.restrictCalls.length - calls} extra restrict() call(s)`
+    )
+    await post({ sessionId: 'root-a', deny: [] })
+    await settle()
+    check(
+      'stability: releasing still lifts the mask for good',
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
+    )
+  }
+  // --- progressive disclosure over the wire ------------------------------------
+  {
+    // A deferred group: its members must leave the model's schema list, stay in the
+    // PANEL's list, and come back once `get_tools` loads them for this session.
+    // Members come from the GLOBAL layer on purpose: `root-b` sits on its own preset,
+    // so the global tools are the ones it can see and the ones `restrict()` can mask.
+    const MEMBER_A = 'working_directory'
+    const MEMBER_B = 'cordis_inspect_list'
+    replaceGroups([
+      {
+        id: 'g-deferred',
+        name: 'Git',
+        members: [MEMBER_A, MEMBER_B],
+        disclosure: true,
+        prompt: 'Git operations: status, commits, branches.'
+      }
+    ])
+    await settle()
+    check('disclosure: get_tools is mounted while a group defers', host.registered.length === 1, String(host.registered.length))
+    check('disclosure: it is named get_tools', host.registered[0]?.name === GET_TOOLS, String(host.registered[0]?.name))
+    const before = host.tools.schemas({ id: 'root-b' }).map((s) => s.name)
+    check('disclosure: a deferred tool is hidden from the session', !before.includes(MEMBER_A), before.join(','))
+    check('disclosure: and its sibling is hidden too', !before.includes(MEMBER_B), before.join(','))
+    check('disclosure: an unrelated tool stays visible', before.includes('cordis_inspect_call'), before.join(','))
+
+    const snapshotB = (await (await get('root-b')).json()).state
+    check(
+      'disclosure: the snapshot reports the deferred names',
+      JSON.stringify([...(snapshotB?.deferred ?? [])].sort()) === JSON.stringify([MEMBER_A, MEMBER_B].sort()),
+      JSON.stringify(snapshotB?.deferred)
+    )
+    check(
+      'disclosure: the panel still lists the hidden tools',
+      snapshotB?.tools?.includes(MEMBER_A),
+      (snapshotB?.tools ?? []).join(',')
+    )
+    check('disclosure: nothing is unlocked yet', (snapshotB?.unlocked ?? []).length === 0)
+    check(
+      'disclosure: the snapshot carries the group fields',
+      snapshotB?.groups?.[0]?.disclosure === true &&
+        snapshotB?.groups?.[0]?.prompt === 'Git operations: status, commits, branches.',
+      JSON.stringify(snapshotB?.groups?.[0])
+    )
+
+    const index = deferredIndexText('root-b')
+    check('disclosure: the index names the group', index.includes('Git'), index)
+    check('disclosure: the index carries the description prompt', index.includes('Git operations'), index)
+    check(
+      'disclosure: the index does not list tool names',
+      !index.includes(MEMBER_A) && !index.includes(MEMBER_B),
+      index
+    )
+
+    const catalogue = await host.registered[0].execute({}, { agent: { id: 'root-b' } })
+    check('disclosure: a catalogue call names the groups', catalogue.message.includes('Git (2 tools)'), catalogue.message)
+    check(
+      'disclosure: and carries no tool detail',
+      catalogue.groups.every((group) => group.tools === undefined),
+      JSON.stringify(catalogue.groups)
+    )
+
+    const answer = await host.registered[0].execute({ group: 'Git' }, { agent: { id: 'root-b' } })
+    check('disclosure: get_tools answers the group', answer.groups?.[0]?.name === 'Git', String(answer.groups?.[0]?.name))
+    // THE CONTRACT: a load returns a confirmation only. The schemas arrive with the
+    // tools themselves on the next step, so nothing here may copy them.
+    check(
+      'disclosure: the answer carries no tool list and no schemas',
+      answer.groups[0].tools === undefined && !JSON.stringify(answer).includes('parameters'),
+      JSON.stringify(answer)
+    )
+    const rendered = host.registered[0].output.render({ group: 'Git' }, answer)
+    const renderedText = rendered.map((part) => part.text ?? '').join('\n')
+    check('disclosure: the render is the confirmation sentence', renderedText === answer.message, renderedText)
+    check(
+      'disclosure: and says the tools are injected',
+      /injected/.test(answer.message) && /next step/.test(answer.message),
+      answer.message
+    )
+    check(
+      'disclosure: with the group unlocked',
+      answer.groups[0].unlocked === true,
+      JSON.stringify(answer.groups[0])
+    )
+    await settle()
+    const after = host.tools.schemas({ id: 'root-b' }).map((s) => s.name)
+    check(
+      'disclosure: the load unhides the group',
+      after.includes(MEMBER_A) && after.includes(MEMBER_B),
+      after.join(',')
+    )
+    check('disclosure: the index disappears once loaded', deferredIndexText('root-b') === '', deferredIndexText('root-b'))
+    check(
+      'disclosure: the session reports the unlock',
+      (await (await get('root-b')).json()).state?.unlocked?.includes('g-deferred') === true
+    )
+    // Session-scoped: the sibling conversation still cannot see those tools.
+    check(
+      'disclosure: another session keeps them hidden',
+      !host.tools.schemas({ id: 'child-a' }).map((s) => s.name).includes(MEMBER_A)
+    )
+    // Loading a second time is a no-op that says so, and still returns no schemas.
+    const again = await host.registered[0].execute({ group: 'git' }, { agent: { id: 'root-b' } })
+    check(
+      'disclosure: a second load reports it was already loaded',
+      again.message.includes('already loaded') && !JSON.stringify(again).includes('parameters'),
+      again.message
+    )
+
+    // The manual way back: relock for this session only.
+    const relocked = await (await post({ sessionId: 'root-b', hide: ['g-deferred'] })).json()
+    await settle()
+    check(
+      'disclosure: hide relocks the session',
+      !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes(MEMBER_A)
+    )
+    check('disclosure: and the snapshot says so', (relocked.state?.unlocked ?? []).length === 0)
+    check('disclosure: the index is back', deferredIndexText('root-b').includes('Git'))
+
+    // Turning the feature off must undo both halves: the unmask and the tool.
+    replaceGroups([{ id: 'g-deferred', name: 'Git', members: [MEMBER_A, MEMBER_B], disclosure: false }])
+    await settle()
+    check('disclosure: turning it off unregisters get_tools', host.registered.length === 0, String(host.registered.length))
+    check(
+      'disclosure: and the tools are whole again',
+      host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes(MEMBER_A)
+    )
+    check('disclosure: the index is gone', deferredIndexText('root-b') === '')
+    replaceGroups([])
   }
   {
     // Editing from the child edits the ROOT: releasing there must release the whole
@@ -2045,7 +2323,7 @@ try {
     rememberTab('plugins')
     const calls = []
     const listed = {
-      protocol: 8,
+      protocol: PROTOCOL,
       sessionId: 's1',
       available: true,
       complete: true,
@@ -2118,7 +2396,7 @@ try {
         json: async () => ({
           ok: true,
           state: {
-            protocol: 8,
+            protocol: PROTOCOL,
             sessionId: 's1',
             available: true,
             skills: [{ name: 'alpha', description: 'd', path: '/tmp/SKILL.md', modelInvocable: true, userInvocable: true, toggleable: true }]
@@ -2143,6 +2421,152 @@ try {
       check(
         'skills tab: a refused write rolls the switch back',
         byClass(currentTree, 'dsh-tools-panel-tool-switch').find((node) => node.props['aria-label'] === 'alpha')?.props['aria-checked'] === true
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  // The progressive-disclosure editor: the group row opens a dialog, and saving it
+  // writes the group definition with the disclosure switch and its prompt.
+  {
+    rememberTab('tools')
+    const calls = []
+    const baseState = {
+      protocol: PROTOCOL,
+      sessionId: 's1',
+      tools: ['bash', 'edit', 'read'],
+      denied: [],
+      deferred: ['bash'],
+      unlocked: [],
+      groups: [{ id: 'g1', name: 'Git', members: ['bash'], disclosure: false, prompt: '' }]
+    }
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url: String(url), init })
+      if (init.method === 'POST') {
+        const body = JSON.parse(init.body)
+        if (Array.isArray(body.groups)) {
+          return { status: 200, json: async () => ({ ok: true, state: { ...baseState, groups: body.groups } }) }
+        }
+        if (Array.isArray(body.hide)) {
+          return { status: 200, json: async () => ({ ok: true, state: { ...baseState, unlocked: [] } }) }
+        }
+        return { status: 200, json: async () => ({ ok: true, state: { ...baseState, denied: body.deny ?? [] } }) }
+      }
+      return { status: 200, json: async () => ({ ok: true, state: baseState }) }
+    }
+    try {
+      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
+      const view = render(comp, { t: tt, sessionId: 's1' })
+      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
+      await pump(view)
+      const button = byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')
+      check('disclosure dialog: the group row carries the button', button.length === 1, String(button.length))
+      check('disclosure dialog: it reads the stored switch', button[0].props['aria-pressed'] === false)
+      button[0].props.onClick()
+      await pump(view)
+      check('disclosure dialog: clicking opens it', byClass(currentTree, 'dsh-tools-panel-dialog').length === 1)
+      const textarea = byClass(currentTree, 'dsh-tools-panel-dialogTextarea')[0]
+      check('disclosure dialog: it starts from the stored prompt', textarea?.props?.value === '', String(textarea?.props?.value))
+      const box = byClass(currentTree, 'dsh-tools-panel-dialogSwitch')[0]
+      box.children[0].props.onChange({ target: { checked: true } })
+      textarea.props.onChange({ target: { value: 'Git ops' } })
+      await pump(view)
+      byClass(currentTree, 'dsh-tools-panel-dialogPrimary')[0].props.onClick()
+      await pump(view)
+      const saved = calls.find((call) => call.init?.method === 'POST')
+      const body = saved === undefined ? {} : JSON.parse(saved.init.body)
+      check('disclosure dialog: saving writes the switch', body.groups?.[0]?.disclosure === true, JSON.stringify(body))
+      check('disclosure dialog: and the prompt', body.groups?.[0]?.prompt === 'Git ops', JSON.stringify(body))
+      check('disclosure dialog: it closes on save', byClass(currentTree, 'dsh-tools-panel-dialog').length === 0)
+      check(
+        'disclosure dialog: the button reads as pressed',
+        byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')[0]?.props['aria-pressed'] === true
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+  // A group that is BOTH deferred and already fetched shows the loaded chip and
+  // offers the way back in TWO places: a button on the row itself (no dialog needed)
+  // and the same action in the editor. Both must hit the same `hide` write.
+  {
+    rememberTab('tools')
+    const posts = []
+    const baseState = {
+      protocol: PROTOCOL,
+      sessionId: 's1',
+      tools: ['bash', 'read'],
+      denied: [],
+      deferred: [],
+      unlocked: ['g1'],
+      groups: [{ id: 'g1', name: 'Git', members: ['bash'], disclosure: true, prompt: 'Git ops' }]
+    }
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init = {}) => {
+      if (init.method === 'POST') {
+        const body = JSON.parse(init.body)
+        posts.push(body)
+        if (Array.isArray(body.hide)) {
+          return { status: 200, json: async () => ({ ok: true, state: { ...baseState, unlocked: [] } }) }
+        }
+      }
+      return { status: 200, json: async () => ({ ok: true, state: baseState }) }
+    }
+    try {
+      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
+      const view = render(comp, { t: tt, sessionId: 's1' })
+      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
+      await pump(view)
+      check(
+        'disclosure row: the fetched group is marked',
+        textOf(currentTree).some((text) => text.includes('本会话已加载')),
+        textOf(currentTree).slice(0, 6).join('|')
+      )
+      const unload = byClass(currentTree, 'dsh-tools-panel-tool-groupUnload')
+      check('disclosure row: the loaded row offers a direct unload button', unload.length === 1, String(unload.length))
+      check(
+        'disclosure row: the button names its group',
+        unload[0]?.props['aria-label'] === '卸载 Git',
+        String(unload[0]?.props['aria-label'])
+      )
+      check('disclosure row: the button is operable', unload[0]?.props.disabled === false)
+      // The dialog offers the same action — it is a second way in, not the only one.
+      byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')[0].props.onClick()
+      await pump(view)
+      check(
+        'disclosure dialog: it opens already on',
+        byClass(currentTree, 'dsh-tools-panel-dialogSwitch')[0]?.children[0]?.props?.checked === true
+      )
+      check(
+        'disclosure dialog: and offers the unload action',
+        textOf(byClass(currentTree, 'dsh-tools-panel-dialog')[0]).includes('卸载'),
+        textOf(byClass(currentTree, 'dsh-tools-panel-dialog')[0]).join('|')
+      )
+      // Leave the dialog through its own Cancel control, then use the ROW button: the
+      // point of the row action is that unloading never requires the dialog at all.
+      const dialog = byClass(currentTree, 'dsh-tools-panel-dialog')[0]
+      byClass(dialog, 'dsh-tools-panel-tool-bulkButton')
+        .find((node) => textOf(node).includes('取消'))
+        .props.onClick()
+      await pump(view)
+      check(
+        'disclosure row: the action is still there with the dialog closed',
+        byClass(currentTree, 'dsh-tools-panel-tool-groupUnload').length === 1
+      )
+      byClass(currentTree, 'dsh-tools-panel-tool-groupUnload')[0].props.onClick()
+      await pump(view)
+      const hide = posts.find((body) => Array.isArray(body.hide))
+      check(
+        'disclosure row: unloading posts the group id for this session',
+        JSON.stringify(hide) === JSON.stringify({ sessionId: 's1', hide: ['g1'] }),
+        JSON.stringify(posts)
+      )
+      check(
+        'disclosure row: the unloaded row stops announcing itself',
+        !textOf(currentTree).some((text) => text.includes('本会话已加载')),
+        textOf(currentTree).slice(0, 6).join('|')
       )
     } finally {
       globalThis.fetch = originalFetch
@@ -2174,6 +2598,24 @@ check('client: groups are created from a multi-selection', clientSource.includes
 check('client: a group has one bulk switch', /onToggleAll/.test(clientSource))
 check('client: a group can be renamed and removed', /onRename/.test(clientSource) && /onRemove/.test(clientSource))
 check('client: group writes go to the host', clientSource.includes('writeGroups('))
+check(
+  'client: progressive-disclosure re-hides go to the host',
+  clientSource.includes('JSON.stringify({ sessionId, hide })'),
+  'the host reads `hide`'
+)
+check(
+  'client: the loaded group row unloads without opening the dialog',
+  clientSource.includes('dsh-tools-panel-tool-groupUnload') && /onUnload/.test(clientSource)
+)
+check(
+  'client: the row and the dialog share one unload path',
+  (clientSource.match(/onUnload: \(\) => unload\(/g) ?? []).length === 2,
+  String((clientSource.match(/onUnload: \(\) => unload\(/g) ?? []).length)
+)
+check(
+  'client: the group row opens the disclosure editor',
+  /onDisclosure/.test(clientSource) && clientSource.includes('function DisclosureDialog(')
+)
 check('client: offers a search filter', clientSource.includes("type: 'search'"))
 check('client: offers a bulk action', clientSource.includes('flipAll'))
 check('client: the list scrolls inside the menu', /\.dsh-tools-panel-tool-list\s*\{[^}]*max-height/m.test(clientSource))

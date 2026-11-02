@@ -72,6 +72,35 @@
  *   Group definitions are DURABLE and global (one file under `DSH_HOME`), because
  *   they are the user's organization of their own tool list, not a restriction on
  *   one conversation. The deny list stays per-session and in memory.
+ *
+ * PROGRESSIVE DISCLOSURE (added in protocol 9)
+ *   A group may OPT IN to being deferred: the user gives it a description prompt
+ *   and, while it is deferred, its member tools are not injected into the model's
+ *   tool list at all — the same hiding mechanism the kill switch uses, so the
+ *   model does not see their schemas and does not pay their token cost.
+ *
+ *   What the model gets INSTEAD is two things:
+ *     1. one line in the system prompt per still-locked group — its name, the
+ *        user's description prompt, and how many tools it holds — so the model
+ *        knows the group exists and what it is for;
+ *     2. a `get_tools` tool, registered only while at least one deferred group
+ *        exists. Calling it with a group name LOADS that group — and answers with a
+ *        confirmation, nothing more: no names, no descriptions, no parameter
+ *        schemas. The group's real schemas arrive with the tools themselves in the
+ *        next step's tool list, so copying them into the answer would spend twice
+ *        the context this feature exists to save.
+ *
+ *   Fetching is SESSION-SCOPED and in memory: `get_tools` records the group as
+ *   unlocked for the calling agent, lifts the restriction for that session (and
+ *   for the sessions it spawned), and from the next step on those tools are back
+ *   in the model's tool list. A restart, or a new conversation, starts locked
+ *   again — the unlocked set is deliberately not persisted. The group DEFINITIONS
+ *   (including disclosure and its prompt) stay durable and global, like every
+ *   other group field.
+ *
+ *   THE TOOL ITSELF IS NOT GUARDED. Hiding is about context economy, not access
+ *   control: a model that already read a schema may call the tool even while it is
+ *   still hidden, which keeps a same-batch fetch-then-call working.
  */
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -113,9 +142,18 @@ const HEADER = 'x-dsh-plugin-tools-panel'
  * the snapshot grew a `groups` field and a POST may carry one. 8 added the SKILLS
  * and PROMPTS routes: a skill toggle rewrites `disable-model-invocation` in the
  * skill file, and a prompt toggle persists a disabled section name that is
- * shadowed by an empty same-name section in every live agent's scope.
+ * shadowed by an empty same-name section in every live agent's scope. 9 added
+ * PROGRESSIVE DISCLOSURE: a group carries `disclosure` and `prompt`, the snapshot
+ * reports the session's `deferred` names and `unlocked` group ids, and the
+ * `get_tools` tool unlocks a group for one session.
+ *
+ * WHY 10 AND NOT 9: a previously deployed lineage of this package already answered
+ * protocol 9 with a DIFFERENT state shape (a persisted `tools.json`). Reusing 9
+ * would let a stale host and a fresh bundle accept each other while disagreeing
+ * about the fields — exactly the silent skew the number exists to catch. Nothing
+ * depends on the number being dense.
  */
-const PROTOCOL = 8
+const PROTOCOL = 10
 
 /**
  * Where the user's own group definitions live.
@@ -200,9 +238,34 @@ function normalizeGroups(value) {
     let id = typeof entry.id === 'string' && entry.id.length > 0 && entry.id.length <= 64 ? entry.id : undefined
     if (id === undefined || seen.has(id)) id = `g${groups.length + 1}-${Math.random().toString(36).slice(2, 8)}`
     seen.add(id)
-    groups.push({ id, name, members })
+    groups.push({
+      id,
+      name,
+      members,
+      // Progressive disclosure is opt-in per group. Anything that is not exactly
+      // `true` reads as off, so a hand-edited file cannot half-enable it.
+      disclosure: entry.disclosure === true,
+      prompt: normalizeGroupPrompt(entry.prompt)
+    })
   }
   return groups
+}
+
+/**
+ * Validate one group's description prompt.
+ *
+ * This text is injected into the model's system prompt, so it is bounded and
+ * stripped of control characters that would let one entry break the index's line
+ * structure. An absent or non-string value is the empty string, not a refusal:
+ * a group that has never been given a prompt is ordinary.
+ * @returns the cleaned prompt.
+ */
+function normalizeGroupPrompt(value) {
+  if (typeof value !== 'string') return ''
+  return value
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
+    .trim()
+    .slice(0, MAX_GROUP_PROMPT)
 }
 
 // --- skills and prompt sections (protocol 8) ----------------------------------
@@ -559,6 +622,9 @@ const MAX_NAME = 200
 /** How many user-defined groups one profile may hold, and how long a name may be. */
 const MAX_GROUPS = 100
 const MAX_GROUP_NAME = 60
+/** How much of one group's description prompt is stored, and how much reaches the prompt. */
+const MAX_GROUP_PROMPT = 2000
+const MAX_INDEX_PROMPT = 300
 
 /**
  * The live switch, per session.
@@ -578,6 +644,17 @@ const policies = new Map()
  * change. Global, not per session: see the header's GROUPS section.
  */
 let groups = loadGroups()
+
+/**
+ * Set by `apply`: re-derive the state that depends on the group definitions.
+ *
+ * `replaceGroups` is ALSO called by the agent-facing `manage_tool_groups` tool,
+ * which lives in its own loader row and holds no controller reference. Rather than
+ * exporting the restrictor and the tool controller, the write path calls this hook —
+ * so an edit from either side (panel or model) reaches the live restrictions and the
+ * `get_tools` registration at the same moment it reaches the file.
+ */
+let onGroupsChanged = () => {}
 
 /**
  * Who spawned whom, for every live agent — restricted or not.
@@ -633,6 +710,109 @@ function policyFor(sessionId) {
 /** The exact set of denied names that governs one session (never mutated here). */
 function denySetFor(sessionId) {
   return policyFor(sessionId)?.deny ?? EMPTY_DENY
+}
+
+// --- progressive disclosure, per session -------------------------------------
+
+/**
+ * The disclosure groups a session has unlocked, by group id.
+ *
+ * SESSION-SCOPED AND IN MEMORY, by design: "the model fetched this group" is a
+ * fact about one conversation, not a durable preference, so a new conversation
+ * (or a restart) starts with every deferred group locked again. Keys are session
+ * ids; a subagent inherits its ancestors' unlocks lazily through `parents`, the
+ * same way the deny list is inherited.
+ */
+const unlocked = new Map()
+
+/** The disclosure groups that actually defer tools: opted in AND non-empty. */
+function deferredGroups() {
+  return groups.filter((group) => group.disclosure === true && group.members.length > 0)
+}
+
+/**
+ * Every group id one session has unlocked, unioned up its spawn chain.
+ *
+ * Union rather than "nearest owner" (the deny list's rule): an unlock is an
+ * ADDITION to what the model may see, so a child may widen its own view without
+ * widening its parent's, and a parent's unlock must reach the children it
+ * delegated to.
+ * @param sessionId - the session asking.
+ * @returns the unlocked group ids.
+ */
+function unlockedFor(sessionId) {
+  const ids = new Set()
+  let current = sessionId
+  const seen = new Set()
+  while (typeof current === 'string' && !seen.has(current)) {
+    seen.add(current)
+    const entry = unlocked.get(current)
+    if (entry !== undefined) for (const id of entry) ids.add(id)
+    current = parents.get(current)
+  }
+  return ids
+}
+
+/** The disclosure groups still locked for one session. */
+function lockedGroupsFor(sessionId) {
+  const open = unlockedFor(sessionId)
+  return deferredGroups().filter((group) => !open.has(group.id))
+}
+
+/**
+ * The member names hidden ONLY because of progressive disclosure.
+ *
+ * Kept separate from the deny set because the two mean different things: a denied
+ * tool is refused by the guard and shows as "off" in the panel, while a deferred
+ * one is merely not advertised — it stays callable by name, and the panel still
+ * lists it with its own switch.
+ * @param sessionId - the session asking.
+ * @returns the deferred names.
+ */
+function deferredNamesFor(sessionId) {
+  const names = new Set()
+  for (const group of lockedGroupsFor(sessionId)) {
+    for (const name of group.members) names.add(name)
+  }
+  return names
+}
+
+/**
+ * The full hidden set that governs one session: the kill switch PLUS disclosure.
+ *
+ * This is what the restrictor masks and what the panel's tool list must union in,
+ * because `schemas()` cannot tell the two apart once both are hidden.
+ * @param sessionId - the session asking.
+ * @returns the hidden names.
+ */
+function hiddenSetFor(sessionId) {
+  const deny = denySetFor(sessionId)
+  const deferred = deferredNamesFor(sessionId)
+  if (deferred.size === 0) return deny
+  const hidden = new Set(deny)
+  for (const name of deferred) hidden.add(name)
+  return hidden
+}
+
+/** Unlock one group for one session and return whether the set changed. */
+function unlockGroup(sessionId, groupId) {
+  const current = unlocked.get(sessionId)
+  if (current !== undefined && current.has(groupId)) return false
+  const next = new Set(current ?? [])
+  next.add(groupId)
+  unlocked.set(sessionId, next)
+  return true
+}
+
+/** Lock one group again for one session (the "hide it again" action). */
+function lockGroup(sessionId, groupId) {
+  const current = unlocked.get(sessionId)
+  if (current === undefined || !current.has(groupId)) return false
+  const next = new Set(current)
+  next.delete(groupId)
+  if (next.size === 0) unlocked.delete(sessionId)
+  else unlocked.set(sessionId, next)
+  return true
 }
 
 /**
@@ -734,23 +914,33 @@ function createRestrictor(scope, agents) {
    */
   function visibleNamesOf(agent) {
     try {
-      return new Set(scope.tools.schemas(agent).map((schema) => schema.name))
+      const schemas = scope.tools.schemas(agent)
+      return new Set(schemas.map((schema) => schema.name))
     } catch {
       return undefined
     }
   }
 
   /**
-   * The deny list that applies to one agent, cut down to names hiding can mask.
-   * @param agentId - the session whose policy applies (after inheritance).
-   * @param known - the maskable names for that agent, or undefined when unavailable.
+   * The hidden names that apply to one agent, cut down to names hiding can mask.
+   *
+   * The hidden set is the session's kill switch UNIONED WITH every still-locked
+   * deferred group: a progressively disclosed tool is hidden exactly the way a
+   * denied one is, which is the whole point — the model never receives its schema.
+   *
+   * The caller must pass "visible OR already masked by this scope", never the bare
+   * `schemas()` answer: masking removes its own names from that answer, so a set
+   * filtered against the bare view shrinks to nothing one pass later and the mask
+   * is cleared underneath itself (see the loop documented in `sync`).
+   * @param agentId - the session whose hidden set applies (after inheritance).
+   * @param known - the names this scope may mask, or undefined when unavailable.
    * @returns the names to mask, or undefined to leave the applied set untouched.
    */
   function wantedFor(agentId, known) {
     if (known === undefined) return undefined
-    const deny = denySetFor(agentId)
-    if (deny.size === 0) return []
-    return [...deny].filter((name) => known.has(name)).sort()
+    const hidden = hiddenSetFor(agentId)
+    if (hidden.size === 0) return []
+    return [...hidden].filter((name) => known.has(name)).sort()
   }
 
   /**
@@ -781,6 +971,14 @@ function createRestrictor(scope, agents) {
       apply(c) {
         let stopped = false
         let applied = null
+        /**
+         * The names this scope is currently masking.
+         *
+         * Kept because `restrict()` hides a tool by REMOVING it from `schemas()`, so
+         * the live view cannot tell "not registered" from "masked by me". The next
+         * pass needs that difference: see `sync` below.
+         */
+        let appliedNames = []
         const disposers = []
 
         const clear = () => {
@@ -802,10 +1000,34 @@ function createRestrictor(scope, agents) {
          */
         const sync = (agentId, known) => {
           if (stopped) return
-          const names = wantedFor(agentId, known ?? visibleNamesOf(target.agent))
+          const visible = known ?? visibleNamesOf(target.agent)
           // No answer from the registry: keep whatever is applied. Clearing here
           // would make a tool the user switched off callable again.
-          if (names === undefined) return
+          if (visible === undefined) return
+          // Read the deny list against "visible OR already masked by this scope".
+          //
+          // `visible` is `schemas()`, and `restrict()` hides a tool by REMOVING it
+          // from that very answer. Filtering the wanted set against the live view is
+          // therefore a feedback loop, not a convergence:
+          //
+          //   pass 1: the denied name is visible -> mask it;
+          //           the mask emits `tools/change`;
+          //   pass 2: the name is gone from `visible` -> wanted becomes [] ->
+          //           signature changes -> clear() -> the tool comes back;
+          //   pass 3: visible again -> mask again -> … forever.
+          //
+          // One pass per tick, both layers, until the process stops: the model sees
+          // a tool list that grows and shrinks between rounds, and the registry tears
+          // down and rebuilds a layer each time. Unioning in what THIS scope already
+          // masks makes the input independent of this scope's own output. A name
+          // nobody provides is still dropped — a disconnected MCP server is added
+          // back by the `tools/change` pass once it re-registers, because it is in
+          // `visible` by then — and a name that vanished while denied stays masked,
+          // which is what the deny list means.
+          const maskable = appliedNames.length === 0
+            ? visible
+            : new Set([...visible, ...appliedNames])
+          const names = wantedFor(agentId, maskable)
           const signature = names.join('\u0000')
           // Re-applying an unchanged set would tear down and rebuild the same
           // layers, and `restrict()`/its disposer each emit `tools/change`
@@ -818,6 +1040,11 @@ function createRestrictor(scope, agents) {
           // re-enters through; claiming first makes the re-entrant pass see the new
           // signature and return instead of tearing the layers down mid-apply.
           applied = signature
+          // Claimed with the signature: the next pass must still count these names
+          // as maskable even though `restrict()` is about to hide them from
+          // `visible`. Without this, pass 2 sees the tools it just hid as "not
+          // provided" and clears them — the loop described above.
+          appliedNames = names
           clear()
           if (names.length === 0) return
           try {
@@ -846,6 +1073,7 @@ function createRestrictor(scope, agents) {
           c.effect(() => () => {
             stopped = true
             clear()
+            appliedNames = []
             holder.sync = () => {}
           })
         } catch {
@@ -1471,6 +1699,357 @@ function createPromptShadows(scope, agents) {
   }
 }
 
+// --- progressive disclosure: the index and the fetch tool ---------------------
+
+/** Section name of the deferred-group index in the system prompt. */
+const INDEX_SECTION = 'tools-panel:deferred-tools'
+/**
+ * Sort order of that section.
+ *
+ * First-party instructions sit below 10100 (harness source, web surface) and the
+ * deployment persona suffix is 10200, so 10150 puts the index at the tail of the
+ * prompt without claiming the last slot. The value only has to be finite.
+ */
+const INDEX_ORDER = 10150
+/** The model-facing fetch tool. Deliberately the plain name a model expects. */
+const GET_TOOLS = 'get_tools'
+
+/**
+ * The system-prompt index of one session's still-locked deferred groups.
+ *
+ * This is the whole point of the description prompt: it is not a note for the UI,
+ * it is the line the MODEL reads to decide whether fetching this group is worth a
+ * call. One line per group, no tool names — listing the names would hand back the
+ * context economy the feature exists to buy.
+ *
+ * A session id is optional: an assembly without an agent cannot know what was
+ * unlocked, and showing every deferred group is the honest fallback (a locked
+ * group it already fetched costs one redundant line, not a wrong tool).
+ * @param sessionId - the session being assembled, when known.
+ * @returns the section text, or '' when nothing is locked (an empty section is
+ *   dropped by the renderer, so the prompt is byte-identical with the feature off).
+ */
+function deferredIndexText(sessionId) {
+  const locked = typeof sessionId === 'string' ? lockedGroupsFor(sessionId) : deferredGroups()
+  if (locked.length === 0) return ''
+  const lines = [
+    '## Deferred tool groups',
+    'The tools of the groups below are not loaded in this conversation, so they are not in your tool list yet.',
+    'Call `get_tools` with a group name or id to load that group: the tools are injected into your tool list',
+    'from the next step on, with their own descriptions and parameter schemas, and stay available for the rest',
+    'of this conversation.',
+    ''
+  ]
+  for (const group of locked) {
+    // Collapse whitespace in BOTH fields: a name or description carrying a newline
+    // would otherwise end the `- ` list item early and turn the rest of the prompt
+    // into free text the model reads as instructions.
+    const name = group.name.replace(/\s+/g, ' ')
+    const prompt = truncateText(String(group.prompt ?? '').replace(/\s+/g, ' '), MAX_INDEX_PROMPT)
+    const suffix = `${group.members.length} tool${group.members.length === 1 ? '' : 's'}`
+    lines.push(`- ${name}${prompt.text.length === 0 ? '' : `: ${prompt.text}`} (${suffix})`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Resolve one group by id or exact name, case-insensitively.
+ * @returns the group, or undefined when nothing matches unambiguously.
+ */
+function findGroupByName(list, value) {
+  const key = value.trim().toLowerCase()
+  const byId = list.find((group) => group.id.toLowerCase() === key)
+  if (byId !== undefined) return byId
+  const matches = list.filter((group) => group.name.toLowerCase() === key)
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+/** The tool names of every tool visible to one agent. */
+function liveNames(host, agent) {
+  const names = new Set()
+  if (host?.tools === undefined) return names
+  let schemas
+  try {
+    // A call without an agent falls back to the registry's global view: `get_tools`
+    // is registered process-wide, so it may be executed outside any one agent, and a
+    // load that DID unlock needs the truth about which members are mounted.
+    schemas = host.tools.schemas(agent)
+  } catch {
+    return names
+  }
+  for (const schema of schemas) {
+    if (typeof schema?.name === 'string') names.add(schema.name)
+  }
+  return names
+}
+
+/**
+ * Whether one tool is registered at all (mounted somewhere), through the global view.
+ *
+ * `liveNames` alone cannot answer "did this member land in the tool list" when the
+ * call names an agent that the registry does not track `schemas()` for: the agent
+ * view can legitimately come back empty while the tool itself is mounted — the same
+ * situation as the tool-less preset, where emptiness is truthful rather than
+ * missing. The global view settles it: a name registered process-wide counts as
+ * loaded, because that is where an agent inherits it from.
+ * @returns whether the name is registered, or undefined when there is no registry.
+ */
+function registeredSomewhere(host, name) {
+  if (host?.tools === undefined) return undefined
+  try {
+    return host.tools.schemas().some((schema) => schema?.name === name)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * How many of a group's members are mounted right now.
+ *
+ * The ONLY thing `get_tools` counts. It deliberately does not look at a member's
+ * description or parameter image: nothing of the sort travels back to the model
+ * any more (see {@link getToolsDefinition}), so a group whose tool list is partly
+ * unregistered only needs the missing count to report honestly.
+ * @param group - the group definition.
+ * @param live - the names the calling agent can see.
+ * @param host - the registry, for the global fallback (see `registeredSomewhere`).
+ * @returns the member count and how many of them are not registered.
+ */
+function describeGroup(group, live, host) {
+  let mounted = 0
+  let missing = 0
+  for (const name of group.members) {
+    if (live.has(name) || registeredSomewhere(host, name) === true) mounted += 1
+    else missing += 1
+  }
+  return { mounted, missing }
+}
+
+/**
+ * The `get_tools` definition.
+ *
+ * The answer is a CONFIRMATION ONLY: no tool name, description or parameter schema
+ * comes back. Loading the group puts the REAL tools into the model's tool list from
+ * the next step on, where the harness serves their full schemas — repeating them in
+ * this answer would copy the very context payloads the feature exists to save, and
+ * the model would read each schema twice. So the whole result is one sentence: the
+ * tools are injected, and the next step can call them.
+ *
+ * Registered ONLY while at least one group is deferred (see
+ * {@link createDeferredTools}), so a profile that never uses the feature pays no
+ * schema for a tool that could never answer anything.
+ * @param enable - unlock one group for one session; returns whether it changed.
+ * @param names - the calling agent's visible tool names, so the answer can say how
+ *   many members actually landed in the tool list.
+ * @param registry - `{ tools }`, read for the global view (see `registeredSomewhere`).
+ */
+function getToolsDefinition({ enable, names, registry }) {
+  return {
+    name: GET_TOOLS,
+    description:
+      'Load a deferred (progressively disclosed) tool group into this conversation. The system prompt ' +
+      'lists the deferred groups; call this with a group name or id and that group\'s tools are injected ' +
+      'into your tool list from the next step on, with their own descriptions and parameter schemas, for ' +
+      'the rest of the conversation. The answer is only a confirmation — it returns no schemas. Omit ' +
+      '`group` to list the groups. A group loaded here stays available: do not load it again.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        group: {
+          type: 'string',
+          description:
+            'Group name or id, exactly as the system prompt lists it. Omit to list the deferred groups.'
+        }
+      }
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'message', 'groups'],
+        properties: {
+          ok: { type: 'boolean', description: 'Whether the call was answered.' },
+          message: { type: 'string', description: 'One sentence describing what happened.' },
+          groups: {
+            type: 'array',
+            description: 'The groups this answer covers. No tool schema travels here.',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'name', 'prompt', 'memberCount', 'unlocked'],
+              properties: {
+                id: { type: 'string' },
+                name: { type: 'string' },
+                prompt: { type: 'string' },
+                memberCount: { type: 'number' },
+                unlocked: { type: 'boolean' }
+              }
+            }
+          }
+        }
+      },
+      render(args, value) {
+        // The message IS the answer, for a catalogue call and for a load alike: once
+        // a group is loaded its tools arrive as real tools on the next step, so any
+        // further text here would only re-spend the context this feature saves.
+        return [{ type: 'text', text: value.message }]
+      }
+    },
+    async execute(args, exec) {
+      const input = args ?? {}
+      const sessionId = typeof exec?.agent?.id === 'string' ? exec.agent.id : undefined
+      const disclosed = deferredGroups()
+      if (disclosed.length === 0) {
+        return {
+          ok: true,
+          message: 'No tool group has progressive disclosure enabled, so there is nothing to load.',
+          groups: []
+        }
+      }
+      const live = exec?.agent === undefined ? new Set() : names(exec.agent)
+      const key = typeof input.group === 'string' ? input.group.trim() : ''
+      if (key.length === 0) {
+        const open = sessionId === undefined ? new Set() : unlockedFor(sessionId)
+        const catalogue = disclosed
+          .map((group) => {
+            const count = group.members.length
+            return `${group.name} (${count} tool${count === 1 ? '' : 's'})${open.has(group.id) ? ' [loaded]' : ''}`
+          })
+          .join(', ')
+        return {
+          ok: true,
+          message:
+            `${disclosed.length} deferred group${disclosed.length === 1 ? '' : 's'}: ${catalogue}. ` +
+            'Call again with `group` set to one of them to load its tools.',
+          groups: disclosed.map((group) => ({
+            id: group.id,
+            name: group.name,
+            prompt: group.prompt ?? '',
+            memberCount: group.members.length,
+            unlocked: open.has(group.id)
+          }))
+        }
+      }
+      const group = findGroupByName(disclosed, key)
+      if (group === undefined) {
+        const known = disclosed.map((entry) => `"${entry.name}"`).join(', ')
+        throw new Error(`no deferred group matches "${key}"; known groups: ${known}`)
+      }
+      const wasOpen = sessionId !== undefined && unlockedFor(sessionId).has(group.id)
+      const nowOpen = sessionId === undefined || wasOpen
+        ? false
+        : enable(sessionId, group.id)
+      const described = describeGroup(group, live, registry)
+      // The answer is the confirmation and nothing else: the schemas arrive with the
+      // tools themselves on the next step, so they are not copied into this text.
+      const parts = []
+      if (described.mounted === 0) {
+        parts.push(`Group "${group.name}" has no registered tool right now, so nothing was injected.`)
+      } else if (nowOpen) {
+        parts.push(
+          `Group "${group.name}" is loaded: ${described.mounted} tool${described.mounted === 1 ? '' : 's'} ` +
+          'injected into your tool list, available from the next step for the rest of this conversation.'
+        )
+      } else if (wasOpen) {
+        parts.push(
+          `Group "${group.name}" was already loaded in this conversation: its ` +
+          `${described.mounted} tool${described.mounted === 1 ? '' : 's'} are in your tool list.`
+        )
+      } else {
+        parts.push(
+          `Group "${group.name}" was not injected: this call has no session to load it into. ` +
+          'The tools stay callable by name.'
+        )
+      }
+      if (described.missing > 0) {
+        parts.push(`${described.missing} member${described.missing === 1 ? '' : 's'} not registered right now, skipped.`)
+      }
+      return {
+        ok: true,
+        message: parts.join(' '),
+        groups: [{
+          id: group.id,
+          name: group.name,
+          prompt: group.prompt ?? '',
+          memberCount: group.members.length,
+          unlocked: wasOpen || nowOpen
+        }]
+      }
+    }
+  }
+}
+
+/**
+ * Keep the `get_tools` registration in step with the group definitions.
+ *
+ * Registered on the FIRST deferred group and unregistered when the LAST one goes
+ * away, because the tool is the feature's only mouth: a profile that never defers a
+ * group pays no schema for it, and a profile that stops deferring drops it again
+ * without a restart. Registration is global (one registry entry, every session),
+ * while the unlock it performs is per session — that split is what keeps the tool
+ * list stable across conversations while the DISCLOSURE state still differs.
+ *
+ * A registration failure is swallowed to "no tool this time": the index section is
+ * registered separately, so the model would still learn the groups exist, and the
+ * next group edit retries.
+ * @param ctx - the plugin context (`tools`).
+ * @param restrictor - the live hider, re-synced after an unlock.
+ */
+function createDeferredTools(ctx, restrictor) {
+  /** The registration disposer while `get_tools` is mounted. */
+  let off
+  let live = true
+  const sync = () => {
+    if (!live) return
+    if (deferredGroups().length === 0) {
+      if (off !== undefined) {
+        try {
+          off()
+        } catch {
+          // The fiber is already gone; nothing left to dispose.
+        }
+        off = undefined
+      }
+      return
+    }
+    if (off !== undefined) return
+    try {
+      off = ctx.tools.register(
+        getToolsDefinition({
+          enable(sessionId, groupId) {
+            const changed = unlockGroup(sessionId, groupId)
+            // Unlocking is only half the job: the restriction has to be lifted for
+            // the tools to reappear in the next step's schema list.
+            if (changed) restrictor?.syncAll()
+            return changed
+          },
+          names(agent) {
+            return liveNames({ tools: ctx.tools }, agent)
+          },
+          registry: { tools: ctx.tools }
+        })
+      )
+    } catch {
+      off = undefined
+    }
+  }
+  return {
+    sync,
+    dispose() {
+      live = false
+      if (off !== undefined) {
+        try {
+          off()
+        } catch {
+          // Already gone.
+        }
+        off = undefined
+      }
+    }
+  }
+}
+
 // --- http ---------------------------------------------------------------------
 
 function sendJson(res, status, payload) {
@@ -1534,6 +2113,13 @@ function cleanDeny(value) {
  *
  * The denied names are unioned in because hiding is exactly what removes them from
  * that answer — without the union the control could only ever switch tools OFF.
+ * The DEFERRED names are unioned in for the same reason plus one of their own: a
+ * progressively disclosed tool is hidden too, but it is not denied — the panel must
+ * keep its row (with its own switch) or the user could never manage a deferred
+ * group's members from the menu again. Only names this process has actually SEEN
+ * are added: a group may legitimately name a tool that is not mounted (an MCP
+ * server that is disconnected today), and such a name has no row to offer — this
+ * keeps the old "a vanished member is not drawn" rule.
  *
  * NO FALLBACK TO THE GLOBAL VIEW. This used to fall back to `schemas()` when the
  * session had no live agent, and that was wrong in the one case it mattered most: a
@@ -1543,7 +2129,8 @@ function cleanDeny(value) {
  * inventing rows.
  * @param sessionId - the conversation's session.
  * @param host - `{ tools, agents }`.
- * @returns the sorted union of the session's visible tools and its denied names.
+ * @returns the sorted union of the session's visible tools, its denied names, and
+ *   the known names hidden by progressive disclosure.
  */
 function toolsForSession(sessionId, host) {
   const visible = []
@@ -1555,7 +2142,11 @@ function toolsForSession(sessionId, host) {
       /* a registry that cannot answer leaves the denied names below */
     }
   }
-  return [...new Set([...visible, ...denySetFor(sessionId)])].sort()
+  // Every deferred name is offered, registered or not: the panel's job is to let the
+  // user MANAGE a group's members (including a switch for one whose MCP server is
+  // disconnected today), and disclosure must never be the reason a row disappears.
+  const deferred = [...deferredNamesFor(sessionId)]
+  return [...new Set([...visible, ...denySetFor(sessionId), ...deferred])].sort()
 }
 
 /**
@@ -1605,7 +2196,18 @@ function snapshot(sessionId, host) {
     ...(host?.restrictor?.error === undefined ? {} : { scopesError: host.restrictor.error }),
     masked: host === undefined ? undefined : maskedCount(sessionId, host),
     // The user's groups, copied so a caller cannot mutate the live definitions.
-    groups: groups.map((group) => ({ id: group.id, name: group.name, members: [...group.members] })),
+    groups: groups.map((group) => ({
+      id: group.id,
+      name: group.name,
+      members: [...group.members],
+      disclosure: group.disclosure === true,
+      prompt: group.prompt ?? ''
+    })),
+    // Progressive disclosure, THIS session: the names currently hidden by it, and
+    // the group ids `get_tools` already fetched. Both are session-scoped, so two
+    // tabs on two conversations legitimately report different sets.
+    deferred: [...deferredNamesFor(sessionId)].sort(),
+    unlocked: [...unlockedFor(sessionId)].sort(),
     blocked: record?.blocked ?? 0,
     last: record?.last
   }
@@ -1633,6 +2235,24 @@ function setDeny(sessionId, names, restrictor) {
     })
   }
   restrictor?.syncAll()
+}
+
+/**
+ * Lock groups again for one session — the manual counterpart of `get_tools`.
+ *
+ * An unlock lasts for the conversation, so without this a user who fetched a group
+ * by accident (or wants to watch the disclosure work) would have to start a new
+ * conversation to put it back. The restriction is lifted again on the next pass,
+ * which is what makes the group's tools disappear from the next step's schema list.
+ * @param sessionId - the session whose unlocks to shrink.
+ * @param groupIds - the groups to lock again.
+ * @param restrictor - the live hider, re-synced when something changed.
+ */
+function relockGroups(sessionId, groupIds, restrictor) {
+  let changed = false
+  for (const id of groupIds) if (lockGroup(sessionId, id)) changed = true
+  if (changed) restrictor?.syncAll()
+  return changed
 }
 
 /**
@@ -1685,12 +2305,13 @@ async function handleState(req, res, host) {
   // own, so say so instead.
   const hasDeny = Object.prototype.hasOwnProperty.call(payload, 'deny')
   const hasGroups = Object.prototype.hasOwnProperty.call(payload, 'groups')
-  if (!hasDeny && !hasGroups) {
+  const hasHide = Object.prototype.hasOwnProperty.call(payload, 'hide')
+  if (!hasDeny && !hasGroups && !hasHide) {
     sendJson(res, 409, {
       ok: false,
       error:
         `this host speaks tools-panel protocol ${PROTOCOL} and recognizes neither ` +
-        `\`deny\` nor \`groups\`; it is probably running older code than the page — restart DSH`
+        `\`deny\`, \`groups\` nor \`hide\`; it is probably running older code than the page — restart DSH`
     })
     return
   }
@@ -1701,6 +2322,16 @@ async function handleState(req, res, host) {
       sendJson(res, 400, { ok: false, error: '`groups` must be an array' })
       return
     }
+  }
+  if (hasHide) {
+    // The "hide it again" action: drop these groups from THIS session's unlocked
+    // set. A group id is enough — the group itself is not being edited.
+    const ids = cleanDeny(payload.hide)
+    if (ids === undefined) {
+      sendJson(res, 400, { ok: false, error: '`hide` must be an array of group ids' })
+      return
+    }
+    relockGroups(sessionId, ids, host.restrictor)
   }
   if (hasDeny) {
     const names = cleanDeny(payload.deny)
@@ -1992,6 +2623,64 @@ export function apply(ctx) {
   const restrictor = createRestrictor(ctx, ctx.get('agents'))
   ctx.effect(() => () => restrictor.dispose(), 'tools-panel: restriction scopes')
 
+  // Progressive disclosure: the fetch tool (mounted only while some group defers)
+  // and, below, the system-prompt index of the groups each session has not fetched.
+  const deferred = createDeferredTools(ctx, restrictor)
+  ctx.effect(() => () => deferred.dispose(), 'tools-panel: get_tools')
+  deferred.sync()
+
+  // A group edit changes BOTH derived halves: whether `get_tools` exists, and which
+  // names are hidden. One hook, so `replaceGroups` (the single write path, shared
+  // with the agent-facing tool) cannot forget either.
+  onGroupsChanged = () => {
+    deferred.sync()
+    restrictor.syncAll()
+  }
+  ctx.effect(
+    () => () => {
+      onGroupsChanged = () => {}
+    },
+    'tools-panel: group change hook'
+  )
+
+  /**
+   * Register the deferred-group index as a system-prompt section.
+   *
+   * `text` is a FUNCTION, not a string: it is re-evaluated for every assembly with
+   * that assembly's context, and the harness puts the calling agent on it. That is
+   * what lets ONE global registration report a different locked set per session —
+   * no per-agent shadow fibers, no re-registration when `get_tools` unlocks a group.
+   */
+  const registerDeferredIndex = (scope) => {
+    // Read through `get`, NEVER through a property. Cordis throws
+    // `cannot get property "systemPrompt" without inject` on a property access to a
+    // service this context did not declare, and that throw takes the WHOLE mount
+    // down (guard, routes, everything) for an optional hint. `get` is the raw
+    // accessor and is exempt — the host already reads `skills`/`workingDirectory`
+    // this way for the same reason.
+    const systemPrompt = scope?.get?.('systemPrompt')
+    if (systemPrompt === undefined || typeof systemPrompt.section !== 'function') return
+    try {
+      scope.effect(
+        () =>
+          systemPrompt.section({
+            name: INDEX_SECTION,
+            order: INDEX_ORDER,
+            // The index is assembled from user text; a stray `{{name}}` in a group's
+            // description prompt must stay literal instead of failing the assembly.
+            interpolate: false,
+            text: (context) => deferredIndexText(context?.agent?.id)
+          }),
+        'tools-panel: deferred tool index'
+      )
+    } catch {
+      // Degrade, never die: without the index the model does not learn the groups
+      // exist, but the kill switch, the routes and `get_tools` all still work.
+    }
+  }
+  if (ctx.get('systemPrompt') !== undefined) registerDeferredIndex(ctx)
+  else ctx.inject(['systemPrompt'], (scope) => registerDeferredIndex(scope))
+
   // The prompt tab's other half: one empty same-name section per disabled section,
   // mounted inside each live agent's scope. Created even without `agents` so the
   // route can persist a switch; with no registry it simply has no scopes to mount.
@@ -2090,16 +2779,27 @@ export {
   ROUTE,
   SKILLS_ROUTE,
   cleanDeny,
+  createDeferredTools,
   createPromptShadows,
   createRestrictor,
   createSkillShadows,
+  deferredGroups,
+  deferredIndexText,
+  deferredNamesFor,
   denyReason,
   denySetFor,
+  findGroupByName,
+  getToolsDefinition,
   groupsFile,
+  hiddenSetFor,
+  liveNames,
   loadGroups,
   loadPrompts,
   loadSkillDisabled,
+  lockGroup,
+  lockedGroupsFor,
   makeGuard,
+  normalizeGroupPrompt,
   normalizeGroups,
   normalizePromptNames,
   ownerOf,
@@ -2108,6 +2808,7 @@ export {
   policyFor,
   promptsFile,
   promptsState,
+  relockGroups,
   saveGroups,
   savePrompts,
   saveSkillDisabled,
@@ -2119,7 +2820,15 @@ export {
   togglePromptSection,
   toggleSkill,
   resetPromptSections,
-  toolsForSession
+  toolsForSession,
+  unlockGroup,
+  unlocked,
+  unlockedFor,
+  INDEX_ORDER,
+  INDEX_SECTION,
+  GET_TOOLS,
+  MAX_GROUP_PROMPT,
+  MAX_INDEX_PROMPT
 }
 
 /** Test-only: the live disabled-section names. */
@@ -2160,6 +2869,7 @@ export function replaceGroups(value) {
   if (next === undefined) return undefined
   groups = next
   saveGroups(groups)
+  onGroupsChanged()
   return groups
 }
 

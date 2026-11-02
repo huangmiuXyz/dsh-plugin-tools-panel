@@ -65,7 +65,7 @@ window.__ModuleLoader__.load({
      * with an OLD host, and without this check that shows up as a switch that flips
      * back on its own.
      */
-    const PROTOCOL = 8
+    const PROTOCOL = 10
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 320
     const MENU_MAX_HEIGHT = 420
@@ -142,6 +142,21 @@ window.__ModuleLoader__.load({
       clearSelection: '取消创建',
       selected: '已选 {count} 个',
       emptyGroup: '空分组',
+      // ---- progressive disclosure
+      disclosure: '渐进披露',
+      disclosureTitle: '渐进式披露',
+      disclosureOn: '已开启渐进式披露',
+      disclosureOff: '未开启渐进式披露',
+      disclosureLabel: '渐进式披露',
+      disclosurePrompt: '分组描述提示词',
+      disclosurePromptPlaceholder: '告诉模型这组工具是做什么的、什么时候该加载。例如：用于 Git 操作，查看状态、提交、分支管理。',
+      disclosureHint:
+        '开启后，组内工具不再自动注入上下文，模型只看到这行描述；至少一个分组开启时，工具列表会自动出现 get_tools，模型调用它即把这组工具注入，从下一步起可用（返回的只是一句确认，不带参数 schema）。',
+      disclosureEmpty: '这个分组还没有成员，开启披露不会隐藏任何工具。',
+      disclosureLoaded: '本会话已加载',
+      disclosureUnload: '卸载',
+      disclosureUnloadTitle: '仅在本会话隐藏这组工具，分组定义不变',
+      disclosureSave: '保存',
       // ---- plugins
       pluginsTitle: '已安装插件',
       pluginsLoading: '正在读取插件…',
@@ -218,6 +233,22 @@ window.__ModuleLoader__.load({
       clearSelection: 'Cancel',
       selected: '{count} selected',
       emptyGroup: 'Empty group',
+      // ---- progressive disclosure
+      disclosure: 'Defer',
+      disclosureTitle: 'Progressive disclosure',
+      disclosureOn: 'Progressive disclosure is on',
+      disclosureOff: 'Progressive disclosure is off',
+      disclosureLabel: 'Progressive disclosure',
+      disclosurePrompt: 'Group description prompt',
+      disclosurePromptPlaceholder:
+        'Tell the model what these tools are for and when to load them. e.g. Git operations: status, commits, branches.',
+      disclosureHint:
+        'When on, this group\'s tools are not injected into the context — the model sees only this description. While any group is deferred, a get_tools tool appears: calling it injects the group, usable from the next step. Its answer is a confirmation sentence only — no parameter schemas.',
+      disclosureEmpty: 'This group has no members yet, so nothing would be hidden.',
+      disclosureLoaded: 'Loaded in this conversation',
+      disclosureUnload: 'Unload',
+      disclosureUnloadTitle: 'Hide this group\'s tools again in this conversation; the group definition is unchanged',
+      disclosureSave: 'Save',
       pluginsTitle: 'Installed plugins',
       pluginsLoading: 'Reading plugins…',
       pluginsEmpty: 'This profile has no plugins installed.',
@@ -369,6 +400,21 @@ window.__ModuleLoader__.load({
         method: 'POST',
         headers: { 'content-type': 'application/json', [HEADER]: '1' },
         body: JSON.stringify({ sessionId, groups })
+      })
+
+    /**
+     * Hide progressively disclosed groups again, for THIS session.
+     *
+     * The counterpart of what `get_tools` does: that unlock lasts for the
+     * conversation, so without this the only way back to a locked group would be a
+     * new conversation. Only the session's unlocked set is touched — the group
+     * definition (its switch and description) is unchanged.
+     */
+    const writeHide = (sessionId, hide) =>
+      call({
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [HEADER]: '1' },
+        body: JSON.stringify({ sessionId, hide })
       })
 
     // --- the skills and prompt tabs: talking to the Host --------------------------
@@ -1173,6 +1219,121 @@ window.__ModuleLoader__.load({
 .dsh-tools-panel-prompt-note { color: var(--dsw-alias-label-caption); font-size: 10px; line-height: 14px; }
 .dsh-tools-panel-inlineWarn { color: var(--dsw-alias-state-warn-label); font-size: 11px; line-height: 16px; }
 .dsh-tools-panel-actions { display: flex; align-items: center; gap: 6px; padding: 4px 8px 2px; }
+/* Progressive disclosure: one small gear per group, and the dialog it opens. The
+   gear carries no text — the 320px head already holds the name, the count, the
+   loaded chip, the unload button and the bulk switch, and the state is the colour,
+   not a word. */
+.dsh-tools-panel-tool-groupDisclosure {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+.dsh-tools-panel-tool-groupDisclosure:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-tools-panel-tool-groupDisclosureOn { color: var(--dsw-alias-brand-primary); }
+.dsh-tools-panel-tool-groupDisclosureOn:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-brand-primary);
+}
+.dsh-tools-panel-tool-groupDisclosure:disabled { opacity: .5; cursor: default; }
+.dsh-tools-panel-tool-groupDisclosure:focus-visible {
+  outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+.dsh-tools-panel-tool-groupLoaded { color: var(--dsw-alias-state-success-primary, var(--dsw-alias-label-tertiary)); }
+/* The direct way back from a loaded group to a deferred one: the chip states the
+   fact, this button acts on it. Rendered only while the group is loaded in this
+   conversation, so it never competes with the controls that are always there. */
+.dsh-tools-panel-tool-groupUnload {
+  flex: none;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  cursor: pointer;
+}
+.dsh-tools-panel-tool-groupUnload:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-tools-panel-tool-groupUnload:disabled { opacity: .5; cursor: default; }
+.dsh-tools-panel-tool-groupUnload:focus-visible {
+  outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+/* The dialog is deliberately wider than the menu: a description prompt is prose, and
+   320px is a column for a list, not for writing. */
+.dsh-tools-panel-dialogBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgb(0 0 0 / .35);
+}
+.dsh-tools-panel-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+  width: 420px;
+  max-width: 100%;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 14px;
+  border: .5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-bg-layer-1);
+  box-shadow: var(--dsw-elevation-prominent);
+  color: var(--dsw-alias-label-primary);
+}
+.dsh-tools-panel-dialogTitle { font-size: 13px; font-weight: 600; line-height: 19px; }
+.dsh-tools-panel-dialogSwitch { display: flex; align-items: center; gap: 8px; font-size: 12px; line-height: 18px; cursor: pointer; }
+.dsh-tools-panel-dialogSwitch input { width: 14px; height: 14px; margin: 0; accent-color: var(--dsw-alias-brand-primary); cursor: pointer; }
+.dsh-tools-panel-dialogField { display: flex; flex-direction: column; gap: 4px; }
+.dsh-tools-panel-dialogFieldName { color: var(--dsw-alias-label-secondary); font-size: 11px; line-height: 16px; }
+.dsh-tools-panel-dialogTextarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 84px;
+  padding: 6px 8px;
+  border: .5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  resize: vertical;
+  outline: none;
+}
+.dsh-tools-panel-dialogTextarea:focus-visible { border-color: var(--dsw-alias-brand-primary); }
+.dsh-tools-panel-dialogHint { margin: 0; color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px; }
+.dsh-tools-panel-dialogWarn { margin: 0; color: var(--dsw-alias-state-warn-label); font-size: 11px; line-height: 16px; }
+.dsh-tools-panel-dialogActions { display: flex; align-items: center; gap: 6px; }
+.dsh-tools-panel-dialogSpacer { flex: 1 1 auto; }
+.dsh-tools-panel-dialogPrimary {
+  border-color: transparent;
+  background: var(--dsw-alias-brand-primary);
+  color: var(--dsw-alias-label-primary-foreground);
+}
 `
 
     // --- icons ------------------------------------------------------------------
@@ -1287,6 +1448,37 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * The gear that opens a group's progressive-disclosure settings.
+     *
+     * An icon, not a label: the group head is 320px wide and already carries the
+     * name, the member count, the loaded chip and the bulk switch. The button's
+     * meaning lives in its `aria-label`/`title`, and its on/off state is the colour
+     * — filled brand when the group is deferred, muted grey when it is not.
+     */
+    function GearIcon() {
+      return h(
+        'svg',
+        {
+          viewBox: '0 0 24 24',
+          width: '13',
+          height: '13',
+          'aria-hidden': 'true',
+          focusable: 'false'
+        },
+        h('path', {
+          d:
+            'M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: '1.6',
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round'
+        }),
+        h('circle', { cx: '12', cy: '12', r: '3.1', fill: 'none', stroke: 'currentColor', strokeWidth: '1.6' })
+      )
+    }
+
     // --- rows ------------------------------------------------------------------
     /**
      * One tool: its name and its switch.
@@ -1342,14 +1534,28 @@ window.__ModuleLoader__.load({
      * semantics of a group here — it has no policy of its own, so there is nothing
      * that could disagree with the tools it holds.
      *
+     * The `渐进披露` button is a SECOND, independent axis: it opens the editor for the
+     * group's progressive disclosure, which hides the members from the model's tool
+     * list until they are fetched with `get_tools`. It does not touch the switches —
+     * a deferred tool can still be denied, and a denied tool stays denied after it
+     * is fetched.
+     *
+     * A group that was FETCHED in this conversation shows two things the others do
+     * not: the "loaded" chip, and an `卸载` button beside it. The chip alone would
+     * state a fact the user cannot act on; the button is the direct way back to a
+     * locked group — one click on the row, without opening the editor dialog (the
+     * dialog offers the same action). It only unloads THIS conversation: the group
+     * definition, its switch and its description prompt are untouched.
+     *
      * A member row is drawn only for a tool that some session can actually call;
      * a member whose tool is gone stays in the definition (it may come back when an
      * MCP server reconnects) but is not drawn, because there is no switch to offer
      * for something that does not exist here.
      */
-    function GroupRow({ group, allowedOf, busy, open, onToggleOpen, onToggleAll, onRename, onRemove, children }) {
+    function GroupRow({ group, allowedOf, busy, open, loaded, onToggleOpen, onToggleAll, onRename, onRemove, onDisclosure, onUnload, children }) {
       const members = group.members
       const on = members.length > 0 && members.every((name) => allowedOf(name))
+      const deferred = group.disclosure === true
       return h(
         'div',
         { className: 'dsh-tools-panel-tool-group' },
@@ -1370,7 +1576,46 @@ window.__ModuleLoader__.load({
             '\u25B6'
           ),
           h('span', { className: 'dsh-tools-panel-tool-groupName', title: group.name }, group.name),
+          deferred && loaded === true
+            ? h(
+                'span',
+                {
+                  className: 'dsh-tools-panel-tool-groupMeta dsh-tools-panel-tool-groupLoaded',
+                  title: children?.loadedLabel
+                },
+                children?.loadedLabel
+              )
+            : null,
+          deferred && loaded === true
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-tools-panel-tool-groupUnload',
+                  'aria-label': `${children?.unloadLabel} ${group.name}`,
+                  title: children?.unloadTitle,
+                  disabled: busy,
+                  onClick: onUnload
+                },
+                children?.unloadLabel
+              )
+            : null,
           h('span', { className: 'dsh-tools-panel-tool-groupMeta' }, String(members.length)),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: deferred
+                ? 'dsh-tools-panel-tool-groupDisclosure dsh-tools-panel-tool-groupDisclosureOn'
+                : 'dsh-tools-panel-tool-groupDisclosure',
+              'aria-pressed': deferred,
+              'aria-label': deferred ? children?.disclosureOnLabel : children?.disclosureOffLabel,
+              title: deferred ? children?.disclosureOnLabel : children?.disclosureOffLabel,
+              disabled: busy,
+              onClick: onDisclosure
+            },
+            h(GearIcon)
+          ),
           h(
             'button',
             {
@@ -1416,6 +1661,127 @@ window.__ModuleLoader__.load({
               )
             )
           : null
+      )
+    }
+
+    /**
+     * The progressive-disclosure editor for one group.
+     *
+     * A dialog rather than an inline row: it edits TWO related things (the switch
+     * and the description the model will read), and a textarea inside the 320px menu
+     * would push every other group out of view. It is portalled to `document.body`
+     * so the menu's own scroll container cannot clip it; the panel shell knows to
+     * ignore clicks inside `.dsh-tools-panel-dialogBackdrop`, which is what keeps a
+     * click in here from dismissing the menu underneath.
+     *
+     * The local state is seeded once from `draft` and saved on demand, so typing
+     * does not write to the Host on every keystroke.
+     */
+    function DisclosureDialog({ draft, t, busy, onSave, onCancel, onUnload }) {
+      const [enabled, setEnabled] = useState(draft.disclosure)
+      const [prompt, setPrompt] = useState(draft.prompt)
+      const submit = () => onSave({ disclosure: enabled, prompt: prompt.trim() })
+      return createPortal(
+        h(
+          'div',
+          {
+            className: 'dsh-tools-panel-dialogBackdrop',
+            // A click on the backdrop closes the DIALOG only: stopping here keeps
+            // the panel's own document-level dismissal out of it.
+            onMouseDown: (event) => {
+              event.stopPropagation()
+              if (event.target === event.currentTarget) onCancel()
+            }
+          },
+          h(
+            'div',
+            {
+              className: 'dsh-tools-panel-dialog',
+              role: 'dialog',
+              'aria-modal': 'true',
+              'aria-label': t('disclosureTitle'),
+              onKeyDown: (event) => {
+                if (event.key === 'Escape') {
+                  event.stopPropagation()
+                  onCancel()
+                }
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) submit()
+              }
+            },
+            h(
+              'div',
+              { className: 'dsh-tools-panel-dialogTitle' },
+              `${draft.name} · ${t('disclosureTitle')}`
+            ),
+            h(
+              'label',
+              { className: 'dsh-tools-panel-dialogSwitch' },
+              h('input', {
+                type: 'checkbox',
+                checked: enabled,
+                disabled: busy,
+                onChange: (event) => setEnabled(event.target.checked)
+              }),
+              h('span', null, t('disclosureLabel'))
+            ),
+            h(
+              'label',
+              { className: 'dsh-tools-panel-dialogField' },
+              h('span', { className: 'dsh-tools-panel-dialogFieldName' }, t('disclosurePrompt')),
+              h('textarea', {
+                className: 'dsh-tools-panel-dialogTextarea',
+                value: prompt,
+                rows: 4,
+                autoFocus: true,
+                placeholder: t('disclosurePromptPlaceholder'),
+                onChange: (event) => setPrompt(event.target.value)
+              })
+            ),
+            h('p', { className: 'dsh-tools-panel-dialogHint' }, t('disclosureHint')),
+            draft.members === 0
+              ? h('p', { className: 'dsh-tools-panel-dialogWarn' }, t('disclosureEmpty'))
+              : null,
+            h(
+              'div',
+              { className: 'dsh-tools-panel-dialogActions' },
+              draft.loaded === true
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-tools-panel-tool-bulkButton',
+                      title: t('disclosureUnloadTitle'),
+                      disabled: busy,
+                      onClick: onUnload
+                    },
+                    t('disclosureUnload')
+                  )
+                : null,
+              h('span', { className: 'dsh-tools-panel-dialogSpacer' }),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-tools-panel-tool-bulkButton',
+                  disabled: busy,
+                  onClick: onCancel
+                },
+                t('cancel')
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-tools-panel-tool-bulkButton dsh-tools-panel-dialogPrimary',
+                  disabled: busy,
+                  onClick: submit
+                },
+                t('disclosureSave')
+              )
+            )
+          )
+        ),
+        document.body
       )
     }
 
@@ -1516,6 +1882,9 @@ window.__ModuleLoader__.load({
         const [selected, setSelected] = useState(() => new Set())
         // The group whose name is being typed (or renamed): `{ id?, name }`.
         const [draft, setDraft] = useState(undefined)
+        // The group whose progressive-disclosure editor is open, seeded when it
+        // opens: `{ id, name, members, disclosure, prompt, loaded }`.
+        const [disclosure, setDisclosure] = useState(undefined)
         // Which groups are expanded. Collapsed is the default for a big group so one
         // bundle cannot push the rest of the list out of view.
         const [expanded, setExpanded] = useState(() => new Set())
@@ -1740,6 +2109,83 @@ window.__ModuleLoader__.load({
             setDraft(undefined)
           },
           [commitGroups, groups]
+        )
+
+        /** Open the progressive-disclosure editor for one group. */
+        const editDisclosure = useCallback((group) => {
+          // Read the session state through the ref: this callback is memoized, and
+          // the "loaded in this conversation" chip is state that can arrive later.
+          const open = dataRef.current?.unlocked ?? []
+          setDisclosure({
+            id: group.id,
+            name: group.name,
+            members: group.members.length,
+            disclosure: group.disclosure === true,
+            prompt: typeof group.prompt === 'string' ? group.prompt : '',
+            loaded: open.includes(group.id)
+          })
+        }, [])
+
+        /**
+         * Save one group's progressive-disclosure settings.
+         *
+         * The group id is an ARGUMENT, not a read of the `disclosure` state: the
+         * callback is memoized, so closing over that object would pin it to the
+         * editor that opened FIRST. The current list is read through `dataRef` for
+         * the same reason — the group set can move under a memoized callback.
+         */
+        const saveDisclosure = useCallback(
+          (id, next) => {
+            setDisclosure(undefined)
+            const current = dataRef.current?.groups ?? []
+            commitGroups(
+              current.map((group) =>
+                group.id === id
+                  ? { ...group, disclosure: next.disclosure === true, prompt: next.prompt }
+                  : group
+              )
+            )
+          },
+          [commitGroups]
+        )
+
+        /**
+         * Unload one group for this session only.
+         *
+         * The counterpart of what `get_tools` does. It is the same call whether it
+         * comes from the group row or from the editor dialog, so there is exactly one
+         * write path and no way for the two affordances to disagree. The group
+         * DEFINITION is not touched: only the session's unlocked set shrinks, so the
+         * group stays deferred and the model can fetch it again later.
+         */
+        const unload = useCallback(
+          (id) => {
+            setDisclosure(undefined)
+            if (activeSession === undefined) return
+            setPending(true)
+            writeHide(activeSession, [id])
+              .then((next) => {
+                if (!liveRef.current) return
+                dataRef.current = next
+                setData(next)
+                setError(undefined)
+                setStale(undefined)
+              })
+              .catch((failure) => {
+                if (!liveRef.current) return
+                if (failure instanceof StaleHostError) {
+                  setStale(String(failure.message))
+                  setData(undefined)
+                  setStatus('error')
+                  return
+                }
+                setError(`${t('saveFailed')}${String(failure?.message ?? failure)}`)
+              })
+              .finally(() => {
+                if (liveRef.current) setPending(false)
+              })
+          },
+          [activeSession, t]
         )
 
         /** Flip every tool the list currently shows — not the whole registry. */
@@ -1978,6 +2424,7 @@ window.__ModuleLoader__.load({
                                         selected,
                                         busy: pending,
                                         open: expanded.has(group.id) || query.trim().length > 0,
+                                        loaded: (data?.unlocked ?? []).includes(group.id),
                                         allowedOf: (name) => !denied.has(name),
                                         onToggleOpen: () =>
                                           setExpanded((prev) => {
@@ -1989,10 +2436,18 @@ window.__ModuleLoader__.load({
                                         onToggleAll: () => flipGroup(group),
                                         onRename: () => setDraft({ id: group.id, name: group.name }),
                                         onRemove: () => removeGroup(group.id),
+                                        onDisclosure: () => editDisclosure(group),
+                                        onUnload: () => unload(group.id),
                                         children: {
                                           empty: t('emptyGroup'),
                                           renameLabel: t('rename'),
                                           removeLabel: t('remove'),
+                                          disclosureLabel: t('disclosure'),
+                                          disclosureOnLabel: t('disclosureOn'),
+                                          disclosureOffLabel: t('disclosureOff'),
+                                          loadedLabel: t('disclosureLoaded'),
+                                          unloadLabel: t('disclosureUnload'),
+                                          unloadTitle: t('disclosureUnloadTitle'),
                                           rows: rows.map((name) =>
                                             h(ToolRow, {
                                               key: `${group.id}-${name}`,
@@ -2024,6 +2479,20 @@ window.__ModuleLoader__.load({
                                   )
                                 ]
                         ),
+                        // The disclosure editor lives in its own portal; it is
+                        // rendered from this tab so it keeps the tab's data and
+                        // write path, not a second copy of them.
+                        disclosure === undefined
+                          ? null
+                          : h(DisclosureDialog, {
+                              key: `disclosure-${disclosure.id}`,
+                              draft: disclosure,
+                              t,
+                              busy: pending,
+                              onSave: (next) => saveDisclosure(disclosure.id, next),
+                              onCancel: () => setDisclosure(undefined),
+                              onUnload: () => unload(disclosure.id)
+                            }),
                         // Only a failure gets a line here; the switches say what
                         // the state is, so a summary line repeating them would just
                         // push them down the menu.
@@ -2950,6 +3419,15 @@ window.__ModuleLoader__.load({
             for (const ref of [rootRef, menuRef]) {
               const node = ref.current
               if (node !== null && event.target instanceof Node && node.contains(event.target)) return
+            }
+            // A tab's dialog is a third subtree, portalled to `document.body` so the
+            // menu cannot clip it. It handles its own clicks, and dismissing the menu
+            // from underneath it would close both at once.
+            if (
+              event.target instanceof Element &&
+              event.target.closest('.dsh-tools-panel-dialogBackdrop') !== null
+            ) {
+              return
             }
             setOpen(false)
           }
