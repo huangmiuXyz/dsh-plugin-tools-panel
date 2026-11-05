@@ -2781,6 +2781,183 @@ try {
   check('client: parses as a script', false, String(error?.message ?? error))
 }
 
+// --- 7. boot ordering: a late `agents` service -------------------------------
+/**
+ * Profile bundles load concurrently, so this row can be applied before the agent
+ * loop has provided `agents` — that is the ORDINARY boot order, not an edge case.
+ * Capturing `ctx.get('agents')` at apply time then stored `undefined` forever: no
+ * per-agent scope was ever mounted (so progressive disclosure promised "not in your
+ * tool list yet" while every tool still was), and the skills/prompts tabs answered
+ * "no live agent" for a conversation that was plainly running.
+ *
+ * Locked down here: the lifecycle listeners exist without the service, an
+ * `agent/created` payload alone is enough to mount the mask, and the catch-up pass
+ * mounts agents that existed before the service became visible.
+ */
+{
+  const services = {}
+  const listeners = new Map()
+  const injects = new Map()
+  const restrictCalls = []
+  const mountedScopes = []
+  const registered = []
+  /**
+   * What `restrict()` currently hides, PER AGENT: restrictions are scoped, and the
+   * fake must model the mask, or the "did the tools land" probe below would look
+   * correct without working.
+   */
+  const hidden = new Map()
+  const hiddenOf = (id) => hidden.get(id) ?? new Set()
+
+  const makeAgent = (id) => {
+    const agent = { id }
+    const scopedTools = {
+      restrict(filter) {
+        const names = filter?.deny ?? []
+        restrictCalls.push({ id, names })
+        const masked = new Set(hiddenOf(id))
+        for (const name of names) masked.add(name)
+        hidden.set(id, masked)
+        return () => {
+          const lifted = new Set(hiddenOf(id))
+          for (const name of names) lifted.delete(name)
+          hidden.set(id, lifted)
+        }
+      },
+      schemas: () => [{ name: 'late_tool', description: 'late.', parameters: { type: 'object' } }]
+    }
+    agent.ctx = {
+      fiber: { uid: id, parent: undefined },
+      plugin(definition) {
+        mountedScopes.push(id)
+        definition.apply?.({
+          tools: scopedTools,
+          effect: (fn) => fn(),
+          get: () => undefined,
+          on: () => () => {}
+        })
+        return { dispose() {} }
+      }
+    }
+    return agent
+  }
+
+  const ctx = {
+    tools: {
+      guard: () => () => {},
+      register(definition) {
+        registered.push(definition)
+        return () => {}
+      },
+      restrict() { throw new Error('an unscoped restriction would mask every agent') },
+      // The agent view answers what the agent can call, so the mask shows up here;
+      // the GLOBAL view is empty on purpose — a preset-scoped tool (the case that
+      // exposes the counting bug) is never in the global layer.
+      schemas(scope) {
+        if (scope === undefined || hiddenOf(scope.id).has('late_tool')) return []
+        return [{ name: 'late_tool', description: 'late.', parameters: { type: 'object' } }]
+      }
+    },
+    on(name, listener) {
+      const list = listeners.get(name) ?? []
+      list.push(listener)
+      listeners.set(name, list)
+      return () => {}
+    },
+    get: (name) => services[name],
+    inject(names, callback) {
+      injects.set(names.join(','), callback)
+      if (names.every((name) => services[name] !== undefined)) callback()
+      return () => {}
+    },
+    effect(fn) { fn(); return () => {} }
+  }
+
+  // A deferred group is what gives the mounted plugins something to hide.
+  setGroups([{ id: 'late-1', name: 'late', members: ['late_tool'], disclosure: true, prompt: 'late' }])
+  apply(ctx)
+
+  check(
+    'late agents: agent/created is registered without the service',
+    (listeners.get('agent/created') ?? []).length === 1,
+    String((listeners.get('agent/created') ?? []).length)
+  )
+  check(
+    'late agents: agent/disposed is registered without the service',
+    (listeners.get('agent/disposed') ?? []).length === 1,
+    String((listeners.get('agent/disposed') ?? []).length)
+  )
+  check(
+    'late agents: nothing is mounted while the service is missing',
+    mountedScopes.length === 0,
+    JSON.stringify(mountedScopes)
+  )
+
+  // The session's agent is created before the registry is visible to this plugin.
+  const early = makeAgent('early')
+  for (const listener of listeners.get('agent/created') ?? []) listener({ agent: early, source: 'startup' })
+  check(
+    'late agents: a created event mounts without the service',
+    mountedScopes.includes('early'),
+    JSON.stringify(mountedScopes)
+  )
+  check(
+    'late agents: the event path applies the disclosure mask',
+    restrictCalls.some((call) => call.id === 'early' && call.names.includes('late_tool')),
+    JSON.stringify(restrictCalls)
+  )
+
+  // The service finally appears: the catch-up pass must reach agents that already
+  // existed, which the event path cannot cover.
+  const late = makeAgent('late')
+  services.agents = {
+    list: () => [late],
+    get: (id) => (id === 'late' ? late : undefined),
+    isOwnedBy: () => false
+  }
+  injects.get('agents')?.()
+  check(
+    'late agents: the catch-up pass mounts an agent the service already held',
+    mountedScopes.includes('late'),
+    JSON.stringify(mountedScopes)
+  )
+  check(
+    'late agents: the late pass applies the disclosure mask too',
+    restrictCalls.some((call) => call.id === 'late' && call.names.includes('late_tool')),
+    JSON.stringify(restrictCalls)
+  )
+
+  // The "did the members land" count must be read AFTER the unlock. Counting before
+  // it reads the view the mask itself emptied, so a preset-scoped group (never in the
+  // global layer) reported "nothing was injected" while loading its tools.
+  const getTools = registered.find((definition) => definition.name === 'get_tools')
+  check('late agents: get_tools is registered for the deferred group', getTools !== undefined)
+  const loaded = await getTools.execute({ group: 'late' }, { agent: late })
+  check(
+    'late agents: a preset-scoped group still reports its tools as injected',
+    /injected/.test(loaded.message) && !/no registered tool/.test(loaded.message),
+    loaded.message
+  )
+  check(
+    'late agents: the load lifts the mask',
+    !hiddenOf('late').has('late_tool'),
+    JSON.stringify([...hiddenOf('late')])
+  )
+
+  // The tabs read an agent through `agentFor`; with the service absent they must fall
+  // back to the objects `agent/created` already handed over.
+  const viaEvents = await skillsState(
+    { skills: { snapshot: async () => ({ skills: [], complete: true }) }, seenAgents: new Map([['s1', { id: 's1' }]]) },
+    's1'
+  )
+  check(
+    'late agents: the tabs read the event-seen agent when the service is missing',
+    viaEvents.available === true && viaEvents.reason === undefined,
+    String(viaEvents.reason)
+  )
+  setGroups([])
+}
+
 // Never leave the sandbox behind: it holds a file this test wrote on purpose.
 try {
   fs.rmSync(SANDBOX, { recursive: true, force: true })

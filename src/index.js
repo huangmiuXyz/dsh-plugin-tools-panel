@@ -475,7 +475,11 @@ function createSkillShadows(scope, agents) {
     if (!live) return
     let list = []
     try {
-      list = agents?.list?.() ?? []
+      // Resolved per pass: the registry may be provided after this controller was
+      // built (profile bundles load concurrently). A captured `undefined` would
+      // mean the shadows never mount at all.
+      const registry = typeof agents === 'function' ? agents() : agents
+      list = registry?.list?.() ?? []
     } catch {
       return
     }
@@ -889,6 +893,8 @@ function makeGuard(table, tree) {
  * All of the policy/inheritance logic stays in one place (the table above) instead
  * of being duplicated into N live agent scopes.
  * @param scope - the plugin context (needs `tools`; provides `schemas`).
+ * @param agents - the live agent registry, or a resolver for it; a resolver is what
+ *   survives the service being provided after this plugin mounts.
  * @returns the controller used by the route and by the agent lifecycle listeners.
  */
 function createRestrictor(scope, agents) {
@@ -896,8 +902,16 @@ function createRestrictor(scope, agents) {
   const entries = new Map()
   let live = true
   let timer
-  /** The agent registry, so a pass can resolve one agent's visible names. */
-  const agentsRef = agents
+  /**
+   * The agent registry, resolved per pass rather than captured.
+   *
+   * `agents` is accepted as a resolver because the service may not be provided when
+   * the plugin mounts — profile bundles load concurrently, and `ctx.get()` answers
+   * `undefined` for a service whose providing fiber is not active yet. A captured
+   * `undefined` would never recover; a resolver picks the registry up as soon as it
+   * exists. A plain object is still accepted so a test can drive one directly.
+   */
+  const agentsRef = typeof agents === 'function' ? agents : () => agents
   /** Why the last mount attempt failed, for the snapshot's diagnostics. */
   let mountError
   /** The last `restrict()` failure, for the snapshot's diagnostics. */
@@ -1141,7 +1155,7 @@ function createRestrictor(scope, agents) {
       const agentId = entry.agentId
       if (agentId === undefined) continue
       if (!views.has(agentId)) {
-        const agent = agentsRef?.get?.(agentId)
+        const agent = agentsRef()?.get?.(agentId)
         views.set(agentId, agent === undefined ? undefined : visibleNamesOf(agent))
       }
       try {
@@ -1237,10 +1251,16 @@ function createRestrictor(scope, agents) {
 /** The live agent for one session, or undefined when the session is not running. */
 function agentFor(host, sessionId) {
   try {
-    return host?.agents?.get?.(sessionId)
+    const live = host?.agents?.get?.(sessionId)
+    if (live !== undefined) return live
   } catch {
-    return undefined
+    /* the registry is between generations; the event-seen map below still answers */
   }
+  // The service can be missing for a while after this plugin mounts (bundles load
+  // concurrently), but `agent/created` already handed us the agent object. Without
+  // this fallback the skills/prompts tabs would report "no live agent" for a
+  // conversation that is plainly running.
+  return host?.seenAgents?.get?.(sessionId)
 }
 
 /** The working directory a skill lookup needs; falls back to the session header. */
@@ -1659,7 +1679,10 @@ function createPromptShadows(scope, agents) {
     if (!live) return
     let list = []
     try {
-      list = agents?.list?.() ?? []
+      // Resolved per pass, for the same reason as the skill shadows: the registry
+      // may only be provided after this controller was built.
+      const registry = typeof agents === 'function' ? agents() : agents
+      list = registry?.list?.() ?? []
     } catch {
       return
     }
@@ -1907,7 +1930,6 @@ function getToolsDefinition({ enable, names, registry }) {
           groups: []
         }
       }
-      const live = exec?.agent === undefined ? new Set() : names(exec.agent)
       const key = typeof input.group === 'string' ? input.group.trim() : ''
       if (key.length === 0) {
         const open = sessionId === undefined ? new Set() : unlockedFor(sessionId)
@@ -1940,6 +1962,14 @@ function getToolsDefinition({ enable, names, registry }) {
       const nowOpen = sessionId === undefined || wasOpen
         ? false
         : enable(sessionId, group.id)
+      // Read the visible names AFTER the unlock. `enable` lifts the restriction
+      // synchronously, so this is the honest answer to "did the members land in the
+      // tool list". Reading it before counted the members this very call just
+      // revealed as "not registered", because the mask the disclosure had applied was
+      // hiding them from `schemas()` — a preset-scoped group (one whose tools the
+      // global view never carries) therefore answered "nothing was injected" while
+      // loading them.
+      const live = exec?.agent === undefined ? new Set() : names(exec.agent)
       const described = describeGroup(group, live, registry)
       // The answer is the confirmation and nothing else: the schemas arrive with the
       // tools themselves on the next step, so they are not copied into this text.
@@ -2134,7 +2164,7 @@ function cleanDeny(value) {
  */
 function toolsForSession(sessionId, host) {
   const visible = []
-  const agent = host.agents?.get?.(sessionId)
+  const agent = agentFor(host, sessionId)
   if (agent !== undefined) {
     try {
       for (const schema of host.tools.schemas(agent)) visible.push(schema.name)
@@ -2160,7 +2190,7 @@ function toolsForSession(sessionId, host) {
 function maskedCount(sessionId, host) {
   const denied = denySetFor(sessionId)
   if (denied.size === 0) return 0
-  const agent = host.agents?.get?.(sessionId)
+  const agent = agentFor(host, sessionId)
   if (agent === undefined) return 0
   try {
     const visible = new Set(host.tools.schemas(agent).map((schema) => schema.name))
@@ -2618,9 +2648,29 @@ function nextScopeOf(ctx) {
 export const inject = ['tools']
 
 export function apply(ctx) {
+  /**
+   * The `agents` service, resolved per call instead of captured.
+   *
+   * Profile bundles load concurrently: when this row is applied the agent loop is
+   * often still starting, and `ctx.get('agents')` answers `undefined` for a service
+   * that is perfectly available a moment later. Capturing that `undefined` is what
+   * silently disabled every per-agent half of this plugin — no scope was ever
+   * mounted, so progressive disclosure hid nothing and the skills/prompts tabs
+   * reported "no live agent". Nothing below may hold the object itself.
+   */
+  const agentsNow = () => ctx.get('agents')
+
+  /**
+   * Agents seen through lifecycle events.
+   *
+   * The payload carries the agent, so the per-agent halves work even while the
+   * service is unavailable; the tabs fall back to this map in that window.
+   */
+  const seenAgents = new Map()
+
   // Hiding needs `tools` (restrict/schemas) and each agent's scope; the controller
   // takes the plugin's own context so it can read each agent's schema view.
-  const restrictor = createRestrictor(ctx, ctx.get('agents'))
+  const restrictor = createRestrictor(ctx, agentsNow)
   ctx.effect(() => () => restrictor.dispose(), 'tools-panel: restriction scopes')
 
   // Progressive disclosure: the fetch tool (mounted only while some group defers)
@@ -2684,14 +2734,14 @@ export function apply(ctx) {
   // The prompt tab's other half: one empty same-name section per disabled section,
   // mounted inside each live agent's scope. Created even without `agents` so the
   // route can persist a switch; with no registry it simply has no scopes to mount.
-  const promptShadows = createPromptShadows(ctx, ctx.get('agents'))
+  const promptShadows = createPromptShadows(ctx, agentsNow)
   ctx.effect(() => () => promptShadows.dispose(), 'tools-panel: prompt shadows')
 
   // The skills tab's other half: a same-name runtime registration with both
   // invocation flags off, mounted inside each live agent's scope. It is what makes
   // the runtime skills (plugin-injected, bundled) switchable at all — they have no
   // SKILL.md to edit.
-  const skillShadows = createSkillShadows(ctx, ctx.get('agents'))
+  const skillShadows = createSkillShadows(ctx, agentsNow)
   ctx.effect(() => () => skillShadows.dispose(), 'tools-panel: skill shadows')
 
   ctx.effect(() => ctx.tools.guard(makeGuard(policies, parents)), 'tools-panel: live guard')
@@ -2701,45 +2751,71 @@ export function apply(ctx) {
   // HOLDS the tool can mask it.
   const mountWithAncestors = (agent) => restrictor.mountEverywhere(agent)
 
-  // Record the delegation tree and mount one restriction per live agent. Both
-  // listeners are registered through the same optional-service probe, so a
-  // deployment without `agents` keeps the guard and simply has a flat tree.
-  const agents = ctx.get('agents')
-  if (agents !== undefined) {
-    ctx.effect(
-      () => ctx.on('agent/created', ({ agent }) => {
-        const parentId = detectParent(agents, agent)
-        if (parentId !== undefined) parents.set(agent.id, parentId)
-        // Mount at creation so a switch set BEFORE the child existed already covers
-        // it; the lazy walk decides what that switch means for this child.
-        mountWithAncestors(agent)
-        promptShadows.mount(agent)
-        skillShadows.mount(agent)
-      }),
-      'tools-panel: delegation tree'
-    )
-    ctx.effect(
-      () => ctx.on('agent/disposed', ({ agent }) => {
-        // The LINK goes, the POLICY stays: the restriction is an explicit user
-        // decision about a session, and a session that closes and resumes later
-        // should still be restricted. Keeping the link would instead keep a
-        // finished child in the walk forever.
-        parents.delete(agent.id)
-        // The restriction itself was owned by the agent scope and is already gone.
-        restrictor.release(agent.id)
-        promptShadows.release(agent.id)
-        skillShadows.release(agent.id)
-      }),
-      'tools-panel: tree cleanup'
-    )
-    for (const agent of agents.list()) {
-      mountWithAncestors(agent)
-      promptShadows.mount(agent)
-      skillShadows.mount(agent)
+  /** Wire one agent into every per-agent half. */
+  const attachAgent = (agent) => {
+    if (agent === undefined || typeof agent.id !== 'string') return
+    seenAgents.set(agent.id, agent)
+    const parentId = detectParent(agentsNow(), agent)
+    if (parentId !== undefined) parents.set(agent.id, parentId)
+    // Mount at creation so a switch set BEFORE the child existed already covers
+    // it; the lazy walk decides what that switch means for this child.
+    mountWithAncestors(agent)
+    promptShadows.mount(agent)
+    skillShadows.mount(agent)
+  }
+
+  // The lifecycle listeners are registered UNCONDITIONALLY and read the agent out of
+  // the payload. Gating them on `ctx.get('agents')` is what silently disabled every
+  // per-agent half: at mount time the service is often still loading, so no listener
+  // was ever registered, no scope was ever masked, and progressive disclosure hid
+  // nothing while the skills/prompts tabs answered "no live agent".
+  ctx.effect(
+    () => ctx.on('agent/created', ({ agent }) => attachAgent(agent)),
+    'tools-panel: delegation tree'
+  )
+  ctx.effect(
+    () => ctx.on('agent/disposed', ({ agent }) => {
+      if (agent === undefined || typeof agent.id !== 'string') return
+      // The LINK goes, the POLICY stays: the restriction is an explicit user
+      // decision about a session, and a session that closes and resumes later
+      // should still be restricted. Keeping the link would instead keep a
+      // finished child in the walk forever.
+      parents.delete(agent.id)
+      seenAgents.delete(agent.id)
+      // The restriction itself was owned by the agent scope and is already gone.
+      restrictor.release(agent.id)
+      promptShadows.release(agent.id)
+      skillShadows.release(agent.id)
+    }),
+    'tools-panel: tree cleanup'
+  )
+
+  /**
+   * Attach to the agents that already exist, then re-apply both shadow halves.
+   *
+   * Called once at mount (a profile reload can find sessions already open) and once
+   * more when the `agents` service turns up, which is the ordinary case at boot:
+   * this row can be applied before the agent loop finishes providing the registry.
+   * Everything inside is idempotent, so running twice costs nothing.
+   */
+  const attachLive = () => {
+    let list
+    try {
+      list = agentsNow()?.list?.() ?? []
+    } catch {
+      return
     }
+    for (const agent of list) attachAgent(agent)
     // A section switched off before this process had any agent must apply now.
     promptShadows.syncAll()
     skillShadows.syncAll()
+  }
+  attachLive()
+  if (agentsNow() === undefined) {
+    ctx.effect(
+      () => ctx.inject(['agents'], () => attachLive()),
+      'tools-panel: late agent registry'
+    )
   }
 
   // A tool that appears after the switch was set (an MCP server connecting) must be
@@ -2749,7 +2825,11 @@ export function apply(ctx) {
 
   const deps = {
     tools: ctx.tools,
-    agents,
+    // Probed per request, never captured: the registry may only be provided after
+    // this plugin mounts (see `agentsNow`).
+    get agents() { return agentsNow() },
+    /** Agents seen through lifecycle events: the tabs' fallback while it is missing. */
+    seenAgents,
     restrictor,
     prompts: promptShadows,
     skillShadows,
