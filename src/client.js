@@ -153,6 +153,9 @@ window.__ModuleLoader__.load({
       disclosureHint:
         '开启后，组内工具不再自动注入上下文，模型只看到这行描述；至少一个分组开启时，工具列表会自动出现 get_tools，模型调用它即把这组工具注入，从下一步起可用（返回的只是一句确认，不带参数 schema）。',
       disclosureEmpty: '这个分组还没有成员，开启披露不会隐藏任何工具。',
+      disclosureBadge: '渐进披露',
+      disclosureBadgeTitle: '这个分组开启了渐进式披露：组内工具不在模型的上下文里，模型调用 get_tools 后才注入',
+      disclosureBadgeLoaded: '渐进·已加载',
       disclosureLoaded: '本会话已加载',
       disclosureUnload: '卸载',
       disclosureUnloadTitle: '仅在本会话隐藏这组工具，分组定义不变',
@@ -245,6 +248,10 @@ window.__ModuleLoader__.load({
       disclosureHint:
         'When on, this group\'s tools are not injected into the context — the model sees only this description. While any group is deferred, a get_tools tool appears: calling it injects the group, usable from the next step. Its answer is a confirmation sentence only — no parameter schemas.',
       disclosureEmpty: 'This group has no members yet, so nothing would be hidden.',
+      disclosureBadge: 'Deferred',
+      disclosureBadgeTitle:
+        'Progressive disclosure is on: these tools stay out of the model\'s context until it calls get_tools',
+      disclosureBadgeLoaded: 'Deferred · loaded',
       disclosureLoaded: 'Loaded in this conversation',
       disclosureUnload: 'Unload',
       disclosureUnloadTitle: 'Hide this group\'s tools again in this conversation; the group definition is unchanged',
@@ -1220,9 +1227,9 @@ window.__ModuleLoader__.load({
 .dsh-tools-panel-inlineWarn { color: var(--dsw-alias-state-warn-label); font-size: 11px; line-height: 16px; }
 .dsh-tools-panel-actions { display: flex; align-items: center; gap: 6px; padding: 4px 8px 2px; }
 /* Progressive disclosure: one small gear per group, and the dialog it opens. The
-   gear carries no text — the 320px head already holds the name, the count, the
-   loaded chip, the unload button and the bulk switch, and the state is the colour,
-   not a word. */
+   gear carries no text — the 320px head already holds the name, the deferral badge,
+   the count, the unload button and the bulk switch, so the badge says WHICH group
+   defers and the gear's colour says whether this one does. */
 .dsh-tools-panel-tool-groupDisclosure {
   display: inline-flex;
   flex: none;
@@ -1251,7 +1258,26 @@ window.__ModuleLoader__.load({
   outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
   outline-offset: 1px;
 }
-.dsh-tools-panel-tool-groupLoaded { color: var(--dsw-alias-state-success-primary, var(--dsw-alias-label-tertiary)); }
+/* The deferral badge on a group head. A pill, not plain meta text: it has to be
+   scannable down the list, because it is the only thing that tells a deferred group
+   from an ordinary one before anything is opened. Brand while the group is locked,
+   success-coloured once this conversation loaded it. The row is 320px wide, so the
+   badge stays 10px and never wraps; the name owns the remaining space and ellipsizes. */
+.dsh-tools-panel-tool-groupBadge {
+  flex: none;
+  padding: 0 5px;
+  border: .5px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-brand-primary);
+  font-size: 10px;
+  line-height: 15px;
+  white-space: nowrap;
+}
+.dsh-tools-panel-tool-groupBadgeLoaded {
+  color: var(--dsw-alias-state-success-primary, var(--dsw-alias-brand-primary));
+  border-color: currentColor;
+}
 /* The direct way back from a loaded group to a deferred one: the chip states the
    fact, this button acts on it. Rendered only while the group is loaded in this
    conversation, so it never competes with the controls that are always there. */
@@ -1452,7 +1478,7 @@ window.__ModuleLoader__.load({
      * The gear that opens a group's progressive-disclosure settings.
      *
      * An icon, not a label: the group head is 320px wide and already carries the
-     * name, the member count, the loaded chip and the bulk switch. The button's
+     * name, the deferral badge, the member count and the bulk switch. The button's
      * meaning lives in its `aria-label`/`title`, and its on/off state is the colour
      * — filled brand when the group is deferred, muted grey when it is not.
      */
@@ -1540,9 +1566,12 @@ window.__ModuleLoader__.load({
      * a deferred tool can still be denied, and a denied tool stays denied after it
      * is fetched.
      *
-     * A group that was FETCHED in this conversation shows two things the others do
-     * not: the "loaded" chip, and an `卸载` button beside it. The chip alone would
-     * state a fact the user cannot act on; the button is the direct way back to a
+     * Every deferred group carries a badge on its head — that is what makes the two
+     * kinds of group tellable apart without opening anything or hovering. While the
+     * group is still locked the badge names the mode (`渐进披露`); once this
+     * conversation FETCHED it, the same badge turns green and reads `渐进·已加载`.
+     * The loaded state also grows an `卸载` button beside it: the badge alone would
+     * state a fact the user cannot act on, and the button is the direct way back to a
      * locked group — one click on the row, without opening the editor dialog (the
      * dialog offers the same action). It only unloads THIS conversation: the group
      * definition, its switch and its description prompt are untouched.
@@ -1576,14 +1605,25 @@ window.__ModuleLoader__.load({
             '\u25B6'
           ),
           h('span', { className: 'dsh-tools-panel-tool-groupName', title: group.name }, group.name),
-          deferred && loaded === true
+          // The deferral badge: a deferred group must be recognizable at a glance,
+          // and the gear's colour alone was too quiet a signal. It is ONE badge with
+          // two readings — the mode while the group is still locked, and the loaded
+          // state once this conversation has fetched it (the unload button beside it
+          // is the action half of that reading).
+          deferred
             ? h(
                 'span',
                 {
-                  className: 'dsh-tools-panel-tool-groupMeta dsh-tools-panel-tool-groupLoaded',
-                  title: children?.loadedLabel
+                  className:
+                    loaded === true
+                      ? 'dsh-tools-panel-tool-groupBadge dsh-tools-panel-tool-groupBadgeLoaded'
+                      : 'dsh-tools-panel-tool-groupBadge',
+                  title:
+                    loaded === true
+                      ? `${children?.disclosureOnLabel} · ${children?.loadedLabel}`
+                      : children?.disclosureBadgeTitle
                 },
-                children?.loadedLabel
+                loaded === true ? children?.disclosureBadgeLoaded : children?.disclosureBadge
               )
             : null,
           deferred && loaded === true
@@ -2445,6 +2485,9 @@ window.__ModuleLoader__.load({
                                           disclosureLabel: t('disclosure'),
                                           disclosureOnLabel: t('disclosureOn'),
                                           disclosureOffLabel: t('disclosureOff'),
+                                          disclosureBadge: t('disclosureBadge'),
+                                          disclosureBadgeTitle: t('disclosureBadgeTitle'),
+                                          disclosureBadgeLoaded: t('disclosureBadgeLoaded'),
                                           loadedLabel: t('disclosureLoaded'),
                                           unloadLabel: t('disclosureUnload'),
                                           unloadTitle: t('disclosureUnloadTitle'),

@@ -1998,6 +1998,25 @@ try {
     failed: 'f',
     retry: 'r',
     pluginsLoading: 'pl',
+    // The progressive-disclosure copy, verbatim from the zh dictionary: the tests
+    // below assert on the badge and the dialog, so a placeholder here would assert
+    // on the key instead of the words a user reads.
+    disclosure: '渐进披露',
+    disclosureTitle: '渐进式披露',
+    disclosureOn: '已开启渐进式披露',
+    disclosureOff: '未开启渐进式披露',
+    disclosureLabel: '渐进式披露',
+    disclosurePrompt: '分组描述提示词',
+    disclosurePromptPlaceholder: '告诉模型这组工具是做什么的',
+    disclosureHint: '开启后，组内工具不再自动注入上下文。',
+    disclosureEmpty: '这个分组还没有成员，开启披露不会隐藏任何工具。',
+    disclosureBadge: '渐进披露',
+    disclosureBadgeTitle: '这个分组开启了渐进式披露：组内工具不在模型的上下文里，模型调用 get_tools 后才注入',
+    disclosureBadgeLoaded: '渐进·已加载',
+    disclosureLoaded: '本会话已加载',
+    disclosureUnload: '卸载',
+    disclosureUnloadTitle: '仅在本会话隐藏这组工具，分组定义不变',
+    disclosureSave: '保存',
     pluginsEmpty: 'pe',
     pluginsSearch: '搜索插件',
     pluginsNoMatch: '没有匹配的插件',
@@ -2464,6 +2483,7 @@ try {
       const button = byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')
       check('disclosure dialog: the group row carries the button', button.length === 1, String(button.length))
       check('disclosure dialog: it reads the stored switch', button[0].props['aria-pressed'] === false)
+      check('disclosure badge: a non-deferred group has no badge', byClass(currentTree, 'dsh-tools-panel-tool-groupBadge').length === 0)
       button[0].props.onClick()
       await pump(view)
       check('disclosure dialog: clicking opens it', byClass(currentTree, 'dsh-tools-panel-dialog').length === 1)
@@ -2483,6 +2503,16 @@ try {
       check(
         'disclosure dialog: the button reads as pressed',
         byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')[0]?.props['aria-pressed'] === true
+      )
+      // Turning it on must make the group recognizable on the row itself: a badge
+      // naming the mode, not a colour only the gear carries.
+      const badge = byClass(currentTree, 'dsh-tools-panel-tool-groupBadge')
+      check('disclosure badge: a deferred group is marked on its row', badge.length === 1, String(badge.length))
+      check('disclosure badge: it names the mode', textOf(badge[0]).join('') === '渐进披露', textOf(badge[0]).join(''))
+      check(
+        'disclosure badge: and it explains itself on hover',
+        typeof badge[0]?.props.title === 'string' && badge[0].props.title.includes('get_tools'),
+        String(badge[0]?.props.title)
       )
     } finally {
       globalThis.fetch = originalFetch
@@ -2519,10 +2549,16 @@ try {
       const view = render(comp, { t: tt, sessionId: 's1' })
       byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
       await pump(view)
+      const loadedBadge = byClass(currentTree, 'dsh-tools-panel-tool-groupBadge')
       check(
         'disclosure row: the fetched group is marked',
-        textOf(currentTree).some((text) => text.includes('本会话已加载')),
-        textOf(currentTree).slice(0, 6).join('|')
+        loadedBadge.length === 1 && textOf(loadedBadge[0]).join('') === '渐进·已加载',
+        textOf(loadedBadge[0] ?? {}).join('')
+      )
+      check(
+        'disclosure row: the loaded badge is the loaded reading',
+        loadedBadge[0]?.props?.className?.includes('dsh-tools-panel-tool-groupBadgeLoaded') === true,
+        String(loadedBadge[0]?.props?.className)
       )
       const unload = byClass(currentTree, 'dsh-tools-panel-tool-groupUnload')
       check('disclosure row: the loaded row offers a direct unload button', unload.length === 1, String(unload.length))
@@ -2562,6 +2598,14 @@ try {
         'disclosure row: unloading posts the group id for this session',
         JSON.stringify(hide) === JSON.stringify({ sessionId: 's1', hide: ['g1'] }),
         JSON.stringify(posts)
+      )
+      // Unloading must not drop the badge — the group is still deferred, so it goes
+      // back to the locked reading rather than losing its marker.
+      const relocked = byClass(currentTree, 'dsh-tools-panel-tool-groupBadge')
+      check(
+        'disclosure row: the unloaded row still carries the badge',
+        relocked.length === 1 && !String(relocked[0]?.props?.className).includes('BadgeLoaded'),
+        String(relocked[0]?.props?.className)
       )
       check(
         'disclosure row: the unloaded row stops announcing itself',
@@ -2607,6 +2651,13 @@ check(
   'client: the loaded group row unloads without opening the dialog',
   clientSource.includes('dsh-tools-panel-tool-groupUnload') && /onUnload/.test(clientSource)
 )
+// A deferred group has to be tellable apart on the row itself: a badge naming the
+// mode, plus the loaded reading of the same badge once this session fetched it.
+check(
+  'client: a deferred group carries a badge',
+  clientSource.includes('dsh-tools-panel-tool-groupBadge') && clientSource.includes("t('disclosureBadge')")
+)
+check('client: the loaded reading of that badge exists', clientSource.includes('dsh-tools-panel-tool-groupBadgeLoaded'))
 check(
   'client: the row and the dialog share one unload path',
   (clientSource.match(/onUnload: \(\) => unload\(/g) ?? []).length === 2,
