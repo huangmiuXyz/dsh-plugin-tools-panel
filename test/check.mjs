@@ -246,13 +246,13 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
   // The snapshot carries the groups, and it carries a COPY: a caller that mutates
   // the answer must not corrupt the live definitions the next request reads.
   setGroups([{ id: 'g1', name: 'bundle', members: ['read', 'write'] }])
-  const snap = snapshot('nobody')
+  const snap = await snapshot('nobody')
   check('groups: the snapshot carries them', snap.groups?.[0]?.name === 'bundle', JSON.stringify(snap.groups))
   snap.groups[0].members.push('bash')
   snap.groups[0].name = 'mutated'
   check('groups: the snapshot is a copy', getGroups()[0].name === 'bundle' && getGroups()[0].members.length === 2)
   setGroups([])
-  check('groups: clearing works', snapshot('nobody').groups.length === 0)
+  check('groups: clearing works', (await snapshot('nobody')).groups.length === 0)
 }
 
 // --- 3b. the model-facing group tool -----------------------------------------
@@ -1238,6 +1238,81 @@ try {
     await settle()
   }
   {
+    // WHICH list the menu shows: the MODEL-FACING catalog, not the registry view.
+    //
+    // This is the shipped bug's geometry, and it is NOT the `withoutTools` case
+    // above: there the scope view itself was empty, so a registry read already
+    // answered []. A preset like "空白模式" registers nothing else, but the
+    // process-wide rows its agents inherit stay REGISTERED and stay visible to
+    // `schemas(agent)`; only the assemble stage empties the catalog. The old code
+    // read `schemas(agent)`, so it offered live-looking switches for tools the
+    // model would never see and the guard would refuse.
+    host.extras.systemPrompt = { async assemble() { return { tools: [], sections: [] } } }
+    check(
+      'catalog: the registry still reports tools for that session',
+      host.tools.schemas({ id: 'root-a' }).length > 0,
+      host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name).join(',')
+    )
+    const blankLike = await (await get('root-a')).json()
+    check(
+      'catalog: a session whose assembly offers no tools lists none',
+      blankLike.state?.tools?.length === 0,
+      (blankLike.state?.tools ?? []).join(',')
+    )
+    // The rule is the CATALOG, not "hide everything when anything is missing": a
+    // preset that offers two of the registry's tools lists exactly those two.
+    host.extras.systemPrompt = { async assemble() { return { tools: [{ name: 'read' }, { name: 'bash' }], sections: [] } } }
+    const partial = await (await get('root-a')).json()
+    check(
+      'catalog: the list follows the assembled catalog',
+      JSON.stringify(partial.state?.tools) === '["bash","read"]',
+      JSON.stringify(partial.state?.tools)
+    )
+    // A denied name is still unioned in, so the switch that turned it off stays
+    // reachable from a session whose catalog no longer carries the tool.
+    await post({ sessionId: 'root-a', deny: ['write'] })
+    const deniedBack = await (await get('root-a')).json()
+    check(
+      'catalog: denied names are still listed',
+      JSON.stringify(deniedBack.state?.tools) === '["bash","read","write"]',
+      JSON.stringify(deniedBack.state?.tools)
+    )
+    await post({ sessionId: 'root-a', deny: [] })
+    // PTC: the wire catalog is the single `run_code` transport schema, so the
+    // per-tool list has to come from the registry instead of collapsing to one row.
+    host.extras.systemPrompt = { async assemble() { return { tools: [{ name: 'run_code' }], sections: [] } } }
+    const ptc = await (await get('root-a')).json()
+    check(
+      'catalog: PTC keeps the registry view',
+      (ptc.state?.tools ?? []).includes('edit') && !(ptc.state?.tools ?? []).includes('run_code'),
+      (ptc.state?.tools ?? []).join(',')
+    )
+    // Everything that cannot answer for the catalog keeps the registry view, which
+    // is exactly what this route returned before the change.
+    delete host.extras.systemPrompt
+    const registryOnly = await (await get('root-a')).json()
+    check(
+      'catalog: no systemPrompt service keeps the registry view',
+      (registryOnly.state?.tools ?? []).includes('edit'),
+      (registryOnly.state?.tools ?? []).join(',')
+    )
+    host.extras.systemPrompt = { async assemble() { throw new Error('assembly failed') } }
+    const failedRead = await (await get('root-a')).json()
+    check(
+      'catalog: a failed assembly keeps the registry view',
+      (failedRead.state?.tools ?? []).includes('edit'),
+      (failedRead.state?.tools ?? []).join(',')
+    )
+    host.extras.systemPrompt = { async assemble() { return { sections: [] } } }
+    const noToolsField = await (await get('root-a')).json()
+    check(
+      'catalog: an assembly without `tools` keeps the registry view',
+      (noToolsField.state?.tools ?? []).includes('edit'),
+      (noToolsField.state?.tools ?? []).join(',')
+    )
+    delete host.extras.systemPrompt
+  }
+  {
     // A PRESET scope is shared by every agent on that preset, and it outlives each
     // of them. Its entry used to be left behind forever after the agents were
     // disposed — one leaked entry per agent ever created, each re-read by `syncAll`
@@ -1597,14 +1672,14 @@ try {
   check('denySetFor: it is the live set, not a copy', denySetFor() === denySetFor())
   replaceToolDisabled(['write', 'bash'])
   check('denySetFor: it reports the global names', denySetFor().has('write') && denySetFor().has('bash'))
-  const snap = snapshot('c')
+  const snap = await snapshot('c')
   check('snapshot: names the asking session', snap.sessionId === 'c')
   check('snapshot: has no owning session', snap.ownerId === undefined)
   check('snapshot: has no inheritance flag', snap.inherited === undefined)
   check('snapshot: carries the protocol', snap.protocol === PROTOCOL)
   check('snapshot: reports the global list', JSON.stringify(snap.denied) === '["bash","write"]', JSON.stringify(snap.denied))
   replaceToolDisabled([])
-  check('snapshot: an empty set reports nothing denied', snapshot('free').denied.length === 0)
+  check('snapshot: an empty set reports nothing denied', (await snapshot('free')).denied.length === 0)
 }
 
 // --- 5a. the persisted tool set ----------------------------------------------

@@ -123,6 +123,11 @@ const HEADER = 'x-dsh-plugin-tools-panel'
  * shadowed by an empty same-name section in every live agent's scope. 9 made the
  * TOOL deny set global and durable: the snapshot lost `ownerId`/`inherited` and
  * gained a persisted `tools.json`, so a client must not assume a per-session list.
+ *
+ * 9 also changed WHERE the reported tool list comes from — the assembled catalog
+ * instead of the registry view. That is host-side behaviour with no wire field of
+ * its own: an older client already renders an empty list, so it did not need a new
+ * number (and did not deserve the restart a bump would force).
  */
 const PROTOCOL = 9
 
@@ -964,13 +969,26 @@ function promptRows(raw) {
   return rows
 }
 
-/** Assemble one agent's prompt sections, through the same context shape the loop uses. */
-async function assembleSections(host, agent, signal) {
+/**
+ * Assemble one agent's prompt AND tool catalog, through the same context shape the
+ * loop uses.
+ *
+ * `scope: agent` is what the waterfall's scope filter walks up from, so every
+ * listener the preset and this plugin registered sees the same assembly the next
+ * model step would get — including ones that drop tools after the registry has
+ * contributed them.
+ */
+async function assembleFor(host, agent, signal) {
   const systemPrompt = host?.systemPrompt
   if (systemPrompt === undefined || typeof systemPrompt.assemble !== 'function') {
     throw new PanelError(409, 'the systemPrompt service is unavailable in this deployment')
   }
-  const assembly = await systemPrompt.assemble({ agent, scope: agent, ...(signal === undefined ? {} : { signal }) })
+  return systemPrompt.assemble({ agent, scope: agent, ...(signal === undefined ? {} : { signal }) })
+}
+
+/** Assemble one agent's prompt sections, through the same context shape the loop uses. */
+async function assembleSections(host, agent, signal) {
+  const assembly = await assembleFor(host, agent, signal)
   return Array.isArray(assembly?.sections) ? assembly.sections : []
 }
 
@@ -1182,36 +1200,89 @@ function cleanDeny(value) {
   return names
 }
 
+/** The `run_code` transport schema a PTC step collapses the whole catalog into. */
+const RUN_CODE_NAME = 'run_code'
+
+/**
+ * The registry's view of one agent's tools.
+ *
+ * This is what `schemas(agent)` answers: the scope's inherited and own contributions
+ * after restrictions. It is NOT what the model receives — an assemble-time listener
+ * runs later and may still drop names — so it is only the fallback for the catalog
+ * read below.
+ */
+function registryToolNames(host, agent) {
+  const names = []
+  try {
+    for (const schema of host.tools.schemas(agent)) {
+      if (typeof schema?.name === 'string' && schema.name.length > 0) names.push(schema.name)
+    }
+  } catch {
+    /* a registry that cannot answer leaves the denied names below */
+  }
+  return names
+}
+
+/**
+ * The names in the MODEL-FACING catalog, or `undefined` when the assembly cannot
+ * answer for this session.
+ *
+ * `assembly.tools` is the exact list the loop hands to the request, AFTER every
+ * `system-prompt/assemble` listener has run. That is what the menu has to show,
+ * because the registry view is not the request: the blank preset's whole point is
+ * that its catalog is empty while the process-wide rows it inherits are still
+ * registered and still visible to `schemas()`. Reading the assembly is also what
+ * makes this tab follow every other assemble-time filter, not just this plugin's.
+ *
+ * PTC presentation collapses the catalog to the single `run_code` transport schema.
+ * In that mode the per-tool list is still the registry's (the request has nothing
+ * per-tool to filter, so the guard is the enforcement), so answering `run_code`
+ * alone would hide every switch the tab exists for.
+ */
+async function assembledToolNames(host, agent, signal) {
+  let assembly
+  try {
+    assembly = await assembleFor(host, agent, signal)
+  } catch {
+    return undefined
+  }
+  const tools = assembly?.tools
+  if (!Array.isArray(tools)) return undefined
+  const names = []
+  for (const schema of tools) {
+    if (typeof schema?.name === 'string' && schema.name.length > 0) names.push(schema.name)
+  }
+  if (names.length === 1 && names[0] === RUN_CODE_NAME) return undefined
+  return names
+}
+
 /**
  * Tool names the session can see, plus every name it has denied.
  *
- * `schemas(agent)` is the honest answer to "what can this conversation call", and
- * it is what makes the menu follow the real composition: a preset that mounts
- * fewer tools shows fewer rows, an MCP server that connects adds rows.
+ * THE LIST IS THE MODEL-FACING ONE, read from the assembled catalog. `schemas(agent)`
+ * is only the fallback — no `systemPrompt` service, an assembly that fails or does
+ * not carry `tools`, or the PTC collapse above — because the registry view is where
+ * this panel was wrong: under a preset that empties its catalog ("空白模式") the
+ * registry still holds the inherited rows, so the menu offered live-looking switches
+ * for tools the model would never see and the guard would refuse.
  *
  * The denied names are unioned in because hiding is exactly what removes them from
- * that answer — without the union the control could only ever switch tools OFF.
+ * that answer — without the union the control could only ever switch tools OFF. A
+ * denied name that is not in the catalog (or in the registry) is still listed: the
+ * user has to be able to turn it back on.
  *
- * NO FALLBACK TO THE GLOBAL VIEW. This used to fall back to `schemas()` when the
- * session had no live agent, and that was wrong in the one case it mattered most: a
- * tool-less preset ("空白模式") has no visible tools, so the menu listed all 51
- * process-wide tools — offering switches for tools that session can never call. An
- * empty answer is the truthful answer; the menu shows "no tools" instead of
- * inventing rows.
+ * NO FALLBACK TO THE GLOBAL VIEW. An empty answer is the truthful answer for a
+ * session that can call nothing; the menu shows "no tools" instead of inventing rows
+ * for every process-wide tool.
  * @param sessionId - the conversation's session.
- * @param host - `{ tools, agents }`.
+ * @param host - `{ tools, agents, systemPrompt }`.
+ * @param signal - bounds the assembly read; the registry fallback needs none.
  * @returns the sorted union of the session's visible tools and its denied names.
  */
-function toolsForSession(sessionId, host) {
-  const visible = []
-  const agent = host.agents?.get?.(sessionId)
-  if (agent !== undefined) {
-    try {
-      for (const schema of host.tools.schemas(agent)) visible.push(schema.name)
-    } catch {
-      /* a registry that cannot answer leaves the denied names below */
-    }
-  }
+async function toolsForSession(sessionId, host, signal) {
+  const agent = agentFor(host, sessionId)
+  const assembled = agent === undefined ? undefined : await assembledToolNames(host, agent, signal)
+  const visible = assembled ?? (agent === undefined ? [] : registryToolNames(host, agent))
   return [...new Set([...visible, ...denySetFor()])].sort()
 }
 
@@ -1245,12 +1316,17 @@ function maskedCount(sessionId, host) {
  * The deny list is GLOBAL, so `sessionId` no longer selects a policy — it only
  * selects which session's visible tool list is reported, so the menu still shows
  * exactly the tools that conversation can call.
+ *
+ * Async because that list is the assembled, model-facing catalog (one waterfall
+ * read per state request). `signal` bounds the read; a failure falls back to the
+ * registry view inside `toolsForSession` rather than failing the request.
  */
-function snapshot(sessionId, host) {
+async function snapshot(sessionId, host, signal) {
+  const tools = host === undefined ? [...denied].sort() : await toolsForSession(sessionId, host, signal)
   return {
     protocol: PROTOCOL,
     sessionId,
-    tools: host === undefined ? [...denied].sort() : toolsForSession(sessionId, host),
+    tools,
     denied: [...denied].sort(),
     // Diagnostics, not UI: how many denied names are really gone from the model's
     // schema list. The filter is process-wide now, so there is no per-agent scope
@@ -1292,7 +1368,16 @@ async function handleState(req, res, host) {
       sendJson(res, 400, { ok: false, error: 'missing sessionId query parameter' })
       return
     }
-    sendJson(res, 200, { ok: true, state: snapshot(sessionId, host) })
+    // The list in the answer comes from one assembly, so bound it: a hanging
+    // assemble must not leave the control on its loading line forever.
+    const { signal, done } = requestSignal()
+    try {
+      sendJson(res, 200, { ok: true, state: await snapshot(sessionId, host, signal) })
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+    } finally {
+      done()
+    }
     return
   }
   if (req.method !== 'POST') {
@@ -1353,7 +1438,16 @@ async function handleState(req, res, host) {
     // The deny list is global, so the edit applies to every live agent at once.
     setDeny(names)
   }
-  sendJson(res, 200, { ok: true, state: snapshot(sessionId, host) })
+  // The answer reports the state AFTER the write, which means re-reading the
+  // model-facing catalog; bound that read exactly like the GET above.
+  const { signal, done } = requestSignal()
+  try {
+    sendJson(res, 200, { ok: true, state: await snapshot(sessionId, host, signal) })
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: String(error?.message ?? error) })
+  } finally {
+    done()
+  }
 }
 
 /** A skill or section name as it may appear in a JSON body. */
