@@ -127,7 +127,17 @@ const {
   skillsFile,
   skillsState,
   togglePromptSection,
-  snapshot
+  snapshot,
+  GET_TOOLS,
+  INDEX_SECTION,
+  MAX_GROUP_PROMPT,
+  deferredGroups,
+  deferredIndexText,
+  deferredNamesFor,
+  normalizeGroupPrompt,
+  registerDeferredIndex,
+  unlockGroup,
+  unlockedFor
 } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 
 // The two halves are loaded independently (the bundle hot-reloads; the host half
@@ -242,6 +252,28 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
   check('groups: a non-array is refused', normalizeGroups({}) === undefined)
   check('groups: an absent value is "not sent"', normalizeGroups(undefined) === undefined)
   check('groups: the array is bounded', normalizeGroups(Array.from({ length: MAX_GROUPS + 1 }, () => ({ name: 'x' }))) === undefined)
+
+  // Progressive disclosure is opt-in PER GROUP, and only an exact `true` turns it on:
+  // a hand-edited file that says `"yes"` must not half-enable it.
+  const disclosed = normalizeGroups([
+    { name: 'plain', members: ['a'] },
+    { name: 'deferred', members: ['b'], disclosure: true, prompt: '  Git operations.  ' },
+    { name: 'loose', members: ['c'], disclosure: 'yes', prompt: 42 }
+  ])
+  check('disclosure: a group without it stays off', disclosed[0].disclosure === false && disclosed[0].prompt === '')
+  check('disclosure: an opted-in group keeps the flag', disclosed[1].disclosure === true)
+  check('disclosure: the prompt is trimmed', disclosed[1].prompt === 'Git operations.', disclosed[1].prompt)
+  check('disclosure: only an exact true turns it on', disclosed[2].disclosure === false)
+  check('disclosure: a non-string prompt is empty', disclosed[2].prompt === '')
+  check(
+    'disclosure: the prompt is bounded',
+    normalizeGroupPrompt('x'.repeat(MAX_GROUP_PROMPT + 50)).length === MAX_GROUP_PROMPT
+  )
+  check(
+    'disclosure: control characters cannot break the index line',
+    normalizeGroupPrompt('a\u0000b') === 'a b',
+    JSON.stringify(normalizeGroupPrompt('a\u0000b'))
+  )
 
   // The snapshot carries the groups, and it carries a COPY: a caller that mutates
   // the answer must not corrupt the live definitions the next request reads.
@@ -523,6 +555,9 @@ function fakeHost() {
 
   const modelView = new Map()
 
+  /** Every tool this plugin registered process-wide (the `get_tools` mouth). */
+  const registered = []
+
   /** The scope-less `system-prompt/assemble` listeners, in registration order. */
   const assembleListeners = []
 
@@ -643,6 +678,17 @@ function fakeHost() {
     __registerLocal(name) {
       LOCAL_TOOLS.push(name)
       emit('tools/change')
+    },
+    /**
+     * Register a tool the way `ctx.tools.register` does: process-wide, with an exact
+     * disposer. `get_tools` is registered through here while any group defers.
+     */
+    register(definition) {
+      registered.push(definition)
+      return () => {
+        const at = registered.indexOf(definition)
+        if (at >= 0) registered.splice(at, 1)
+      }
     }
   }
 
@@ -764,7 +810,7 @@ function fakeHost() {
     inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
     effect: (fn) => fn()
   }
-  return { agents, assembleListeners, ctx, extras, guards, live, refresh, routes, server, tools }
+  return { agents, assembleListeners, ctx, extras, guards, live, refresh, registered, registeredFor, routes, server, tools }
 }
 
 // The module-level set is shared with `apply`, so clear it before wiring the fake
@@ -1339,6 +1385,138 @@ try {
       `${whileLive} while live -> ${afterDisposal} after disposal, baseline ${baseline}`
     )
     await settle()
+  }
+  {
+    // --- progressive disclosure (protocol 10) --------------------------------
+    // A group can opt in to being DEFERRED: its members leave the model-facing catalog
+    // until THIS session loads them, and the only trace is one index line plus the
+    // `get_tools` mouth. The seam is the same assembly filter the deny set uses, so the
+    // layer a tool lives in stops mattering — including agent-local tools, which
+    // `restrict()` could never mask.
+    const MEMBERS = ['read', 'edit']
+    // A real deployment always has the `systemPrompt` service, and the feature is built
+    // on it: the catalog read and the schema filter both live there. The catalog tests
+    // above deliberately ran without it, so re-install one that executes the REAL
+    // assembly listeners for this block.
+    host.extras.systemPrompt = {
+      async assemble({ agent } = {}) {
+        const assembly = {
+          tools: host.registeredFor(agent?.id).map((name) => ({ name })),
+          sections: []
+        }
+        let result = assembly
+        for (const listener of host.assembleListeners) {
+          result = await listener(result, { scope: agent }, () => Promise.resolve(result))
+        }
+        return result
+      }
+    }
+    const deferred = await (
+      await post({
+        sessionId: 'root-a',
+        groups: [{ id: 'g-defer', name: 'Editors', members: MEMBERS, disclosure: true, prompt: 'Editing files.' }]
+      })
+    ).json()
+    check(
+      'disclosure: the group keeps its fields',
+      deferred.state?.groups?.[0]?.disclosure === true && deferred.state?.groups?.[0]?.prompt === 'Editing files.',
+      JSON.stringify(deferred.state?.groups?.[0])
+    )
+    await settle()
+    check(
+      'disclosure: a locked group leaves the model-facing catalog',
+      !host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read'),
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).join(',')
+    )
+    check(
+      'disclosure: the panel still lists the members',
+      (deferred.state?.tools ?? []).includes('read') && (deferred.state?.deferred ?? []).includes('read'),
+      JSON.stringify(deferred.state?.deferred)
+    )
+    // Disclosure is context economy, NOT policy: the guard does not refuse the name.
+    check(
+      'disclosure: a deferred tool is not denied',
+      host.guards[0]({ name: 'read', agent: host.agents.get('root-a') }) === undefined,
+      String(host.guards[0]({ name: 'read', agent: host.agents.get('root-a') }))
+    )
+    const index = deferredIndexText('root-a')
+    check('disclosure: the index names the group and its prompt', index.includes('Editors') && index.includes('Editing files.'), index)
+    check('disclosure: the index never lists member names', !index.includes('read') && !index.includes('edit'), index)
+    check('disclosure: the index says how many tools', index.includes('(2 tools)'), index)
+
+    const mouth = host.registered.find((definition) => definition.name === GET_TOOLS)
+    check('disclosure: get_tools exists once a group defers', mouth !== undefined)
+    const catalogue = await mouth.execute({}, { agent: host.agents.get('root-a') })
+    check('disclosure: the catalogue names the group', catalogue.message.includes('Editors (2 tools)'), catalogue.message)
+    const load = await mouth.execute({ group: 'Editors' }, { agent: host.agents.get('root-a') })
+    check('disclosure: loading reports what landed', /loaded: 2 tools injected/.test(load.message), load.message)
+    check(
+      'disclosure: the answer carries no schema',
+      !JSON.stringify(load).includes('parameters') && !JSON.stringify(load).includes('description'),
+      JSON.stringify(load)
+    )
+    await settle()
+    check(
+      'disclosure: the load puts the members back',
+      MEMBERS.every((name) => host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes(name))
+    )
+    check('disclosure: the index is gone once loaded', deferredIndexText('root-a') === '', deferredIndexText('root-a'))
+    check('disclosure: the session reports the unlock', unlockedFor('root-a').has('g-defer'))
+    // Per conversation: another session is untouched by this load.
+    check('disclosure: another session stays locked', deferredNamesFor('root-b').has('read'))
+    // And a subagent inherits its parent's load, so delegating is not a way to get the
+    // tools back.
+    host.agents.spawn('child-d', 'root-a')
+    check('disclosure: a child inherits the parent load', !deferredNamesFor('child-d').has('read'))
+    // The manual counterpart of `get_tools`: lock it again for this session only.
+    await post({ sessionId: 'root-a', hide: ['g-defer'] })
+    await settle()
+    check('disclosure: hide locks the group again', deferredNamesFor('root-a').has('read'))
+    check('disclosure: the index comes back', deferredIndexText('root-a').includes('Editors'))
+    // `hide` is validated like every other body field.
+    const badHide = await post({ sessionId: 'root-a', hide: 'g-defer' })
+    check('disclosure: a non-array hide is a 400', badHide.status === 400, String(badHide.status))
+    // Switching disclosure off drops the mouth and lists the tools normally again.
+    await post({ sessionId: 'root-a', groups: [{ id: 'g-defer', name: 'Editors', members: MEMBERS }] })
+    await settle()
+    check('disclosure: switching it off drops get_tools', host.registered.every((definition) => definition.name !== GET_TOOLS))
+    check(
+      'disclosure: and the tools are listed normally',
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
+    )
+    check('disclosure: with no index left', deferredIndexText('root-a') === '')
+    check('disclosure: deferredGroups is empty again', deferredGroups().length === 0)
+  }
+  {
+    // The index SECTION is what the model actually reads, so it is registered as a real
+    // prompt section whose text is a per-session function. A string would freeze one
+    // session's locked set into every conversation's prompt.
+    const captured = []
+    const scope = {
+      get: (name) => (name === 'systemPrompt' ? { section: (definition) => { captured.push(definition); return () => {} } } : undefined),
+      effect: (fn) => fn()
+    }
+    setGroups([{ id: 'g-sec', name: 'Sec', members: ['read'], disclosure: true, prompt: 'Indexed.' }])
+    registerDeferredIndex(scope)
+    const section = captured[0]
+    check('disclosure: the index is registered as a section', section?.name === INDEX_SECTION, String(section?.name))
+    check('disclosure: the index stays literal', section?.interpolate === false)
+    check(
+      'disclosure: the index text is per session',
+      typeof section?.text === 'function' && section.text({ scope: { id: 'fresh' } }).includes('Sec'),
+      String(typeof section?.text)
+    )
+    // The same registration must answer differently per conversation: loading a group
+    // is session state, and a string-valued section would freeze one session's answer
+    // into every prompt.
+    unlockGroup('nobody', 'g-sec')
+    check(
+      'disclosure: and empty for a session that loaded it',
+      section.text({ scope: { id: 'nobody' } }) === '',
+      section.text({ scope: { id: 'nobody' } })
+    )
+    check('disclosure: while another session still sees it', section.text({ scope: { id: 'fresh' } }).includes('Sec'))
+    setGroups([])
   }
 } finally {
   await new Promise((resolve) => host.server.close(resolve))

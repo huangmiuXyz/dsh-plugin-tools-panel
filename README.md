@@ -73,6 +73,39 @@ or tell the user what you need.
 这是刻意和技能、提示词两个 tab 对齐的——三个 tab 用的是同一种开关，就不该有三种不同的
 生命周期。旧版本是"仅本会话、只在内存、重启全开"的紧急刹车，那个语义已经去掉。
 
+### 渐进式披露（协议 10）
+
+一组工具可以**选择被延后**：给它写一句"这组是干什么的"，开了披露之后，组内工具的 schema
+不再随每一步发给模型（和"禁用"走同一个 `system-prompt/assemble` 过滤，所以**注册在哪一层
+都无所谓**），只在系统提示词里留一行索引。模型需要时调用 `get_tools`，这组工具从**下一步**
+起出现在工具列表里。
+
+- 索引段落名 `tools-panel:deferred-tools`，`text` 是**每次装配求值的函数**，所以每个会话只看
+  到自己还没加载的组。内容是：组名 + 你写的描述提示词 + 成员数，**不列工具名**。
+- 只要存在至少一个这样的组，就自动注册工具 `get_tools`（没有披露组时它不存在）。不带参数先
+  列目录；带 `group`（组名或 id）就是**加载**这组。
+- `get_tools` 的返回**只有一句确认**，不带任何工具名、说明或参数 schema：工具本身下一步就会
+  带着真实 schema 出现在工具列表里，在这里再抄一遍等于让模型读两遍 schema。
+- **加载是本会话的、只在内存**：新会话或重启 DSH 都回到未加载；子 agent 通过委派树**继承**
+  父会话已加载的组，所以"派个子 agent 去拿"不会绕过披露。
+- **手动卸载**：加载过的组在组行上多一个「卸载」按钮，点一下就把这组重新隐藏；弹窗里也有同一
+  个动作。它只改本会话的已加载集合，**不动分组定义**，组仍处于披露状态、模型以后还能再加载。
+- **披露不是权限**：被延后的工具只是"没被广告"，并没有被禁用，guard 不会拒绝它，面板里它照旧
+  有自己的开关。禁用与披露叠加时互不覆盖：被禁用的工具加载后仍然是禁用状态。
+- 定义（含 `disclosure` 与描述提示词）照旧写进 `groups.json`，跨会话保留。
+- **模型也能配置**：`manage_tool_groups` 的 `set_disclosure` 动作（`group` + `disclosure` 和/或
+  `prompt`，两者都可省略一个）改的就是弹窗里同样两个字段，写入即生效。
+
+模型看到的索引大概长这样：
+
+```
+## Deferred tool groups
+The tools of the groups below are not loaded in this conversation, so they are not in your tool list yet.
+Call `get_tools` with a group name or id to load that group: the tools are injected into your tool list
+from the next step on, with their own descriptions and parameter schemas, ...
+- Git：用于 Git 操作，查看状态、提交、分支管理。 (4 tools)
+```
+
 ### 技能
 
 清单是当前会话能用的技能（`ctx.skills.snapshot({ cwd, scope: agent })`），一行一个，开关就是
@@ -131,6 +164,9 @@ localStorage）。不可开关的行会写明原因：宿主基础设施（`mana
 三个 tab 的语义现在是一致的：都是"这个环境里我不要什么"，都写盘、都重启还在。区别只在
 禁用的对象——工具按名字、技能按名字、提示词段落按名字。
 
+**例外是渐进披露的"已加载"**：它记的是"这个会话的模型已经取了这组工具"，属于会话事实，
+所以按会话存在内存里、重启或新会话即失效（见上文）。
+
 ## 界面细节
 
 触发按钮在输入框工具条右侧（`conversation.input.right`），**只有图标**——那一行还要放模型
@@ -165,34 +201,41 @@ tab 时才跑；技能/提示词 tab 在第一次变成活动 tab 时读一次�
 ### 版本错配会明说
 
 两个半边各自声明 `PROTOCOL`。快照里带 `protocol`，客户端发现对不上就不显示清单，直接说
-"宿主端还是旧版本，请重启 DSH"；宿主收到既没有 `deny` 也没有 `groups` 的请求返回 `409`。
-改字段名或状态形状时**两边一起加一**，自检里有一条断言盯着这个数字是否一致。当前：`8`。
+"宿主端还是旧版本，请重启 DSH"；宿主收到既没有 `deny`、也没有 `groups`、也没有 `hide` 的请求
+返回 `409`。改字段名或状态形状时**两边一起加一**，自检里有一条断言盯着这个数字是否一致。
+当前：`10`。
 
 ## 接口
 
 `GET /dsh-plugin-tools-panel/state?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 9, "sessionId": "…",
-  "tools": ["bash", "…"],          // 本会话可见（含已禁用），已排序
+  "protocol": 10, "sessionId": "…",
+  "tools": ["bash", "…"],          // 本会话可见（含已禁用、已披露隐藏），已排序
   "denied": ["write"],             // 全局生效的禁用集合（写盘，重启还在）
-  "groups": [{ "id": "g1", "name": "编辑", "members": ["write", "edit"] }],
-  "scopes": 4,                     // 挂了限制的 agent 作用域数
-  "masked": 1,                     // 真的从模型视图里消失的禁用名个数
+  "groups": [{
+    "id": "g1", "name": "编辑", "members": ["write", "edit"],
+    "disclosure": true,            // 该组是否启用渐进式披露
+    "prompt": "用于改文件…"         // 注入系统提示词的分组描述提示词
+  }],
+  "deferred": ["bash"],            // 本会话被披露隐藏、尚未加载的工具名
+  "unlocked": ["g1"],              // 本会话已加载的组 id（会话级，不落盘）
+  "masked": 1,                     // 真的从注册表视图里消失的禁用名个数
   "blocked": 0, "last": null       // guard 兜底计数与最后一次拦截
 }}
 ```
 
-`POST` body 为 `{ sessionId, deny?: string[], groups?: { id?, name, members }[] }`，**整表替换**，
-两个字段可同时写。必须带 `x-dsh-plugin-tools-panel` 请求头——跨源页面可以不带预检地发简单
-请求，要求自定义头才逼出预检、让浏览器拦下它。`deny` 非数组 → `400`；两个字段都没有 → `409`。
+`POST` body 为 `{ sessionId, deny?: string[], groups?: { id?, name, members, disclosure?, prompt? }[], hide?: string[] }`，
+**整表替换**，各字段可同时写。`hide` 是本会话的「卸载」：把列出的组 id 从已加载集合里去掉。
+必须带 `x-dsh-plugin-tools-panel` 请求头——跨源页面可以不带预检地发简单请求，要求自定义头才逼出
+预检、让浏览器拦下它。`deny` / `hide` 非数组 → `400`；三个字段都没有 → `409`。
 
 ### 技能与提示词接口（协议 8）
 
 `GET /dsh-plugin-tools-panel/skills?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 9, "sessionId": "…", "available": true, "complete": true,
+  "protocol": 10, "sessionId": "…", "available": true, "complete": true,
   "skills": [{
     "name": "blender-modeling", "description": "…", "provider": "fs", "source": "user",
     "path": "/home/…/SKILL.md",        // 真实文件路径；没有它就没有可写的开关
@@ -210,7 +253,7 @@ frontmatter 没闭合 → `409`。必须带同一个请求头。
 `GET /dsh-plugin-tools-panel/prompts?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 9, "sessionId": "…", "available": true, "disabled": ["workspace"],
+  "protocol": 10, "sessionId": "…", "available": true, "disabled": ["workspace"],
   "sections": [{
     "name": "identity", "text": "…（≤4000 字，超出截断）", "chars": 128,
     "truncated": false, "enabled": true, "present": true, "liveChars": 128,
@@ -237,9 +280,9 @@ JSON 就能定位的证据，界面上不显示。
 node test/check.mjs
 ```
 
-373 条断言，覆盖：清单与 patch、两个半边都不引入外部包（`node:` 内置模块除外，本包用
+422 条断言，覆盖：清单与 patch、两个半边都不引入外部包（`node:` 内置模块除外，本包用
 `link:` 安装）、逐工具判定、全局禁用集合的规范化与落盘（含重启后仍生效）、分组规范化与落盘、请求体清洗、真实 `node:http` 服务器跑
-通的整条链路（缺头 403、`deny` 非数组 400、两字段全无 409、未知工具名不炸整份限制、晚注册
+通的整条链路（缺头 403、`deny` / `hide` 非数组 400、三字段全无 409、未知工具名不炸整份限制、晚注册
 工具也会被隐藏），以及用**伪 React 渲染器**跑通的界面：一个触发器、四个 tab、tab 记忆、
 四个 tab 都保持挂载、插件 Remote 调用、过滤未安装运行时、插件搜索与空结果、收藏置顶持久化、
 没有插件管理器时面板仍然打开、技能行与开关（文件型与运行时型走同一条作用域影子）、技能关掉后
@@ -251,8 +294,14 @@ node test/check.mjs
 未闭合拒绝）、禁用集合的规范化与落盘、服务缺席与会话未启动时的回答，以及 `409` 失败后
 **磁盘与内存都不留下**一个假开关。
 
-其中 `layers:` 一组是上面那个 bug 的回归测试：伪宿主把工具分到**预设层**和**全局层**两层
-（和真实宿主一致），断言禁用预设工具时它真的从该 agent 的可见列表里消失、掩码确实施在了
-预设层、且只施一次、放开后两层都恢复。
+渐进式披露单独一组：组字段的规范化与提示词边界、装配后目录里真的少了这些 schema、面板仍保留
+它们的行、索引段落的逐会话文本（组名 + 描述 + 成员数，**不含工具名**）、`get_tools` 的目录/加载/
+重复加载、加载后工具重新可见、加载是**会话级**（另一个会话仍锁着、子 agent 继承父会话的加载）、
+手动卸载（`hide`）后索引与隐藏都回来、关闭披露后 `get_tools` 注销，以及索引段落是**函数**
+（同一注册对不同会话给出不同答案）而不是一段冻结的字符串。
+
+其中 `layers:` 一组是上面那个 bug 的回归测试：伪宿主把工具分到**预设层**、**agent 本层**和
+**全局层**，断言禁用这三处的工具时它们都从该 agent 的可见列表里消失——包括 `restrict()` 当年
+永远遮不住的本层工具。
 
 测试把 `DSH_HOME` 指向临时目录再导入模块，绝不碰真实 profile；跑完删掉。
