@@ -79,15 +79,6 @@ const clientSource = fs.readFileSync(path.join(PKG, 'src', 'client.js'), 'utf8')
 const hostImports = [...hostSource.matchAll(/^\s*import\s[^\n]*?from\s+'([^']+)'/gm)].map((m) => m[1])
 const hostPackages = hostImports.filter((name) => !name.startsWith('node:'))
 check('host half: imports no package', hostPackages.length === 0, hostPackages.join(', ') || hostImports.join(', '))
-// Cordis throws `cannot get property "X" without inject` on a PROPERTY access to a
-// service this context did not declare; `get()` is exempt. A property read here once
-// crashed the whole activate — no guard, no routes, the panel answering 404 — so the
-// shape is pinned: optional services are read through `get` only.
-check(
-  'host half: reads optional services through get()',
-  !/\b(?:ctx|scope|target)\??\.(?:systemPrompt|skills|workingDirectory)\b(?!\s*:)/.test(hostSource),
-  'property access throws without inject'
-)
 const clientImports = [...clientSource.matchAll(/require\('([^']+)'\)/g)].map((m) => m[1])
 check(
   'client half: only react require() calls',
@@ -104,11 +95,14 @@ const {
   ROUTE,
   cleanDeny,
   denySetFor,
+  getToolBlocked,
+  getToolDisabled,
+  getToolLast,
+  loadTools,
   makeGuard,
-  ownerOf,
-  parents,
-  policies,
-  policyFor,
+  replaceToolDisabled,
+  saveTools,
+  toolsFile,
   MAX_GROUPS,
   MAX_PROMPTS,
   MAX_SECTION_TEXT,
@@ -133,18 +127,7 @@ const {
   skillsFile,
   skillsState,
   togglePromptSection,
-  snapshot,
-  GET_TOOLS,
-  MAX_GROUP_PROMPT,
-  createDeferredTools,
-  deferredIndexText,
-  deferredNamesFor,
-  hiddenSetFor,
-  lockedGroupsFor,
-  normalizeGroupPrompt,
-  replaceGroups,
-  unlockGroup,
-  unlockedFor
+  snapshot
 } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 
 // The two halves are loaded independently (the bundle hot-reloads; the host half
@@ -175,13 +158,6 @@ check(
 )
 
 {
-  // A policy record as the host stores it.
-  const record = (deny = [], extra = {}) => ({
-    deny: new Set(deny),
-    blocked: 0,
-    last: undefined,
-    ...extra
-  })
   const call = (name, sessionId) => ({
     name,
     callId: 'call-1',
@@ -189,80 +165,53 @@ check(
     signal: new AbortController().signal,
     ...(sessionId === undefined ? {} : { agent: { id: sessionId } })
   })
-  const freshPolicies = (entries = {}) =>
-    new Map(Object.entries(entries).map(([id, patch]) => [id, record(patch)]))
-  const freshTree = (entries = {}) => new Map(Object.entries(entries))
 
-  const table = freshPolicies()
-  const guard = makeGuard(table, freshTree())
+  // The set is global: the guard reads the live module-level set, so a test drives it
+  // through the same replace helper the route uses.
+  replaceToolDisabled([])
+  const guard = makeGuard()
   check('guard: allows everything while nothing is denied', guard(call('write', 's1')) === undefined)
-  table.set('s1', record(['write']))
+  replaceToolDisabled(['write'])
   const reason = guard(call('write', 's1'))
   check('guard: denies a denied tool', typeof reason === 'string', String(reason))
   check('guard: denial names the tool', reason.includes('"write"'), reason)
   check('guard: denial uses the requested wording', reason.includes('此操作已被用户实时禁用'), reason)
   check('guard: denial tells the model not to retry', reason.includes('Do not retry'), reason)
-  check('guard: counts the denial', table.get('s1').blocked === 1, String(table.get('s1').blocked))
-  check('guard: records the last denial with its session', table.get('s1').last?.tool === 'write')
-  // PER-TOOL is the whole point: one name denied says nothing about any other name,
-  // including names that used to live in the same group as it.
+  check('guard: counts the denial', getToolBlocked() === 1, String(getToolBlocked()))
+  check('guard: records the last denial with its session', getToolLast()?.tool === 'write')
+
+  // PER-TOOL is the whole point: one name denied says nothing about any other name.
   check('guard: denying one write tool leaves another allowed', guard(call('edit', 's1')) === undefined)
   check('guard: and leaves bash allowed', guard(call('bash', 's1')) === undefined)
-  table.set('s1', record(['bash']))
+  replaceToolDisabled(['bash'])
   check('guard: the denied name is the only one refused', guard(call('write', 's1')) === undefined)
   check('guard: and it is still refused', typeof guard(call('bash', 's1')) === 'string')
   // Any name at all can be denied — the registry decides what exists, not this list.
-  table.set('s1', record(['mcp__github__create_issue']))
+  replaceToolDisabled(['mcp__github__create_issue'])
   check('guard: an MCP tool is deniable by name', typeof guard(call('mcp__github__create_issue', 's1')) === 'string')
-  table.delete('s1')
+  replaceToolDisabled([])
   check('guard: allows again as soon as the list is empty', guard(call('bash', 's1')) === undefined)
 
-  // Scoping: restricting one session must not touch another.
-  const scoped = freshPolicies()
-  const scopedGuard = makeGuard(scoped, freshTree())
-  scoped.set('s1', record(['write']))
-  check('scope: the restricted session is denied', typeof scopedGuard(call('write', 's1')) === 'string')
-  check('scope: an unrelated session is untouched', scopedGuard(call('write', 's2')) === undefined)
-  scoped.set('s2', record(['read']))
-  check(
-    'scope: each session keeps its own list',
-    scopedGuard(call('read', 's1')) === undefined && typeof scopedGuard(call('read', 's2')) === 'string'
-  )
+  // GLOBAL scope: the same denial governs every session, including one that did not
+  // exist when the switch was written. There is no per-session list any more.
+  replaceToolDisabled(['write'])
+  check('scope: one session is denied', typeof guard(call('write', 's1')) === 'string')
+  check('scope: an unrelated session is denied too', typeof guard(call('write', 's2')) === 'string')
+  check('scope: a session created later is denied', typeof guard(call('write', 'brand-new')) === 'string')
+  check('scope: and other names stay allowed everywhere', guard(call('read', 's2')) === undefined)
 
-  // Inheritance: a restriction reaches what the session spawned, however deep, and
-  // whether or not the child existed when the list was written.
-  const tree = freshTree({ child: 'root', grand: 'child' })
-  const inherited = freshPolicies()
-  const inheritGuard = makeGuard(inherited, tree)
-  check('inherit: an unrestricted tree allows everything', inheritGuard(call('write', 'grand')) === undefined)
-  inherited.set('root', record(['write']))
-  check('inherit: the root is denied', typeof inheritGuard(call('write', 'root')) === 'string')
-  check('inherit: the child inherits', typeof inheritGuard(call('write', 'child')) === 'string')
-  check('inherit: the grandchild inherits', typeof inheritGuard(call('write', 'grand')) === 'string')
-  check('inherit: the inherited denial leaves other names alone', inheritGuard(call('edit', 'grand')) === undefined)
-  inherited.delete('root')
-  check('inherit: releasing the root releases the grandchild', inheritGuard(call('write', 'grand')) === undefined)
+  // An agentless call is governed as well: there is no session dimension to exempt.
+  check('scope: an agentless call is governed by the global set', typeof guard(call('write', undefined)) === 'string')
+  replaceToolDisabled([])
 
-  // A child may hold its own list; the NEAREST one wins.
-  const nearest = freshPolicies()
-  const nearestGuard = makeGuard(nearest, freshTree({ child: 'root' }))
-  nearest.set('root', record(['read']))
-  check('inherit: the child sees the parent list', typeof nearestGuard(call('read', 'child')) === 'string')
-  nearest.set('child', record(['bash']))
-  check("inherit: the child's own list wins over the parent's", nearestGuard(call('read', 'child')) === undefined)
-  check("inherit: and the child's own restriction applies", typeof nearestGuard(call('bash', 'child')) === 'string')
-  check('inherit: the parent keeps its own list', typeof nearestGuard(call('read', 'root')) === 'string')
-
-  // Out of scope: no agent, no policy, nothing to deny for.
-  const empty = freshPolicies()
-  check('scope: an agentless call is not governed', makeGuard(empty, freshTree())(call('write', undefined)) === undefined)
-
-  // A cycle would hang the guard, which runs synchronously inside the pipeline.
-  const cyclic = freshPolicies()
-  const cycleGuard = makeGuard(cyclic, freshTree({ a: 'b', b: 'a' }))
-  check('safety: a parent cycle terminates', cycleGuard(call('write', 'a')) === undefined)
-  cyclic.set('a', record(['write']))
-  check('safety: a parent cycle still resolves the restriction', typeof cycleGuard(call('write', 'a')) === 'string')
+  // The guard must read the LIVE set, not one captured at construction: a switch
+  // flipped after the guard was registered has to take effect immediately.
+  const liveGuard = makeGuard()
+  check('live: a freshly built guard allows', liveGuard(call('write', 's1')) === undefined)
+  replaceToolDisabled(['write'])
+  check('live: a later switch is seen by the existing guard', typeof liveGuard(call('write', 's1')) === 'string')
+  replaceToolDisabled([])
+  check('live: releasing is seen by the existing guard', liveGuard(call('write', 's1')) === undefined)
 }
 
 // --- 3. request validation ----------------------------------------------------
@@ -294,43 +243,16 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
   check('groups: an absent value is "not sent"', normalizeGroups(undefined) === undefined)
   check('groups: the array is bounded', normalizeGroups(Array.from({ length: MAX_GROUPS + 1 }, () => ({ name: 'x' }))) === undefined)
 
-  // Progressive-disclosure fields: opt-in, typed, trimmed and bounded. The prompt
-  // goes into the model's system prompt, so a hostile or sloppy value must not
-  // survive into it.
-  const disclosed = normalizeGroups([
-    { name: 'git', members: ['a'], disclosure: true, prompt: '  Git stuff  ' },
-    { name: 'plain', members: ['b'], disclosure: 'yes', prompt: 42 }
-  ])
-  check('groups: disclosure is kept', disclosed[0].disclosure === true, JSON.stringify(disclosed[0]))
-  check('groups: anything but true reads as off', disclosed[1].disclosure === false)
-  check('groups: the prompt is trimmed', disclosed[0].prompt === 'Git stuff', disclosed[0].prompt)
-  check('groups: a non-string prompt is empty', disclosed[1].prompt === '')
-  check(
-    'groups: the prompt is bounded',
-    normalizeGroupPrompt('x'.repeat(MAX_GROUP_PROMPT + 50)).length === MAX_GROUP_PROMPT
-  )
-  check('groups: control characters are stripped', !normalizeGroupPrompt('a\u0000b\u0007c').includes('\u0000'))
-
   // The snapshot carries the groups, and it carries a COPY: a caller that mutates
   // the answer must not corrupt the live definitions the next request reads.
   setGroups([{ id: 'g1', name: 'bundle', members: ['read', 'write'] }])
-  const snap = snapshot('nobody')
+  const snap = await snapshot('nobody')
   check('groups: the snapshot carries them', snap.groups?.[0]?.name === 'bundle', JSON.stringify(snap.groups))
   snap.groups[0].members.push('bash')
   snap.groups[0].name = 'mutated'
   check('groups: the snapshot is a copy', getGroups()[0].name === 'bundle' && getGroups()[0].members.length === 2)
-  // The index is a `- ` list: a name or prompt carrying a newline must not end its
-  // own bullet and turn the rest of the prompt into free text for the model.
-  setGroups([
-    { id: 'g-multi', name: 'multi\nline', members: ['a', 'b'], disclosure: true, prompt: 'first\nsecond' }
-  ])
-  const indexText = deferredIndexText('nobody')
-  check('index: one bullet per group', (indexText.match(/^- /gm) ?? []).length === 1, indexText)
-  check('index: a newline in the prompt is collapsed', !indexText.includes('\nsecond'), indexText)
-  check('index: a newline in the name is collapsed', !indexText.includes('\nline'), indexText)
-
   setGroups([])
-  check('groups: clearing works', snapshot('nobody').groups.length === 0)
+  check('groups: clearing works', (await snapshot('nobody')).groups.length === 0)
 }
 
 // --- 3b. the model-facing group tool -----------------------------------------
@@ -397,22 +319,6 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
     check('agent tool: create dedupes members', JSON.stringify(answer.groups[0]?.members) === '["bash","edit"]', JSON.stringify(answer.groups[0]?.members))
     check('agent tool: create persists through replaceGroups', getGroups()[0]?.name === 'Git')
     check('agent tool: create reports the count', answer.groups[0]?.memberCount === 2, String(answer.groups[0]?.memberCount))
-  }
-  {
-    const answer = await call({ action: 'set_disclosure', group: 'Git', disclosure: true, prompt: '  Git operations  ' })
-    check('agent tool: set_disclosure flips the switch', answer.groups[0]?.disclosure === true, JSON.stringify(answer.groups[0]))
-    check('agent tool: set_disclosure stores the trimmed prompt', answer.groups[0]?.prompt === 'Git operations', String(answer.groups[0]?.prompt))
-    const stored = getGroups()[0]
-    check('agent tool: set_disclosure persists both fields', stored?.disclosure === true && stored?.prompt === 'Git operations', JSON.stringify(stored))
-    const off = await call({ action: 'set_disclosure', group: 'Git', disclosure: false })
-    check('agent tool: set_disclosure can turn it off and keep the prompt', off.groups[0]?.disclosure === false && off.groups[0]?.prompt === 'Git operations', JSON.stringify(off.groups[0]))
-    let refused
-    try {
-      await call({ action: 'set_disclosure', group: 'Git' })
-    } catch (failure) {
-      refused = String(failure?.message ?? failure)
-    }
-    check('agent tool: set_disclosure with neither field is refused', typeof refused === 'string' && refused.includes('needs'), String(refused))
   }
   {
     const before = await call({ action: 'list' })
@@ -540,8 +446,6 @@ check('deny: an empty array is a valid "allow everything"', JSON.stringify(clean
  */
 function fakeHost() {
   const guards = []
-  /** Every tool this host's registry currently holds — the plugin's own rows. */
-  const registered = []
   const routes = new Map()
   const listeners = new Map()
   const live = []
@@ -562,13 +466,16 @@ function fakeHost() {
    */
   const PRESET_TOOLS = ['read', 'write', 'edit', 'bash', 'grep', 'todo_write', 'mcp__github__search']
   const GLOBAL_TOOLS = ['working_directory', 'cordis_inspect_list', 'cordis_inspect_call']
-  /** Which names are currently hidden per agent id — what `restrict()` changed. */
-  const hidden = new Map()
-  /** Which names are hidden per PRESET name — the layer above the agent. */
+  /**
+   * Names registered in an AGENT'S OWN layer, which `restrict()` refuses.
+   *
+   * The real registry derives `restrictableNames` from inherited contributions and
+   * excludes the scope's own registrations, so these are exactly the names the panel
+   * can never hide — it must fall back to the guard and must not re-probe them.
+   */
+  const LOCAL_TOOLS = []
   /** Agents whose preset mounts no tools: a scope view with nothing in it. */
   const noTools = new Set()
-  /** Every restriction call, in order, so the checks can read what was applied. */
-  const restrictCalls = []
   /**
    * Every preset ever minted, keyed by preset NAME so agents on the same preset
    * share one layer. `hidden` is the preset's own mask and `ctx` is the scope
@@ -593,35 +500,88 @@ function fakeHost() {
   }
 
   /**
-   * The model-facing shape of one fake tool.
+   * What the MODEL currently sees, per agent, computed by the plugin's own listeners.
    *
-   * Descriptions and parameters are present on purpose: they are what must NOT leak
-   * into a `get_tools` answer (the unlocked tools carry them in the tool list
-   * instead), so a stripped fake would let a leaking answer pass.
+   * The assembly waterfall is ASYNC, so the fake cannot answer `schemas()` by running
+   * it on demand. Instead the real listeners are drained ahead of time into this
+   * cache, and `schemas()` stays synchronous. Every assertion in this file runs after
+   * a route round-trip or an explicit `settle()`, both of which call `refresh()`.
+   *
+   * Running the plugin's actual listeners (rather than re-implementing "everything
+   * minus the deny set") is what keeps the fake a harness: a filter deleted from the
+   * plugin has to show up as a test failure, not be papered over by the mirror.
    */
-  const schemaOf = (name) => ({
-    name,
-    description: `${name} does something.`,
-    parameters: { type: 'object', additionalProperties: false, properties: { path: { type: 'string' } } }
-  })
+  /**
+   * The section names the fake's global prompt layer registers.
+   *
+   * The prompt filter removes names from `assembly.sections`; without a non-empty
+   * section list there would be nothing to remove and the prompt assertions would
+   * pass vacuously. The prompt-route tests install a richer `systemPrompt` service,
+   * but the FILTER only needs the name list, so this stays a plain array.
+   */
+  const promptSections = ['identity', 'rules', 'style']
 
-  /** The names visible to one agent: both layers, minus what is masked on either. */
-  function visibleFor(agentId, preset) {
+  const modelView = new Map()
+
+  /** The scope-less `system-prompt/assemble` listeners, in registration order. */
+  const assembleListeners = []
+
+  /** Names registered for one agent, before any plugin filter runs. */
+  function registeredFor(agentId) {
     if (noTools.has(agentId)) return []
-    const shared = presets.get(preset)
-    const gone = new Set([...(hidden.get(agentId) ?? []), ...(shared?.hidden ?? [])])
-    return [...GLOBAL_TOOLS, ...PRESET_TOOLS].filter((name) => !gone.has(name))
+    return [...GLOBAL_TOOLS, ...PRESET_TOOLS, ...LOCAL_TOOLS]
   }
 
   /**
-   * Fire `tools/change`, the way the real registry does on every registration,
-   * restriction, and restriction disposal. Emission is what makes the panel's
-   * deferred re-apply pass run at all — and what turns a wanted set derived from
-   * the live view into an endless clear/re-apply cycle.
+   * Run the real waterfall for one agent and cache what comes out.
+   *
+   * Mirrors the host: each listener gets `(assembly, context, next)` and may return a
+   * replacement; the outermost value wins. Sections are included so the prompt
+   * filter is exercised through the same path, which is why one drain serves both.
    */
-  function announceToolChange() {
-    for (const listener of listeners.get('tools/change') ?? []) listener()
+  async function refresh() {
+    for (const agent of live) {
+      const names = registeredFor(agent.id)
+      const assembly = {
+        tools: names.map((name) => ({ name })),
+        sections: promptSections.map((name) => ({ name, text: `text of ${name}` }))
+      }
+      let result = assembly
+      for (const listener of assembleListeners) {
+        // `next()` must hand each listener what the previous one produced, which is
+        // what the host's `waterfall` does with its shifting callback list.
+        result = await listener(result, { scope: agent }, () => Promise.resolve(result))
+      }
+      modelView.set(agent.id, {
+        tools: (result.tools ?? assembly.tools).map((schema) => schema.name),
+        sections: (result.sections ?? assembly.sections).map((section) => section.name)
+      })
+    }
   }
+
+  /**
+   * The names one agent can CALL, as the model ends up seeing them.
+   *
+   * Falls back to the unfiltered registry list when no drain has happened yet, so a
+   * caller that reads before the first `refresh()` still gets a sane answer.
+   */
+  function visibleFor(agentId) {
+    const cached = modelView.get(agentId)
+    if (cached !== undefined) return cached.tools
+    return registeredFor(agentId)
+  }
+
+  /**
+   * Fire one registry event, the way the real service's `ctx.emit` does.
+   *
+   * `restrict()` uses this on apply and on dispose, so the fake reproduces the
+   * notification that turns a self-filtering deny list into a feedback loop.
+   * @param name - the event name.
+   */
+  function emit(name) {
+    for (const listener of listeners.get(name) ?? []) listener()
+  }
+
 
   /** The `tools` service, scoped when it belongs to one agent's context. */
   const tools = {
@@ -630,22 +590,6 @@ function fakeHost() {
       return () => {
         const index = guards.indexOf(fn)
         if (index >= 0) guards.splice(index, 1)
-      }
-    },
-    /**
-     * Register a tool, returning its exact disposer.
-     *
-     * Mirrors the real contract: a registration announces `tools/change`, and the
-     * disposer unregisters it and announces again. `get_tools` is mounted and
-     * unmounted at runtime, so the fake has to model both directions.
-     */
-    register(definition) {
-      registered.push(definition)
-      announceToolChange()
-      return () => {
-        const at = registered.indexOf(definition)
-        if (at >= 0) registered.splice(at, 1)
-        announceToolChange()
       }
     },
     /**
@@ -664,9 +608,9 @@ function fakeHost() {
      * this session can call, whatever the reason it cannot call anything.
      */
     schemas(scope) {
-      if (scope === undefined) return GLOBAL_TOOLS.map(schemaOf)
+      if (scope === undefined) return GLOBAL_TOOLS.map((name) => ({ name }))
       const agent = live.find((entry) => entry.id === scope.id)
-      return visibleFor(scope.id, agent?.preset).map(schemaOf)
+      return visibleFor(scope.id, agent?.preset).map((name) => ({ name }))
     },
     /**
      * Test-only: register a tool later and fire `tools/change`, the way a real
@@ -676,15 +620,29 @@ function fakeHost() {
      */
     __register(name) {
       PRESET_TOOLS.push(name)
-      announceToolChange()
+      for (const listener of listeners.get('tools/change') ?? []) listener()
     },
     /**
-     * Test-only: emit `tools/change` without changing anything. This is the event a
-     * `restrict()` (and its disposer) emits, so it is what re-enters the panel's
-     * deferred re-apply pass.
+     * Test-only: fire `tools/change` without changing anything, the way any unrelated
+     * registry mutation does. The convergence check re-fires it to prove the panel
+     * reaches a fixed point instead of answering every notification with a
+     * tear-down/re-apply pair.
      */
-    __change() {
-      announceToolChange()
+    __notify() {
+      emit('tools/change')
+    },
+    /**
+     * Test-only: a name in the agent's OWN layer, which `restrict()` can never mask.
+     *
+     * The real registry resolves `restrictableNames` from INHERITED contributions
+     * only, so a scope's own registrations fail the call with "unknown global tool".
+     * The fake models that by rejecting names that are not in the inherited tables —
+     * registering one here is how the "don't re-probe a permanent failure" path gets
+     * exercised.
+     */
+    __registerLocal(name) {
+      LOCAL_TOOLS.push(name)
+      emit('tools/change')
     }
   }
 
@@ -706,67 +664,26 @@ function fakeHost() {
   function makeAgent(id, preset = 'standard') {
     let shared = presets.get(preset)
     if (shared === undefined) {
-      shared = { presetId: `${preset}-${nextPresetId++}`, hidden: new Set() }
+      shared = { presetId: `${preset}-${nextPresetId++}` }
       presets.set(preset, shared)
     }
-    const presetId = shared.presetId
-    const scopedTools = {
-      guard: tools.guard,
-      /** Restrict the names THIS agent can see — its own layer's mask. */
-      restrict(filter) {
-        const names = filter?.deny ?? []
-        if (names.length === 0) throw new Error('empty restriction')
-        for (const name of names) {
-          if (!GLOBAL_TOOLS.includes(name) && !PRESET_TOOLS.includes(name)) {
-            throw new Error(`unknown global tool: ${name}`)
-          }
-        }
-        restrictCalls.push({ id, names, layer: 'agent' })
-        const applied = new Set(hidden.get(id) ?? [])
-        for (const name of names) applied.add(name)
-        hidden.set(id, applied)
-        // The real contract emits on the way in; the panel's `schemas()` read after
-        // this point no longer contains these names.
-        announceToolChange()
-        return () => {
-          const set = new Set(hidden.get(id) ?? [])
-          for (const name of names) set.delete(name)
-          hidden.set(id, set)
-          announceToolChange()
-        }
-      },
-      schemas: (scope) => tools.schemas(scope ?? { id })
-    }
-    /** The same contract one layer up, masking the PRESET's own registrations. */
-    const presetTools = {
-      guard: tools.guard,
-      restrict(filter) {
-        const names = filter?.deny ?? []
-        if (names.length === 0) throw new Error('empty restriction')
-        for (const name of names) {
-          if (!PRESET_TOOLS.includes(name)) throw new Error(`unknown global tool: ${name}`)
-        }
-        restrictCalls.push({ id: presetId, names, layer: 'preset' })
-        // The mask belongs to the PRESET, not to this agent: every agent sharing the
-        // preset sees the same layer, so a second agent must not get its own copy.
-        for (const name of names) shared.hidden.add(name)
-        announceToolChange()
-        return () => {
-          for (const name of names) shared.hidden.delete(name)
-          announceToolChange()
-        }
-      },
-      schemas: (scope) => tools.schemas(scope ?? { id })
-    }
     const agent = { id, preset }
-    agent.presetId = presetId
+    agent.presetId = shared.presetId
     agent.ctx = {
       // `fiber.uid` is the scope's identity and `fiber.parent` is the enclosing
-      // CONTEXT — the documented Cordis shape, which is what the plugin walks.
+      // CONTEXT — the documented Cordis shape. The tool filter no longer walks this
+      // chain (it is registered once, without a scope), but the prompt and skill
+      // shadows still mount per agent, so the scope has to be a real mount point.
       fiber: { uid: id, parent: undefined },
       plugin(definition) {
         const fiberCtx = {
-          tools: scopedTools,
+          tools: {
+            guard: tools.guard,
+            // No `restrict()`: the mechanism is gone. Leaving it out is deliberate —
+            // if the plugin ever called it again, this fake would fail loudly instead
+            // of silently accepting the call.
+            schemas: (argument) => tools.schemas(argument ?? { id })
+          },
           // Resolved per CALL: the prompt-shadow plugin is mounted when this agent
           // appears, while the fake `systemPrompt` service is installed later by the
           // prompt-section test. A promise-of-a-service would make the mount order
@@ -796,31 +713,9 @@ function fakeHost() {
           on: () => () => {}
         }
         definition.apply?.(fiberCtx)
-        return {
-          dispose() {
-            hidden.delete(id)
-          }
-        }
-      }
-    }
-    // The preset scope above it. `fiber.parent` is the link the plugin's walk follows.
-    // Shared per preset: a second agent on the same preset points at the SAME object,
-    // so the plugin's "already mounted" check has a real second agent to dedupe.
-    const presetCtx = shared.ctx ?? {
-      fiber: { uid: presetId, parent: undefined },
-      plugin(definition) {
-        const fiberCtx = {
-          tools: presetTools,
-          effect: (fn) => fn(),
-          get: () => undefined,
-          on: () => () => {}
-        }
-        definition.apply?.(fiberCtx)
         return { dispose() {} }
       }
     }
-    shared.ctx = presetCtx
-    agent.ctx.fiber.parent = presetCtx
     return agent
   }
 
@@ -857,6 +752,9 @@ function fakeHost() {
       const list = listeners.get(name) ?? []
       list.push(listener)
       listeners.set(name, list)
+      // The plugin registers its schema filter this way. Capturing it here is what
+      // lets `schemas()` run the REAL filter instead of a hand-copied mirror.
+      if (name === 'system-prompt/assemble') assembleListeners.push(listener)
       return () => {
         const at = list.indexOf(listener)
         if (at >= 0) list.splice(at, 1)
@@ -866,19 +764,27 @@ function fakeHost() {
     inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
     effect: (fn) => fn()
   }
-  return { agents, ctx, extras, guards, registered, hidden, live, routes, restrictCalls, server, tools }
+  return { agents, assembleListeners, ctx, extras, guards, live, refresh, routes, server, tools }
 }
 
-// The module-level tables are shared with `apply`, so clear them before wiring the
-// fake host; the assertions below read them directly.
-policies.clear()
-parents.clear()
+// The module-level set is shared with `apply`, so clear it before wiring the fake
+// host; the assertions below read it directly.
+replaceToolDisabled([])
 
 const host = fakeHost()
 const { apply } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 apply(host.ctx)
-/** Let the deferred `tools/change` re-apply run. */
-const settle = () => new Promise((resolve) => setTimeout(resolve, 5))
+/**
+ * Let deferred work land, then re-drain the real assembly listeners.
+ *
+ * Two things need waiting on: the plugin's own microtasks, and the
+ * `system-prompt/assemble` listeners whose result `schemas()` reports. Draining here
+ * is what keeps every `schemas()` read after a route call meaningful.
+ */
+const settle = async () => {
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  await host.refresh()
+}
 check('apply: registers exactly one guard', host.guards.length === 1, String(host.guards.length))
 check('apply: registers the control route', host.routes.has(ROUTE), ROUTE)
 
@@ -886,12 +792,22 @@ await new Promise((resolve) => host.server.listen(0, '127.0.0.1', resolve))
 const base = `http://127.0.0.1:${host.server.address().port}`
 const get = (sessionId) =>
   fetch(sessionId === undefined ? `${base}${ROUTE}` : `${base}${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
-const post = (body, withHeader = true) =>
-  fetch(`${base}${ROUTE}`, {
+/**
+ * POST the control route, then re-drain the assembly listeners.
+ *
+ * The drain is part of the helper on purpose: every `schemas()` assertion after a
+ * switch is a question about what the model would see NEXT, and the answer only
+ * exists once the plugin's listeners have run again.
+ */
+const post = async (body, withHeader = true) => {
+  const answer = await fetch(`${base}${ROUTE}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(withHeader ? { [HEADER]: '1' } : {}) },
     body: JSON.stringify(body)
   })
+  await host.refresh()
+  return answer
+}
 
 try {
   // Two independent sessions, plus a delegated child and grandchild under the first.
@@ -902,9 +818,6 @@ try {
   host.agents.spawn('root-b', undefined, 'other')
   host.agents.spawn('child-a', 'root-a')
   host.agents.spawn('grand-a', 'child-a')
-  check('tree: the child link was recorded', parents.get('child-a') === 'root-a', String(parents.get('child-a')))
-  check('tree: the grandchild link was recorded', parents.get('grand-a') === 'child-a', String(parents.get('grand-a')))
-  check('tree: a top-level session has no link', !parents.has('root-a'))
 
   {
     const answer = await get('root-a')
@@ -913,7 +826,6 @@ try {
     check('route: GET starts with nothing denied', Array.isArray(payload.state?.denied) && payload.state.denied.length === 0)
     check('route: the snapshot advertises its protocol', payload.state?.protocol === PROTOCOL, String(payload.state?.protocol))
     check('route: the snapshot names the session', payload.state?.sessionId === 'root-a')
-    check('route: a fresh session is not inherited', payload.state?.inherited === false)
     // THE feature: the list is read from the registry, not hard-coded.
     check(
       'route: the tool list comes from the registry',
@@ -997,26 +909,26 @@ try {
     check('live: another name is untouched', guard({ name: 'edit', agent: { id: 'root-a' } }) === undefined)
   }
   {
-    // THE scoping promise, over the wire: a second session is unaffected.
+    // GLOBAL scope over the wire: a switch written from one session governs every
+    // session, including a sibling and a descendant that never touched the panel.
+    // That is the deliberate change from the old per-session panic switch.
     const payload = await (await get('root-b')).json()
-    check('live: another session is untouched', payload.state?.denied?.length === 0)
+    check('live: another session reports the same list', payload.state?.denied?.[0] === 'write', JSON.stringify(payload.state?.denied))
     check(
-      'live: and its visible tools are whole',
-      host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('write')
+      'live: and its visible tools are masked too',
+      !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('write')
     )
   }
   {
-    // Inheritance over the wire: the child and grandchild follow the root, which is
-    // what stops "delegate it to a subagent" being a way around the switch.
+    // Every agent in the profile is covered, descendants included: delegation is not
+    // a way around the switch.
     const guard = host.guards[0]
-    check('live: the child inherits the denial', typeof guard({ name: 'write', agent: { id: 'child-a' } }) === 'string')
-    check('live: the grandchild inherits the denial', typeof guard({ name: 'write', agent: { id: 'grand-a' } }) === 'string')
+    check('live: the child is denied', typeof guard({ name: 'write', agent: { id: 'child-a' } }) === 'string')
+    check('live: the grandchild is denied', typeof guard({ name: 'write', agent: { id: 'grand-a' } }) === 'string')
     const payload = await (await get('grand-a')).json()
-    check('live: an inheriting session reports its owner', payload.state?.ownerId === 'root-a', String(payload.state?.ownerId))
-    check('live: and is flagged as inherited', payload.state?.inherited === true)
-    check('live: the inherited list is what it reports', payload.state?.denied?.[0] === 'write')
-    // The hide reaches the descendants too: a subagent is not a way around the
-    // switch, so its own scope is masked as well.
+    check('live: a descendant reports the same global list', payload.state?.denied?.[0] === 'write')
+    check('live: and carries no owner, because the list is not per-session', payload.state?.ownerId === undefined)
+    check('live: and is not flagged as inherited', payload.state?.inherited === undefined)
     check(
       'live: the child cannot even see the denied tool',
       !host.tools.schemas({ id: 'child-a' }).map((s) => s.name).includes('write')
@@ -1052,24 +964,13 @@ try {
       !seen.includes('working_directory'),
       seen.join(',')
     )
-    // The mask must actually have been applied on the PRESET layer, not only read
-    // as an agent-scope restriction. This is the assertion that fails on the old
-    // single-mount code: without it the preset rows simply stay visible.
-    const presetCalls = host.restrictCalls.filter((call) => call.layer === 'preset')
-    check(
-      'layers: the restriction reached the preset layer',
-      presetCalls.some((call) => call.names.includes('bash')),
-      JSON.stringify(presetCalls.map((call) => call.names))
-    )
-    // The preset layer is mounted ONCE for the whole preset, however many agents
-    // use it — a second agent must not produce a second mask. The count is bounded
-    // by the number of preset layers, not by the number of agents.
-    const presetLayers = presetCalls.map((call) => call.id)
-    check(
-      'layers: the preset layer is masked once, not per agent',
-      new Set(presetLayers).size <= 1,
-      `${new Set(presetLayers).size} layer(s) for ${host.live.length} agent(s)`
-    )
+    // The MECHANISM that used to be asserted here — "the restriction reached the
+    // preset layer", "each preset layer is masked exactly once" — is gone with
+    // `restrict()`. There are no per-scope restrictions to count any more: one
+    // process-wide filter removes the name wherever it was registered, so a preset
+    // row and an agent-local row are handled identically. What still has to hold is
+    // the OUTCOME, which the checks above and below assert: the name is not in the
+    // list the model sees, and the untouched names still are.
     check(
       'layers: the other preset tools stay visible',
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
@@ -1087,164 +988,40 @@ try {
     )
   }
   {
-    // THE oscillation. `restrict()` hides a tool by REMOVING it from `schemas()`,
-    // and it emits `tools/change` — the very event that schedules the panel's next
-    // re-apply pass. A wanted set filtered against that live view therefore reads
-    // its own mask as "this tool is gone", clears it, re-exposes the tool, and
-    // re-applies on the next tick, forever: the model sees a tool list that grows
-    // and shrinks between rounds. The fake now emits on the way in AND out of a
-    // restriction, so this block runs the loop instead of a single pass.
-    const applied = await (await post({ sessionId: 'root-a', deny: ['read', 'bash'] })).json()
-    check('stability: the switch takes effect at once', applied.state?.denied?.length === 2)
-    const calls = host.restrictCalls.length
+    // THE oscillation regression, kept as a guard against reintroducing it.
+    //
+    // The old implementation asked `schemas()` — the POST-restriction view — which
+    // tool names it should deny. Its own action removed names from that view, so the
+    // next pass computed a different answer, the signature changed, the restriction
+    // was lifted, the names returned, and `restrict()`/its disposer each emitted
+    // `tools/change` and started it again. Every tool flipped off and on about once
+    // a tick per mounted scope, which the user saw as the tool list being repeatedly
+    // removed and re-added.
+    //
+    // The replacement cannot express that loop: the filter reads the deny set and
+    // writes nothing, so it has no feedback path. The check below pins the OUTCOME —
+    // stability across repeated notifications — so a future change that starts
+    // mutating during assembly fails here instead of in the UI.
+    await (await post({ sessionId: 'root-a', deny: ['bash', 'grep'] })).json()
+    await settle()
+    const snapshotAfterSet = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
     for (let round = 0; round < 3; round += 1) {
-      // Each of these is the event a re-apply would emit, plus the event a clear
-      // would emit: enough rounds that an oscillation cannot hide behind parity.
-      host.tools.__change()
+      host.tools.__notify()
       await settle()
     }
-    const names = host.tools.schemas({ id: 'root-a' }).map((s) => s.name)
-    check('stability: a pass does not clear its own mask', !names.includes('read') && !names.includes('bash'), names.join(','))
+    const snapshotAfterNoise = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
     check(
-      'stability: and does not re-apply an unchanged set',
-      host.restrictCalls.length === calls,
-      `${host.restrictCalls.length - calls} extra restrict() call(s)`
+      'convergence: the visible list is stable across repeated tools/change',
+      snapshotAfterNoise.join(',') === snapshotAfterSet.join(','),
+      `${snapshotAfterSet.length} -> ${snapshotAfterNoise.length} names`
     )
-    await post({ sessionId: 'root-a', deny: [] })
+    check(
+      'convergence: and the denied tools stay hidden throughout',
+      !snapshotAfterNoise.includes('bash') && !snapshotAfterNoise.includes('grep'),
+      snapshotAfterNoise.join(',')
+    )
+    await (await post({ sessionId: 'root-a', deny: [] })).json()
     await settle()
-    check(
-      'stability: releasing still lifts the mask for good',
-      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
-    )
-  }
-  // --- progressive disclosure over the wire ------------------------------------
-  {
-    // A deferred group: its members must leave the model's schema list, stay in the
-    // PANEL's list, and come back once `get_tools` loads them for this session.
-    // Members come from the GLOBAL layer on purpose: `root-b` sits on its own preset,
-    // so the global tools are the ones it can see and the ones `restrict()` can mask.
-    const MEMBER_A = 'working_directory'
-    const MEMBER_B = 'cordis_inspect_list'
-    replaceGroups([
-      {
-        id: 'g-deferred',
-        name: 'Git',
-        members: [MEMBER_A, MEMBER_B],
-        disclosure: true,
-        prompt: 'Git operations: status, commits, branches.'
-      }
-    ])
-    await settle()
-    check('disclosure: get_tools is mounted while a group defers', host.registered.length === 1, String(host.registered.length))
-    check('disclosure: it is named get_tools', host.registered[0]?.name === GET_TOOLS, String(host.registered[0]?.name))
-    const before = host.tools.schemas({ id: 'root-b' }).map((s) => s.name)
-    check('disclosure: a deferred tool is hidden from the session', !before.includes(MEMBER_A), before.join(','))
-    check('disclosure: and its sibling is hidden too', !before.includes(MEMBER_B), before.join(','))
-    check('disclosure: an unrelated tool stays visible', before.includes('cordis_inspect_call'), before.join(','))
-
-    const snapshotB = (await (await get('root-b')).json()).state
-    check(
-      'disclosure: the snapshot reports the deferred names',
-      JSON.stringify([...(snapshotB?.deferred ?? [])].sort()) === JSON.stringify([MEMBER_A, MEMBER_B].sort()),
-      JSON.stringify(snapshotB?.deferred)
-    )
-    check(
-      'disclosure: the panel still lists the hidden tools',
-      snapshotB?.tools?.includes(MEMBER_A),
-      (snapshotB?.tools ?? []).join(',')
-    )
-    check('disclosure: nothing is unlocked yet', (snapshotB?.unlocked ?? []).length === 0)
-    check(
-      'disclosure: the snapshot carries the group fields',
-      snapshotB?.groups?.[0]?.disclosure === true &&
-        snapshotB?.groups?.[0]?.prompt === 'Git operations: status, commits, branches.',
-      JSON.stringify(snapshotB?.groups?.[0])
-    )
-
-    const index = deferredIndexText('root-b')
-    check('disclosure: the index names the group', index.includes('Git'), index)
-    check('disclosure: the index carries the description prompt', index.includes('Git operations'), index)
-    check(
-      'disclosure: the index does not list tool names',
-      !index.includes(MEMBER_A) && !index.includes(MEMBER_B),
-      index
-    )
-
-    const catalogue = await host.registered[0].execute({}, { agent: { id: 'root-b' } })
-    check('disclosure: a catalogue call names the groups', catalogue.message.includes('Git (2 tools)'), catalogue.message)
-    check(
-      'disclosure: and carries no tool detail',
-      catalogue.groups.every((group) => group.tools === undefined),
-      JSON.stringify(catalogue.groups)
-    )
-
-    const answer = await host.registered[0].execute({ group: 'Git' }, { agent: { id: 'root-b' } })
-    check('disclosure: get_tools answers the group', answer.groups?.[0]?.name === 'Git', String(answer.groups?.[0]?.name))
-    // THE CONTRACT: a load returns a confirmation only. The schemas arrive with the
-    // tools themselves on the next step, so nothing here may copy them.
-    check(
-      'disclosure: the answer carries no tool list and no schemas',
-      answer.groups[0].tools === undefined && !JSON.stringify(answer).includes('parameters'),
-      JSON.stringify(answer)
-    )
-    const rendered = host.registered[0].output.render({ group: 'Git' }, answer)
-    const renderedText = rendered.map((part) => part.text ?? '').join('\n')
-    check('disclosure: the render is the confirmation sentence', renderedText === answer.message, renderedText)
-    check(
-      'disclosure: and says the tools are injected',
-      /injected/.test(answer.message) && /next step/.test(answer.message),
-      answer.message
-    )
-    check(
-      'disclosure: with the group unlocked',
-      answer.groups[0].unlocked === true,
-      JSON.stringify(answer.groups[0])
-    )
-    await settle()
-    const after = host.tools.schemas({ id: 'root-b' }).map((s) => s.name)
-    check(
-      'disclosure: the load unhides the group',
-      after.includes(MEMBER_A) && after.includes(MEMBER_B),
-      after.join(',')
-    )
-    check('disclosure: the index disappears once loaded', deferredIndexText('root-b') === '', deferredIndexText('root-b'))
-    check(
-      'disclosure: the session reports the unlock',
-      (await (await get('root-b')).json()).state?.unlocked?.includes('g-deferred') === true
-    )
-    // Session-scoped: the sibling conversation still cannot see those tools.
-    check(
-      'disclosure: another session keeps them hidden',
-      !host.tools.schemas({ id: 'child-a' }).map((s) => s.name).includes(MEMBER_A)
-    )
-    // Loading a second time is a no-op that says so, and still returns no schemas.
-    const again = await host.registered[0].execute({ group: 'git' }, { agent: { id: 'root-b' } })
-    check(
-      'disclosure: a second load reports it was already loaded',
-      again.message.includes('already loaded') && !JSON.stringify(again).includes('parameters'),
-      again.message
-    )
-
-    // The manual way back: relock for this session only.
-    const relocked = await (await post({ sessionId: 'root-b', hide: ['g-deferred'] })).json()
-    await settle()
-    check(
-      'disclosure: hide relocks the session',
-      !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes(MEMBER_A)
-    )
-    check('disclosure: and the snapshot says so', (relocked.state?.unlocked ?? []).length === 0)
-    check('disclosure: the index is back', deferredIndexText('root-b').includes('Git'))
-
-    // Turning the feature off must undo both halves: the unmask and the tool.
-    replaceGroups([{ id: 'g-deferred', name: 'Git', members: [MEMBER_A, MEMBER_B], disclosure: false }])
-    await settle()
-    check('disclosure: turning it off unregisters get_tools', host.registered.length === 0, String(host.registered.length))
-    check(
-      'disclosure: and the tools are whole again',
-      host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes(MEMBER_A)
-    )
-    check('disclosure: the index is gone', deferredIndexText('root-b') === '')
-    replaceGroups([])
   }
   {
     // Editing from the child edits the ROOT: releasing there must release the whole
@@ -1269,8 +1046,9 @@ try {
     for (const name of ['write', 'edit', 'grep', 'todo_write']) {
       check(`live: ${name} is still allowed`, guard({ name, agent: { id: 'root-a' } }) === undefined)
     }
-    // Read stays denied for the session's descendants but never leaks to a sibling.
-    check('live: the sibling session may still read', guard({ name: 'read', agent: { id: 'root-b' } }) === undefined)
+    // The list is global, so a name denied here is denied for every session —
+    // siblings included. That is the deliberate difference from the old model.
+    check('live: the sibling session is denied too', typeof guard({ name: 'read', agent: { id: 'root-b' } }) === 'string')
   }
   {
     // A name that is NOT a global registry tool cannot be masked by `restrict()`
@@ -1287,11 +1065,10 @@ try {
     await post({ sessionId: 'root-b', deny: [] })
   }
   {
-    // An empty list drops the policy entry entirely, so a session returns to "no
-    // policy" rather than carrying an empty record it does not need.
+    // An empty list means "nothing denied anywhere", not an empty record per session.
     await post({ sessionId: 'root-a', deny: [] })
-    check('route: an empty list drops the policy entry', !policies.has('root-a'))
-    check('live: and the descendants are released', host.guards[0]({ name: 'read', agent: { id: 'grand-a' } }) === undefined)
+    check('route: an empty list clears the global set', getToolDisabled().length === 0, JSON.stringify(getToolDisabled()))
+    check('live: and every session is released', host.guards[0]({ name: 'read', agent: { id: 'grand-a' } }) === undefined)
     check(
       'restrict: and the scope is unmasked again',
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read')
@@ -1299,14 +1076,20 @@ try {
   }
   {
     // Counters are diagnostics: they prove the guard ran, and they survive the round
-    // trip. Re-established here because dropping a policy drops its counters too.
+    // trip. They are global now, alongside the set they describe.
     await post({ sessionId: 'root-a', deny: ['read'] })
     const guard = host.guards[0]
     guard({ name: 'read', agent: { id: 'root-a' } })
     guard({ name: 'read', agent: { id: 'root-a' } })
     const payload = await (await get('root-a')).json()
-    check('route: the counter survives the round trip', payload.state?.blocked === 2, String(payload.state?.blocked))
-    check('route: the last denial names its tool', payload.state?.last?.tool === 'read')
+    // The counter is global and monotonic: it counts every refusal this process has
+    // made, so the assertion is "it moved by two", not "it equals two".
+    const before = payload.state.blocked
+    guard({ name: 'read', agent: { id: 'root-a' } })
+    guard({ name: 'read', agent: { id: 'root-a' } })
+    const after = await (await get('root-a')).json()
+    check('route: the counter survives the round trip', after.state.blocked === before + 2, `${before} -> ${after.state.blocked}`)
+    check('route: the last denial names its tool', after.state?.last?.tool === 'read')
     await post({ sessionId: 'root-a', deny: [] })
   }
   {
@@ -1385,28 +1168,176 @@ try {
       'tools/change: the late tool is hidden once it registers',
       !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('mcp__late__tool')
     )
+    // The set is global, so the late tool is masked for EVERY session once it
+    // registers — including one that never had the switch written from it.
     check(
-      'tools/change: and it was visible before the switch was set',
-      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('mcp__late__tool')
+      'tools/change: and it is masked for other sessions too',
+      !host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('mcp__late__tool')
     )
     await post({ sessionId: 'root-b', deny: [] })
   }
   {
-    // Disposal forgets the LINK but keeps the POLICY: the restriction is a user
-    // decision about a session, while a finished child should not linger in the walk.
+    // Disposing an agent unmounts its scope restriction, but the global set — the
+    // user's decision — stays: a session that closes and resumes is still restricted.
     await post({ sessionId: 'root-a', deny: ['write'] })
     check(
       'teardown: the child is restricted before disposal',
       typeof host.guards[0]({ name: 'write', agent: { id: 'child-a' } }) === 'string'
     )
     host.agents.dispose('child-a')
-    check('teardown: the link is forgotten', !parents.has('child-a'))
-    check('teardown: the policy survives', policies.has('root-a'))
+    check('teardown: the set survives a disposed agent', getToolDisabled().includes('write'), JSON.stringify(getToolDisabled()))
     check(
-      'teardown: the root is still restricted',
+      'teardown: the remaining agent is still restricted',
       typeof host.guards[0]({ name: 'write', agent: { id: 'root-a' } }) === 'string'
     )
     await post({ sessionId: 'root-a', deny: [] })
+    await settle()
+  }
+  {
+    // THE bug this rewrite fixes, stated as an outcome.
+    //
+    // A tool registered into the AGENT'S OWN layer is invisible to
+    // `tools.restrict()`: restrictions only filter INHERITED contributions, and that
+    // exemption is deliberate — it is how the delegation runtime hands a child its
+    // own tools. So the old implementation could not remove `subagent`,
+    // `send_team`, the `team_task_*` family, `wait_agent`, `interrupt_agent`,
+    // `list_agents` or `list_subagent_models`, and the panel showed their switches
+    // off while the model kept being offered them. That gap is what the user
+    // reported as "tools are not blocked".
+    //
+    // The schema filter does not care which layer registered a name, so it must
+    // remove these exactly like any other denied tool.
+    const scopeLocal = ['scope_local_probe_a', 'scope_local_probe_b']
+    host.tools.__registerLocal(scopeLocal[0])
+    host.tools.__registerLocal(scopeLocal[1])
+    await post({ sessionId: 'root-a', deny: scopeLocal })
+    await settle()
+    const seenByModel = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
+    check(
+      'scope-local: a tool registered in the agent own layer IS removed',
+      !seenByModel.includes(scopeLocal[0]),
+      seenByModel.join(',')
+    )
+    check(
+      'scope-local: and so is the second one',
+      !seenByModel.includes(scopeLocal[1]),
+      seenByModel.join(',')
+    )
+    check(
+      'scope-local: the untouched tools are still offered',
+      seenByModel.includes('read') && seenByModel.includes('working_directory'),
+      seenByModel.join(',')
+    )
+    // The guard is a separate, cheaper backstop and must stay: it is what stops a
+    // call the model makes from history or through a PTC sub-dispatch.
+    check(
+      'scope-local: the guard still refuses the name independently of the filter',
+      typeof host.guards[0]({ name: scopeLocal[0], agent: { id: 'root-a' } }) === 'string'
+    )
+    await post({ sessionId: 'root-a', deny: [] })
+    await settle()
+  }
+  {
+    // WHICH list the menu shows: the MODEL-FACING catalog, not the registry view.
+    //
+    // This is the shipped bug's geometry, and it is NOT the `withoutTools` case
+    // above: there the scope view itself was empty, so a registry read already
+    // answered []. A preset like "空白模式" registers nothing else, but the
+    // process-wide rows its agents inherit stay REGISTERED and stay visible to
+    // `schemas(agent)`; only the assemble stage empties the catalog. The old code
+    // read `schemas(agent)`, so it offered live-looking switches for tools the
+    // model would never see and the guard would refuse.
+    host.extras.systemPrompt = { async assemble() { return { tools: [], sections: [] } } }
+    check(
+      'catalog: the registry still reports tools for that session',
+      host.tools.schemas({ id: 'root-a' }).length > 0,
+      host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name).join(',')
+    )
+    const blankLike = await (await get('root-a')).json()
+    check(
+      'catalog: a session whose assembly offers no tools lists none',
+      blankLike.state?.tools?.length === 0,
+      (blankLike.state?.tools ?? []).join(',')
+    )
+    // The rule is the CATALOG, not "hide everything when anything is missing": a
+    // preset that offers two of the registry's tools lists exactly those two.
+    host.extras.systemPrompt = { async assemble() { return { tools: [{ name: 'read' }, { name: 'bash' }], sections: [] } } }
+    const partial = await (await get('root-a')).json()
+    check(
+      'catalog: the list follows the assembled catalog',
+      JSON.stringify(partial.state?.tools) === '["bash","read"]',
+      JSON.stringify(partial.state?.tools)
+    )
+    // A denied name is still unioned in, so the switch that turned it off stays
+    // reachable from a session whose catalog no longer carries the tool.
+    await post({ sessionId: 'root-a', deny: ['write'] })
+    const deniedBack = await (await get('root-a')).json()
+    check(
+      'catalog: denied names are still listed',
+      JSON.stringify(deniedBack.state?.tools) === '["bash","read","write"]',
+      JSON.stringify(deniedBack.state?.tools)
+    )
+    await post({ sessionId: 'root-a', deny: [] })
+    // PTC: the wire catalog is the single `run_code` transport schema, so the
+    // per-tool list has to come from the registry instead of collapsing to one row.
+    host.extras.systemPrompt = { async assemble() { return { tools: [{ name: 'run_code' }], sections: [] } } }
+    const ptc = await (await get('root-a')).json()
+    check(
+      'catalog: PTC keeps the registry view',
+      (ptc.state?.tools ?? []).includes('edit') && !(ptc.state?.tools ?? []).includes('run_code'),
+      (ptc.state?.tools ?? []).join(',')
+    )
+    // Everything that cannot answer for the catalog keeps the registry view, which
+    // is exactly what this route returned before the change.
+    delete host.extras.systemPrompt
+    const registryOnly = await (await get('root-a')).json()
+    check(
+      'catalog: no systemPrompt service keeps the registry view',
+      (registryOnly.state?.tools ?? []).includes('edit'),
+      (registryOnly.state?.tools ?? []).join(',')
+    )
+    host.extras.systemPrompt = { async assemble() { throw new Error('assembly failed') } }
+    const failedRead = await (await get('root-a')).json()
+    check(
+      'catalog: a failed assembly keeps the registry view',
+      (failedRead.state?.tools ?? []).includes('edit'),
+      (failedRead.state?.tools ?? []).join(',')
+    )
+    host.extras.systemPrompt = { async assemble() { return { sections: [] } } }
+    const noToolsField = await (await get('root-a')).json()
+    check(
+      'catalog: an assembly without `tools` keeps the registry view',
+      (noToolsField.state?.tools ?? []).includes('edit'),
+      (noToolsField.state?.tools ?? []).join(',')
+    )
+    delete host.extras.systemPrompt
+  }
+  {
+    // A PRESET scope is shared by every agent on that preset, and it outlives each
+    // of them. Its entry used to be left behind forever after the agents were
+    // disposed — one leaked entry per agent ever created, each re-read by `syncAll`
+    // on every `tools/change`. The map must be bounded by LIVE agents, not by the
+    // agents this process has ever run.
+    //
+    // Spawn a run of agents on the same preset, then dispose them all; the scope
+    // count must come back down to what the still-live agents need.
+    const scopeCount = async () => (await (await get('root-a')).json()).state?.scopes
+    const baseline = await scopeCount()
+    const churn = []
+    for (let index = 0; index < 6; index += 1) churn.push(host.agents.spawn(`churn-${index}`, undefined, 'churny'))
+    await settle()
+    const whileLive = await scopeCount()
+    for (const agent of churn) host.agents.dispose(agent.id)
+    await settle()
+    const afterDisposal = await scopeCount()
+    // EXACT equality, not "went down": one leaked preset entry is the whole bug, so a
+    // loose `<` comparison lets it through. The churn agents were the only users of
+    // that preset, so every entry they caused must be gone.
+    check(
+      'leak: disposing agents returns the scope count to the live baseline',
+      afterDisposal === baseline,
+      `${whileLive} while live -> ${afterDisposal} after disposal, baseline ${baseline}`
+    )
     await settle()
   }
 } finally {
@@ -1597,11 +1528,22 @@ try {
         const merged = new Map()
         for (const section of promptGlobal) merged.set(section.name, section)
         for (const [name, definition] of overlay) merged.set(name, definition)
-        return {
+        const assembly = {
           sections: [...merged.values()]
             .sort((left, right) => left.order - right.order)
             .map((section) => ({ name: section.name, text: section.text }))
         }
+        // Run the plugin's REAL `system-prompt/assemble` listeners, exactly as the
+        // host does. Without this the fake would answer from the raw registry and the
+        // panel's verification step would see nothing removed — the filter would be
+        // untested here, and a deleted filter would still pass.
+        let result = assembly
+        for (const listener of host.assembleListeners) {
+          result = await listener(result, { scope: agent }, () => Promise.resolve(result))
+        }
+        // Mirror the host's post-waterfall rule: a `complete` section is re-imposed.
+        // No section in this fixture is complete, so nothing is restored.
+        return result
       },
       __scoped(id) {
         return (definition) => {
@@ -1624,9 +1566,19 @@ try {
 
     const hidden = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })).json()
     check('prompts route: the switch reports it took effect', hidden.ok === true && hidden.applied === true)
+    // The mechanism changed from "register an empty same-name section" to "remove the
+    // section from the assembled list", so the observable is absence from the
+    // assembly. The overlay check is kept as the NEGATIVE half: the plugin must not
+    // have fallen back to shadowing either.
+    const afterHide = await host.extras.systemPrompt.assemble({ agent: host.agents.get('root-a') })
     check(
-      'prompts route: the section is now empty in the live prompt',
-      (overlays.get('root-a')?.get('identity')?.text ?? 'not-shadowed') === ''
+      'prompts route: the section is gone from the live prompt',
+      !afterHide.sections.some((section) => section.name === 'identity'),
+      afterHide.sections.map((section) => section.name).join(',')
+    )
+    check(
+      'prompts route: and no shadow was registered for it',
+      !(overlays.get('root-a')?.has('identity') ?? false)
     )
     const hiddenRow = hidden.state.sections.find((row) => row.name === 'identity')
     check('prompts route: the row is off', hiddenRow?.enabled === false)
@@ -1639,23 +1591,36 @@ try {
 
     const restored = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: true })).json()
     check('prompts route: the switch can be turned back on', restored.applied === true)
-    check('prompts route: the shadow is gone', !(overlays.get('root-a')?.has('identity') ?? false))
+    check('prompts route: no shadow was ever registered', !(overlays.get('root-a')?.has('identity') ?? false))
     check('prompts route: the text is back', restored.state.sections.find((row) => row.name === 'identity')?.liveChars > 0)
 
     // An unknown name must not persist a dead switch.
     check('prompts route: an unknown section is a 404', (await promptsPost({ sessionId: 'root-a', name: 'nope', enabled: false })).status === 404)
     check('prompts route: an unknown section persists nothing', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
 
-    // A section that cannot be shadowed is detected and rolled back.
+    // THE improvement, asserted directly. A section the agent registered ITSELF lives
+    // in the agent's own layer, which the old same-name shadow could not overwrite —
+    // that was the 409 this block used to demand. The filter removes sections from
+    // the assembled list instead, so there is no layer to be wrong about and the
+    // switch now succeeds. `shadowFails` still marks the name, proving the outcome no
+    // longer depends on shadowing at all.
     shadowFails.add('tool-notes')
-    const refused = await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: false })
-    check('prompts route: an unshadowable section is a 409', refused.status === 409, String(refused.status))
-    check('prompts route: the refusal leaves no disabled name', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
+    const selfRegisteredAnswer = await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: false })
+    const selfRegistered = await selfRegisteredAnswer.json()
     check(
-      'prompts route: the section still carries its text',
-      (overlays.get('root-a')?.get('tool-notes')?.text ?? 'still live') !== ''
+      'prompts route: a self-registered section can now be switched off',
+      selfRegisteredAnswer.status === 200 && selfRegistered.applied === true,
+      JSON.stringify(selfRegistered)
+    )
+    check('prompts route: and the disabled name is recorded', getPromptDisabled().includes('tool-notes'), JSON.stringify(getPromptDisabled()))
+    check(
+      'prompts route: the filter removed it from the assembled prompt',
+      !(await host.extras.systemPrompt.assemble({ agent: host.agents.get('root-a') }))
+        .sections.some((section) => section.name === 'tool-notes')
     )
     shadowFails.delete('tool-notes')
+    // Put it back so the reset assertions below start from a clean set.
+    await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: true })
 
     // The reset switch restores every disabled section at once.
     await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })
@@ -1702,23 +1667,49 @@ try {
 
 // --- 5. module-level helpers --------------------------------------------------
 {
-  policies.clear()
-  parents.clear()
-  check('owner: an unrestricted session owns itself', ownerOf('solo') === 'solo')
-  policies.set('p', { deny: new Set(['write']), blocked: 0 })
-  parents.set('c', 'p')
-  check('owner: a child resolves to its restricted parent', ownerOf('c') === 'p')
-  check('policyFor: the child gets the parent policy', policyFor('c').deny.has('write'))
-  check('policyFor: an unrelated session gets nothing', policyFor('x') === undefined)
-  check('denySetFor: an unrelated session gets the shared empty set', denySetFor('x') === EMPTY_DENY)
-  const snap = snapshot('c')
+  replaceToolDisabled([])
+  check('denySetFor: an empty set is returned as-is', denySetFor().size === 0)
+  check('denySetFor: it is the live set, not a copy', denySetFor() === denySetFor())
+  replaceToolDisabled(['write', 'bash'])
+  check('denySetFor: it reports the global names', denySetFor().has('write') && denySetFor().has('bash'))
+  const snap = await snapshot('c')
   check('snapshot: names the asking session', snap.sessionId === 'c')
-  check('snapshot: names the owning session', snap.ownerId === 'p')
-  check('snapshot: flags inheritance', snap.inherited === true)
+  check('snapshot: has no owning session', snap.ownerId === undefined)
+  check('snapshot: has no inheritance flag', snap.inherited === undefined)
   check('snapshot: carries the protocol', snap.protocol === PROTOCOL)
-  check('snapshot: an unrestricted session reports nothing denied', snapshot('free').denied.length === 0)
-  policies.clear()
-  parents.clear()
+  check('snapshot: reports the global list', JSON.stringify(snap.denied) === '["bash","write"]', JSON.stringify(snap.denied))
+  replaceToolDisabled([])
+  check('snapshot: an empty set reports nothing denied', (await snapshot('free')).denied.length === 0)
+}
+
+// --- 5a. the persisted tool set ----------------------------------------------
+{
+  check('tools: a corrupt list is normalized', JSON.stringify(normalizePromptNames([1, ' a ', 'a', '', null])) === '["a"]')
+  replaceToolDisabled(['alpha', 'beta'])
+  saveTools()
+  check('tools: the set round-trips through disk', JSON.stringify(loadTools()) === '["alpha","beta"]', JSON.stringify(loadTools()))
+  check('tools: the file lives under DSH_HOME', toolsFile().startsWith(SANDBOX), toolsFile())
+  const saved = JSON.parse(fs.readFileSync(toolsFile(), 'utf8'))
+  check('tools: the saved file carries the version', saved.version === 1, String(saved.version))
+  check('tools: and the names the set held', JSON.stringify(saved.disabled) === '["alpha","beta"]', JSON.stringify(saved.disabled))
+  replaceToolDisabled([])
+  saveTools()
+  check('tools: clearing writes an empty list', JSON.stringify(loadTools()) === '[]', JSON.stringify(loadTools()))
+
+  // THE promise of this revision: a switch survives a process restart. A fresh load
+  // of the module reads the file back and the guard enforces it again, with no
+  // session id involved anywhere.
+  replaceToolDisabled(['write', 'bash'])
+  saveTools()
+  check(
+    'tools: a switch survives a reload',
+    JSON.stringify(loadTools().sort()) === '["bash","write"]',
+    JSON.stringify(loadTools())
+  )
+  check('tools: the reloaded names are enforced', makeGuard()({ name: 'write', agent: { id: 'any' } }) !== undefined)
+  check('tools: and an allowed name is not', makeGuard()({ name: 'read', agent: { id: 'any' } }) === undefined)
+  replaceToolDisabled([])
+  saveTools()
 }
 
 
@@ -1998,25 +1989,6 @@ try {
     failed: 'f',
     retry: 'r',
     pluginsLoading: 'pl',
-    // The progressive-disclosure copy, verbatim from the zh dictionary: the tests
-    // below assert on the badge and the dialog, so a placeholder here would assert
-    // on the key instead of the words a user reads.
-    disclosure: '渐进披露',
-    disclosureTitle: '渐进式披露',
-    disclosureOn: '已开启渐进式披露',
-    disclosureOff: '未开启渐进式披露',
-    disclosureLabel: '渐进式披露',
-    disclosurePrompt: '分组描述提示词',
-    disclosurePromptPlaceholder: '告诉模型这组工具是做什么的',
-    disclosureHint: '开启后，组内工具不再自动注入上下文。',
-    disclosureEmpty: '这个分组还没有成员，开启披露不会隐藏任何工具。',
-    disclosureBadge: '渐进披露',
-    disclosureBadgeTitle: '这个分组开启了渐进式披露：组内工具不在模型的上下文里，模型调用 get_tools 后才注入',
-    disclosureBadgeLoaded: '渐进·已加载',
-    disclosureLoaded: '本会话已加载',
-    disclosureUnload: '卸载',
-    disclosureUnloadTitle: '仅在本会话隐藏这组工具，分组定义不变',
-    disclosureSave: '保存',
     pluginsEmpty: 'pe',
     pluginsSearch: '搜索插件',
     pluginsNoMatch: '没有匹配的插件',
@@ -2445,177 +2417,6 @@ try {
       globalThis.fetch = originalFetch
     }
   }
-
-  // The progressive-disclosure editor: the group row opens a dialog, and saving it
-  // writes the group definition with the disclosure switch and its prompt.
-  {
-    rememberTab('tools')
-    const calls = []
-    const baseState = {
-      protocol: PROTOCOL,
-      sessionId: 's1',
-      tools: ['bash', 'edit', 'read'],
-      denied: [],
-      deferred: ['bash'],
-      unlocked: [],
-      groups: [{ id: 'g1', name: 'Git', members: ['bash'], disclosure: false, prompt: '' }]
-    }
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = async (url, init = {}) => {
-      calls.push({ url: String(url), init })
-      if (init.method === 'POST') {
-        const body = JSON.parse(init.body)
-        if (Array.isArray(body.groups)) {
-          return { status: 200, json: async () => ({ ok: true, state: { ...baseState, groups: body.groups } }) }
-        }
-        if (Array.isArray(body.hide)) {
-          return { status: 200, json: async () => ({ ok: true, state: { ...baseState, unlocked: [] } }) }
-        }
-        return { status: 200, json: async () => ({ ok: true, state: { ...baseState, denied: body.deny ?? [] } }) }
-      }
-      return { status: 200, json: async () => ({ ok: true, state: baseState }) }
-    }
-    try {
-      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
-      const view = render(comp, { t: tt, sessionId: 's1' })
-      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
-      await pump(view)
-      const button = byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')
-      check('disclosure dialog: the group row carries the button', button.length === 1, String(button.length))
-      check('disclosure dialog: it reads the stored switch', button[0].props['aria-pressed'] === false)
-      check('disclosure badge: a non-deferred group has no badge', byClass(currentTree, 'dsh-tools-panel-tool-groupBadge').length === 0)
-      button[0].props.onClick()
-      await pump(view)
-      check('disclosure dialog: clicking opens it', byClass(currentTree, 'dsh-tools-panel-dialog').length === 1)
-      const textarea = byClass(currentTree, 'dsh-tools-panel-dialogTextarea')[0]
-      check('disclosure dialog: it starts from the stored prompt', textarea?.props?.value === '', String(textarea?.props?.value))
-      const box = byClass(currentTree, 'dsh-tools-panel-dialogSwitch')[0]
-      box.children[0].props.onChange({ target: { checked: true } })
-      textarea.props.onChange({ target: { value: 'Git ops' } })
-      await pump(view)
-      byClass(currentTree, 'dsh-tools-panel-dialogPrimary')[0].props.onClick()
-      await pump(view)
-      const saved = calls.find((call) => call.init?.method === 'POST')
-      const body = saved === undefined ? {} : JSON.parse(saved.init.body)
-      check('disclosure dialog: saving writes the switch', body.groups?.[0]?.disclosure === true, JSON.stringify(body))
-      check('disclosure dialog: and the prompt', body.groups?.[0]?.prompt === 'Git ops', JSON.stringify(body))
-      check('disclosure dialog: it closes on save', byClass(currentTree, 'dsh-tools-panel-dialog').length === 0)
-      check(
-        'disclosure dialog: the button reads as pressed',
-        byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')[0]?.props['aria-pressed'] === true
-      )
-      // Turning it on must make the group recognizable on the row itself: a badge
-      // naming the mode, not a colour only the gear carries.
-      const badge = byClass(currentTree, 'dsh-tools-panel-tool-groupBadge')
-      check('disclosure badge: a deferred group is marked on its row', badge.length === 1, String(badge.length))
-      check('disclosure badge: it names the mode', textOf(badge[0]).join('') === '渐进披露', textOf(badge[0]).join(''))
-      check(
-        'disclosure badge: and it explains itself on hover',
-        typeof badge[0]?.props.title === 'string' && badge[0].props.title.includes('get_tools'),
-        String(badge[0]?.props.title)
-      )
-    } finally {
-      globalThis.fetch = originalFetch
-    }
-  }
-  // A group that is BOTH deferred and already fetched shows the loaded chip and
-  // offers the way back in TWO places: a button on the row itself (no dialog needed)
-  // and the same action in the editor. Both must hit the same `hide` write.
-  {
-    rememberTab('tools')
-    const posts = []
-    const baseState = {
-      protocol: PROTOCOL,
-      sessionId: 's1',
-      tools: ['bash', 'read'],
-      denied: [],
-      deferred: [],
-      unlocked: ['g1'],
-      groups: [{ id: 'g1', name: 'Git', members: ['bash'], disclosure: true, prompt: 'Git ops' }]
-    }
-    const originalFetch = globalThis.fetch
-    globalThis.fetch = async (url, init = {}) => {
-      if (init.method === 'POST') {
-        const body = JSON.parse(init.body)
-        posts.push(body)
-        if (Array.isArray(body.hide)) {
-          return { status: 200, json: async () => ({ ok: true, state: { ...baseState, unlocked: [] } }) }
-        }
-      }
-      return { status: 200, json: async () => ({ ok: true, state: baseState }) }
-    }
-    try {
-      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
-      const view = render(comp, { t: tt, sessionId: 's1' })
-      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
-      await pump(view)
-      const loadedBadge = byClass(currentTree, 'dsh-tools-panel-tool-groupBadge')
-      check(
-        'disclosure row: the fetched group is marked',
-        loadedBadge.length === 1 && textOf(loadedBadge[0]).join('') === '渐进·已加载',
-        textOf(loadedBadge[0] ?? {}).join('')
-      )
-      check(
-        'disclosure row: the loaded badge is the loaded reading',
-        loadedBadge[0]?.props?.className?.includes('dsh-tools-panel-tool-groupBadgeLoaded') === true,
-        String(loadedBadge[0]?.props?.className)
-      )
-      const unload = byClass(currentTree, 'dsh-tools-panel-tool-groupUnload')
-      check('disclosure row: the loaded row offers a direct unload button', unload.length === 1, String(unload.length))
-      check(
-        'disclosure row: the button names its group',
-        unload[0]?.props['aria-label'] === '卸载 Git',
-        String(unload[0]?.props['aria-label'])
-      )
-      check('disclosure row: the button is operable', unload[0]?.props.disabled === false)
-      // The dialog offers the same action — it is a second way in, not the only one.
-      byClass(currentTree, 'dsh-tools-panel-tool-groupDisclosure')[0].props.onClick()
-      await pump(view)
-      check(
-        'disclosure dialog: it opens already on',
-        byClass(currentTree, 'dsh-tools-panel-dialogSwitch')[0]?.children[0]?.props?.checked === true
-      )
-      check(
-        'disclosure dialog: and offers the unload action',
-        textOf(byClass(currentTree, 'dsh-tools-panel-dialog')[0]).includes('卸载'),
-        textOf(byClass(currentTree, 'dsh-tools-panel-dialog')[0]).join('|')
-      )
-      // Leave the dialog through its own Cancel control, then use the ROW button: the
-      // point of the row action is that unloading never requires the dialog at all.
-      const dialog = byClass(currentTree, 'dsh-tools-panel-dialog')[0]
-      byClass(dialog, 'dsh-tools-panel-tool-bulkButton')
-        .find((node) => textOf(node).includes('取消'))
-        .props.onClick()
-      await pump(view)
-      check(
-        'disclosure row: the action is still there with the dialog closed',
-        byClass(currentTree, 'dsh-tools-panel-tool-groupUnload').length === 1
-      )
-      byClass(currentTree, 'dsh-tools-panel-tool-groupUnload')[0].props.onClick()
-      await pump(view)
-      const hide = posts.find((body) => Array.isArray(body.hide))
-      check(
-        'disclosure row: unloading posts the group id for this session',
-        JSON.stringify(hide) === JSON.stringify({ sessionId: 's1', hide: ['g1'] }),
-        JSON.stringify(posts)
-      )
-      // Unloading must not drop the badge — the group is still deferred, so it goes
-      // back to the locked reading rather than losing its marker.
-      const relocked = byClass(currentTree, 'dsh-tools-panel-tool-groupBadge')
-      check(
-        'disclosure row: the unloaded row still carries the badge',
-        relocked.length === 1 && !String(relocked[0]?.props?.className).includes('BadgeLoaded'),
-        String(relocked[0]?.props?.className)
-      )
-      check(
-        'disclosure row: the unloaded row stops announcing itself',
-        !textOf(currentTree).some((text) => text.includes('本会话已加载')),
-        textOf(currentTree).slice(0, 6).join('|')
-      )
-    } finally {
-      globalThis.fetch = originalFetch
-    }
-  }
 }
 
 // --- 6. the client half's wiring ----------------------------------------------
@@ -2642,31 +2443,6 @@ check('client: groups are created from a multi-selection', clientSource.includes
 check('client: a group has one bulk switch', /onToggleAll/.test(clientSource))
 check('client: a group can be renamed and removed', /onRename/.test(clientSource) && /onRemove/.test(clientSource))
 check('client: group writes go to the host', clientSource.includes('writeGroups('))
-check(
-  'client: progressive-disclosure re-hides go to the host',
-  clientSource.includes('JSON.stringify({ sessionId, hide })'),
-  'the host reads `hide`'
-)
-check(
-  'client: the loaded group row unloads without opening the dialog',
-  clientSource.includes('dsh-tools-panel-tool-groupUnload') && /onUnload/.test(clientSource)
-)
-// A deferred group has to be tellable apart on the row itself: a badge naming the
-// mode, plus the loaded reading of the same badge once this session fetched it.
-check(
-  'client: a deferred group carries a badge',
-  clientSource.includes('dsh-tools-panel-tool-groupBadge') && clientSource.includes("t('disclosureBadge')")
-)
-check('client: the loaded reading of that badge exists', clientSource.includes('dsh-tools-panel-tool-groupBadgeLoaded'))
-check(
-  'client: the row and the dialog share one unload path',
-  (clientSource.match(/onUnload: \(\) => unload\(/g) ?? []).length === 2,
-  String((clientSource.match(/onUnload: \(\) => unload\(/g) ?? []).length)
-)
-check(
-  'client: the group row opens the disclosure editor',
-  /onDisclosure/.test(clientSource) && clientSource.includes('function DisclosureDialog(')
-)
 check('client: offers a search filter', clientSource.includes("type: 'search'"))
 check('client: offers a bulk action', clientSource.includes('flipAll'))
 check('client: the list scrolls inside the menu', /\.dsh-tools-panel-tool-list\s*\{[^}]*max-height/m.test(clientSource))
@@ -2679,9 +2455,16 @@ check('client: takes the slot sessionId seat', /\{\s*t: seat,\s*sessionId\s*\}/.
 check('client: sends the session on GET', clientSource.includes('?sessionId='))
 check('client: sends the session on POST', clientSource.includes('...patch, sessionId') || clientSource.includes('sessionId, deny'))
 check('client: does not hardcode a session id', !/sessionId:\s*['"]/.test(clientSource))
-// The inherited notice: editing a subagent's list edits its parent, so the menu has
-// to say so rather than let that read as an unrelated session changing.
-check('client: surfaces an inherited policy', clientSource.includes("t('inherited')"))
+// The scope badge: the deny set is global and durable, so the menu has to say that a
+// switch affects every conversation and survives a restart.
+check(
+  'client: surfaces the global scope',
+  clientSource.includes("t('toolsGlobal')") &&
+    clientSource.includes("toolsGlobal: '全局 · 重启后仍生效'") &&
+    clientSource.includes("toolsGlobal: 'Global · survives a restart'"),
+  'a scope badge the switches cannot imply on their own'
+)
+check('client: no longer claims a per-session inheritance', !clientSource.includes("t('inherited')"))
 check('client: the icon-only trigger keeps an accessible name', clientSource.includes("'aria-label': t('title')"))
 check(
   'client: every t() key exists in a dictionary',
@@ -2740,10 +2523,10 @@ check(
   'clearSelection -> 取消创建 / Cancel'
 )
 
-// The count badge was removed at the user's request; the inherited notice stays,
-// because that one says whose policy these switches are.
+// The count badge was removed at the user's request; the scope badge stays, because
+// that one says what the switches cannot: they apply profile-wide and persist.
 check('panel: no count badge', !/tool-count/.test(clientSource) && !/\$\{denied\.size\}\//.test(clientSource))
-check('panel: the inherited notice stays', clientSource.includes("t('inherited')"))
+check('panel: the scope badge stays', clientSource.includes("t('toolsGlobal')"))
 
 check(
   'scroll: the tab pane is a flex participant',
@@ -2779,183 +2562,6 @@ try {
   check('client: parses as a script', true)
 } catch (error) {
   check('client: parses as a script', false, String(error?.message ?? error))
-}
-
-// --- 7. boot ordering: a late `agents` service -------------------------------
-/**
- * Profile bundles load concurrently, so this row can be applied before the agent
- * loop has provided `agents` — that is the ORDINARY boot order, not an edge case.
- * Capturing `ctx.get('agents')` at apply time then stored `undefined` forever: no
- * per-agent scope was ever mounted (so progressive disclosure promised "not in your
- * tool list yet" while every tool still was), and the skills/prompts tabs answered
- * "no live agent" for a conversation that was plainly running.
- *
- * Locked down here: the lifecycle listeners exist without the service, an
- * `agent/created` payload alone is enough to mount the mask, and the catch-up pass
- * mounts agents that existed before the service became visible.
- */
-{
-  const services = {}
-  const listeners = new Map()
-  const injects = new Map()
-  const restrictCalls = []
-  const mountedScopes = []
-  const registered = []
-  /**
-   * What `restrict()` currently hides, PER AGENT: restrictions are scoped, and the
-   * fake must model the mask, or the "did the tools land" probe below would look
-   * correct without working.
-   */
-  const hidden = new Map()
-  const hiddenOf = (id) => hidden.get(id) ?? new Set()
-
-  const makeAgent = (id) => {
-    const agent = { id }
-    const scopedTools = {
-      restrict(filter) {
-        const names = filter?.deny ?? []
-        restrictCalls.push({ id, names })
-        const masked = new Set(hiddenOf(id))
-        for (const name of names) masked.add(name)
-        hidden.set(id, masked)
-        return () => {
-          const lifted = new Set(hiddenOf(id))
-          for (const name of names) lifted.delete(name)
-          hidden.set(id, lifted)
-        }
-      },
-      schemas: () => [{ name: 'late_tool', description: 'late.', parameters: { type: 'object' } }]
-    }
-    agent.ctx = {
-      fiber: { uid: id, parent: undefined },
-      plugin(definition) {
-        mountedScopes.push(id)
-        definition.apply?.({
-          tools: scopedTools,
-          effect: (fn) => fn(),
-          get: () => undefined,
-          on: () => () => {}
-        })
-        return { dispose() {} }
-      }
-    }
-    return agent
-  }
-
-  const ctx = {
-    tools: {
-      guard: () => () => {},
-      register(definition) {
-        registered.push(definition)
-        return () => {}
-      },
-      restrict() { throw new Error('an unscoped restriction would mask every agent') },
-      // The agent view answers what the agent can call, so the mask shows up here;
-      // the GLOBAL view is empty on purpose — a preset-scoped tool (the case that
-      // exposes the counting bug) is never in the global layer.
-      schemas(scope) {
-        if (scope === undefined || hiddenOf(scope.id).has('late_tool')) return []
-        return [{ name: 'late_tool', description: 'late.', parameters: { type: 'object' } }]
-      }
-    },
-    on(name, listener) {
-      const list = listeners.get(name) ?? []
-      list.push(listener)
-      listeners.set(name, list)
-      return () => {}
-    },
-    get: (name) => services[name],
-    inject(names, callback) {
-      injects.set(names.join(','), callback)
-      if (names.every((name) => services[name] !== undefined)) callback()
-      return () => {}
-    },
-    effect(fn) { fn(); return () => {} }
-  }
-
-  // A deferred group is what gives the mounted plugins something to hide.
-  setGroups([{ id: 'late-1', name: 'late', members: ['late_tool'], disclosure: true, prompt: 'late' }])
-  apply(ctx)
-
-  check(
-    'late agents: agent/created is registered without the service',
-    (listeners.get('agent/created') ?? []).length === 1,
-    String((listeners.get('agent/created') ?? []).length)
-  )
-  check(
-    'late agents: agent/disposed is registered without the service',
-    (listeners.get('agent/disposed') ?? []).length === 1,
-    String((listeners.get('agent/disposed') ?? []).length)
-  )
-  check(
-    'late agents: nothing is mounted while the service is missing',
-    mountedScopes.length === 0,
-    JSON.stringify(mountedScopes)
-  )
-
-  // The session's agent is created before the registry is visible to this plugin.
-  const early = makeAgent('early')
-  for (const listener of listeners.get('agent/created') ?? []) listener({ agent: early, source: 'startup' })
-  check(
-    'late agents: a created event mounts without the service',
-    mountedScopes.includes('early'),
-    JSON.stringify(mountedScopes)
-  )
-  check(
-    'late agents: the event path applies the disclosure mask',
-    restrictCalls.some((call) => call.id === 'early' && call.names.includes('late_tool')),
-    JSON.stringify(restrictCalls)
-  )
-
-  // The service finally appears: the catch-up pass must reach agents that already
-  // existed, which the event path cannot cover.
-  const late = makeAgent('late')
-  services.agents = {
-    list: () => [late],
-    get: (id) => (id === 'late' ? late : undefined),
-    isOwnedBy: () => false
-  }
-  injects.get('agents')?.()
-  check(
-    'late agents: the catch-up pass mounts an agent the service already held',
-    mountedScopes.includes('late'),
-    JSON.stringify(mountedScopes)
-  )
-  check(
-    'late agents: the late pass applies the disclosure mask too',
-    restrictCalls.some((call) => call.id === 'late' && call.names.includes('late_tool')),
-    JSON.stringify(restrictCalls)
-  )
-
-  // The "did the members land" count must be read AFTER the unlock. Counting before
-  // it reads the view the mask itself emptied, so a preset-scoped group (never in the
-  // global layer) reported "nothing was injected" while loading its tools.
-  const getTools = registered.find((definition) => definition.name === 'get_tools')
-  check('late agents: get_tools is registered for the deferred group', getTools !== undefined)
-  const loaded = await getTools.execute({ group: 'late' }, { agent: late })
-  check(
-    'late agents: a preset-scoped group still reports its tools as injected',
-    /injected/.test(loaded.message) && !/no registered tool/.test(loaded.message),
-    loaded.message
-  )
-  check(
-    'late agents: the load lifts the mask',
-    !hiddenOf('late').has('late_tool'),
-    JSON.stringify([...hiddenOf('late')])
-  )
-
-  // The tabs read an agent through `agentFor`; with the service absent they must fall
-  // back to the objects `agent/created` already handed over.
-  const viaEvents = await skillsState(
-    { skills: { snapshot: async () => ({ skills: [], complete: true }) }, seenAgents: new Map([['s1', { id: 's1' }]]) },
-    's1'
-  )
-  check(
-    'late agents: the tabs read the event-seen agent when the service is missing',
-    viaEvents.available === true && viaEvents.reason === undefined,
-    String(viaEvents.reason)
-  )
-  setGroups([])
 }
 
 // Never leave the sandbox behind: it holds a file this test wrote on purpose.

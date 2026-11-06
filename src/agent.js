@@ -11,8 +11,8 @@
  * WHAT A GROUP IS (and is not)
  *   A name plus a list of tool names, shown in the panel's Tools tab. It is
  *   ORGANIZATION, not policy: being in a group never disables a tool, and one tool
- *   may sit in several groups. The per-session deny list is a different thing and
- *   is not touched from here.
+ *   may sit in several groups. The global deny set is a different thing and is not
+ *   touched from here.
  *
  * WHY ONE TOOL AND NOT FIVE
  *   Six tools that all edit one small JSON document would each cost a schema in
@@ -22,16 +22,14 @@
 import {
   MAX_GROUPS,
   MAX_GROUP_NAME,
-  MAX_GROUP_PROMPT,
   MAX_NAME,
   MAX_TOOLS,
   getGroups,
-  normalizeGroupPrompt,
   replaceGroups
 } from './index.js'
 
 /** Every action this tool accepts, in menu order. */
-const ACTIONS = ['list', 'get', 'create', 'rename', 'set_members', 'add_members', 'remove_members', 'set_disclosure', 'delete']
+const ACTIONS = ['list', 'get', 'create', 'rename', 'set_members', 'add_members', 'remove_members', 'delete']
 
 /**
  * Read a group name off the arguments.
@@ -109,10 +107,6 @@ function summarize(list) {
     id: group.id,
     name: group.name,
     memberCount: group.members.length,
-    // Editable through `set_disclosure`, but only when the caller asks: this tool
-    // never touches the disclosure fields as a side effect of a member edit.
-    disclosure: group.disclosure === true,
-    prompt: group.prompt ?? '',
     members: [...group.members]
   }))
 }
@@ -128,11 +122,8 @@ const definition = {
   name: 'manage_tool_groups',
   description:
     'Create, edit, and delete the tool GROUPS shown in the user\'s tool panel — named sets of tool names. ' +
-    'A group is organization only: membership never disables a tool, and one tool may belong to several groups. ' +
-    'Use `set_disclosure` to turn progressive disclosure on or off for a group and to write the description ' +
-    'prompt the model reads when deciding whether to load it (with disclosure on, the group\'s tools are ' +
-    'hidden until the model calls `get_tools`, saving their schema tokens). Changes are saved and appear ' +
-    'in the panel right away. Query with `list` or `get` before editing: ' +
+    'A group is organization only: it never disables a tool, and one tool may belong to several groups. ' +
+    'Changes are saved and appear in the panel right away. Query with `list` or `get` before editing: ' +
     'a group is addressed by its id or its exact name.',
   parameters: {
     type: 'object',
@@ -149,7 +140,6 @@ const definition = {
           'rename: needs group and the new name. ' +
           'set_members: replaces a group\'s members. ' +
           'add_members / remove_members: adjust the members of one group. ' +
-          'set_disclosure: turns progressive disclosure on/off and/or writes the group\'s description prompt. ' +
           'delete: removes the group; the tools themselves stay available.'
       },
       group: {
@@ -171,21 +161,6 @@ const definition = {
           'set_members: the complete new list. ' +
           'add_members / remove_members: the names to add or drop. ' +
           'A name no tool currently provides is kept as written, so a group survives a disconnected MCP server.'
-      },
-      disclosure: {
-        type: 'boolean',
-        description:
-          'set_disclosure: whether the group uses progressive disclosure. ' +
-          'When true its tools are withheld from the tool list until `get_tools` loads the group; ' +
-          'when false they are listed normally. Omit to leave the switch as it is.'
-      },
-      prompt: {
-        type: 'string',
-        description:
-          'set_disclosure: the group description prompt, 0-' + MAX_GROUP_PROMPT + ' characters. ' +
-          'It is injected into the system prompt as the line the model reads to decide whether loading ' +
-          'this group is worth a call, so describe what the group is for, not its tool names. ' +
-          'Omit to leave the prompt unchanged; send an empty string to clear it.'
       }
     }
   },
@@ -203,19 +178,11 @@ const definition = {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['id', 'name', 'memberCount', 'disclosure', 'prompt', 'members'],
+            required: ['id', 'name', 'memberCount', 'members'],
             properties: {
               id: { type: 'string' },
               name: { type: 'string' },
               memberCount: { type: 'number' },
-              disclosure: {
-                type: 'boolean',
-                description: 'Whether the group uses progressive disclosure.'
-              },
-              prompt: {
-                type: 'string',
-                description: 'The group description prompt injected for a deferred group.'
-              },
               members: { type: 'array', items: { type: 'string' } }
             }
           }
@@ -229,11 +196,10 @@ const definition = {
       const lines = [value.message]
       if (value.groups.length > 0 && showMembers) {
         for (const group of value.groups) {
-          const mark = group.disclosure === true ? ' [deferred]' : ''
           lines.push(
             group.members.length === 0
-              ? `- ${group.name}${mark} (${group.id}): empty`
-              : `- ${group.name}${mark} (${group.id}): ${group.members.join(', ')}`
+              ? `- ${group.name} (${group.id}): empty`
+              : `- ${group.name} (${group.id}): ${group.members.join(', ')}`
           )
         }
       } else if (value.groups.length > 0) {
@@ -248,10 +214,8 @@ const definition = {
     if (!ACTIONS.includes(action)) throw new Error(`\`action\` must be one of: ${ACTIONS.join(', ')}`)
 
     // Work on a copy: `replaceGroups` normalizes and stores, and a half-applied
-    // edit must never reach the live array. Spread rather than pick: a group also
-    // carries the progressive-disclosure fields (`disclosure`, `prompt`), which
-    // this tool does not edit but MUST not wipe when it rewrites the list.
-    const list = getGroups().map((group) => ({ ...group, members: [...group.members] }))
+    // edit must never reach the live array.
+    const list = getGroups().map((group) => ({ id: group.id, name: group.name, members: [...group.members] }))
     let message
     let next
 
@@ -315,46 +279,6 @@ const definition = {
           action === 'remove_members'
             ? `Removed ${members.length} tool${members.length === 1 ? '' : 's'} from "${group.name}"; it now holds ${updated.length}.`
             : `${verb} members of "${group.name}"; it now holds ${updated.length} tool${updated.length === 1 ? '' : 's'}.`
-        break
-      }
-      case 'set_disclosure': {
-        const group = findGroup(list, input.group)
-        const hasDisclosure = Object.prototype.hasOwnProperty.call(input, 'disclosure')
-        const hasPrompt = Object.prototype.hasOwnProperty.call(input, 'prompt')
-        if (!hasDisclosure && !hasPrompt) {
-          throw new Error('`set_disclosure` needs `disclosure` and/or `prompt`')
-        }
-        if (hasDisclosure && typeof input.disclosure !== 'boolean') {
-          throw new Error('`disclosure` must be a boolean')
-        }
-        if (hasPrompt && typeof input.prompt !== 'string') {
-          throw new Error('`prompt` must be a string (send an empty string to clear it)')
-        }
-        const prompt = hasPrompt ? normalizeGroupPrompt(input.prompt) : (group.prompt ?? '')
-        if (hasPrompt && prompt.length === 0 && input.prompt.trim().length > 0) {
-          throw new Error('`prompt` became empty after cleaning; it contains only control characters')
-        }
-        const disclosure = hasDisclosure ? input.disclosure : group.disclosure === true
-        next = list.map((entry) => (entry.id === group.id ? { ...entry, disclosure, prompt } : entry))
-        const parts = []
-        if (hasDisclosure) {
-          parts.push(
-            disclosure
-              ? `Group "${group.name}" now uses progressive disclosure.`
-              : `Group "${group.name}" no longer uses progressive disclosure; its tools are listed normally.`
-          )
-        }
-        if (hasPrompt) {
-          parts.push(
-            prompt.length === 0
-              ? 'The description prompt is empty, so the model gets only the group name and member count.'
-              : `The description prompt is set (${prompt.length} chars).`
-          )
-        }
-        if (disclosure && group.members.length === 0) {
-          parts.push('The group has no members, so nothing is deferred until it has at least one tool.')
-        }
-        message = parts.join(' ')
         break
       }
       case 'delete': {
