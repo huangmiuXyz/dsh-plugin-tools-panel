@@ -29,7 +29,7 @@ import {
 } from './index.js'
 
 /** Every action this tool accepts, in menu order. */
-const ACTIONS = ['list', 'get', 'create', 'rename', 'set_members', 'add_members', 'remove_members', 'delete']
+const ACTIONS = ['list', 'get', 'create', 'rename', 'set_members', 'add_members', 'remove_members', 'set_disclosure', 'delete']
 
 /**
  * Read a group name off the arguments.
@@ -107,7 +107,9 @@ function summarize(list) {
     id: group.id,
     name: group.name,
     memberCount: group.members.length,
-    members: [...group.members]
+    members: [...group.members],
+    disclosure: group.disclosure === 'deferred' ? 'deferred' : 'always',
+    prompt: group.prompt ?? ''
   }))
 }
 
@@ -152,6 +154,20 @@ const definition = {
           `Group name, 1-${MAX_GROUP_NAME} characters, unique among groups. ` +
           'Required by `create` (the new name) and `rename` (the name it should have).'
       },
+      disclosure: {
+        type: 'string',
+        enum: ['always', 'deferred'],
+        description:
+          'set_disclosure only. `always` puts the members in the tool list every step. ' +
+          '`deferred` withholds them: the system prompt shows one index line (name, `prompt`, count) ' +
+          'and the model must call `get_tools` to load the group into the conversation.'
+      },
+      prompt: {
+        type: 'string',
+        description:
+          'set_disclosure only, and only meaningful with `deferred`: a one-line description of what ' +
+          'the group is for, shown in the index line. This is your chance to say WHEN to load it.'
+      },
       members: {
         type: 'array',
         items: { type: 'string' },
@@ -178,12 +194,14 @@ const definition = {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['id', 'name', 'memberCount', 'members'],
+            required: ['id', 'name', 'memberCount', 'members', 'disclosure'],
             properties: {
               id: { type: 'string' },
               name: { type: 'string' },
               memberCount: { type: 'number' },
-              members: { type: 'array', items: { type: 'string' } }
+              members: { type: 'array', items: { type: 'string' } },
+              disclosure: { type: 'string', enum: ['always', 'deferred'] },
+              prompt: { type: 'string' }
             }
           }
         }
@@ -279,6 +297,22 @@ const definition = {
           action === 'remove_members'
             ? `Removed ${members.length} tool${members.length === 1 ? '' : 's'} from "${group.name}"; it now holds ${updated.length}.`
             : `${verb} members of "${group.name}"; it now holds ${updated.length} tool${updated.length === 1 ? '' : 's'}.`
+        break
+      }
+      case 'set_disclosure': {
+        const group = findGroup(list, input.group)
+        const mode = input.disclosure === 'deferred' ? 'deferred' : input.disclosure === 'always' ? 'always' : undefined
+        if (mode === undefined) throw new Error('`disclosure` must be "always" or "deferred"')
+        const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : (group.prompt ?? '')
+        next = list.map((entry) => (
+          entry.id === group.id
+            ? (mode === 'deferred' ? { ...entry, disclosure: 'deferred', prompt } : { id: entry.id, name: entry.name, members: entry.members })
+            : entry
+        ))
+        message = mode === 'deferred'
+          ? `Group "${group.name}" is now deferred: its ${group.members.length} tool(s) stay out of the tool list until ` +
+            `\`get_tools\` loads them. A new conversation starts deferred again.`
+          : `Group "${group.name}" is now loaded every step; its tools are back in the tool list.`
         break
       }
       case 'delete': {

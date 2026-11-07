@@ -141,6 +141,34 @@ check(
   clientSource.includes('JSON.stringify({ sessionId, deny })'),
   'deny, not per-kind booleans'
 )
+// Phase 10 added LOCKED: names the registry refuses to hide. A client that never
+// reads the field would draw live switches over tools no restriction can touch —
+// exactly the lie this panel exists to stop telling.
+check(
+  'protocol: the client reads the locked list',
+  /data\?\.locked/.test(clientSource),
+  'snapshot.locked'
+)
+check(
+  'protocol: the client renders a locked row without a switch',
+  clientSource.includes('dsh-tools-panel-tool-lock'),
+  'the badge takes the switch\'s place'
+)
+check(
+  'disclosure: the panel can edit a group\'s description',
+  clientSource.includes('disclosurePrompt') && clientSource.includes('editDisclosure'),
+  'the model reads this line instead of the schemas'
+)
+check(
+  'disclosure: the panel renders a settings entry per group',
+  clientSource.includes('dsh-tools-panel-tool-groupDisclosure') && clientSource.includes('GearIcon'),
+  'a bare toggle cannot express the prompt'
+)
+check(
+  'protocol: bulk actions skip locked members',
+  clientSource.includes('hideableVisible'),
+  'every bulk control targets the hideable subset'
+)
 
 // THE point of this revision: nothing is classified. A name is denied by being in
 // the list, and no table in this package decides what a tool "is".
@@ -521,29 +549,60 @@ function fakeHost() {
    */
   const promptSections = ['identity', 'rules', 'style']
 
-  const modelView = new Map()
-
   /** The scope-less `system-prompt/assemble` listeners, in registration order. */
   const assembleListeners = []
 
-  /** Names registered for one agent, before any plugin filter runs. */
+  /**
+   * Per-agent restrictions, exactly as `restrict()` records them: a filter appended
+   * to the AGENT's own layer. Nothing here knows which names it should hide — it
+   * masks whatever the current registry holds, which is what makes a tool registered
+   * AFTER the switch (an MCP server connecting) hidden without a re-apply.
+   */
+  const restrictions = new Map()
+
+  /** Names registered for one agent, before any restriction masks them. */
   function registeredFor(agentId) {
     if (noTools.has(agentId)) return []
     return [...GLOBAL_TOOLS, ...PRESET_TOOLS, ...LOCAL_TOOLS]
   }
 
   /**
-   * Run the real waterfall for one agent and cache what comes out.
+   * The registry's derivation for one scope: `visible`, `knownNames`,
+   * `restrictableNames`.
    *
-   * Mirrors the host: each listener gets `(assembly, context, next)` and may return a
-   * replacement; the outermost value wins. Sections are included so the prompt
-   * filter is exercised through the same path, which is why one drain serves both.
+   * The split is the whole point of this plugin: `restrictableNames` excludes the
+   * scope's OWN registrations, which is why a locked tool can be seen in the panel
+   * and can never be switched off.
+   */
+  function viewOf(scope) {
+    const id = typeof scope === 'string' ? scope : scope?.id
+    const empty = noTools.has(id)
+    const inherited = empty ? [] : [...GLOBAL_TOOLS, ...PRESET_TOOLS]
+    const own = empty ? [] : [...LOCAL_TOOLS]
+    const banned = new Set()
+    for (const filter of restrictions.get(id) ?? []) for (const name of filter.deny) banned.add(name)
+    const visible = new Map()
+    for (const name of inherited) if (!banned.has(name)) visible.set(name, { name })
+    for (const name of own) visible.set(name, { name })
+    return {
+      visible,
+      knownNames: new Set([...inherited, ...own]),
+      restrictableNames: new Set(inherited)
+    }
+  }
+
+  /**
+   * Run the real assembly waterfall for one agent and cache what comes out.
+   *
+   * Only SECTIONS are read from it now: Harness 0.2.2 keeps tool declarations out of
+   * the presentation waterfall, so `assembly.tools` would always be the unfiltered
+   * list and asserting on it would be asserting on nothing. Tools come from
+   * {@link viewOf}, which is the model-facing source of truth in this version.
    */
   async function refresh() {
     for (const agent of live) {
-      const names = registeredFor(agent.id)
       const assembly = {
-        tools: names.map((name) => ({ name })),
+        tools: registeredFor(agent.id).map((name) => ({ name })),
         sections: promptSections.map((name) => ({ name, text: `text of ${name}` }))
       }
       let result = assembly
@@ -559,17 +618,7 @@ function fakeHost() {
     }
   }
 
-  /**
-   * The names one agent can CALL, as the model ends up seeing them.
-   *
-   * Falls back to the unfiltered registry list when no drain has happened yet, so a
-   * caller that reads before the first `refresh()` still gets a sane answer.
-   */
-  function visibleFor(agentId) {
-    const cached = modelView.get(agentId)
-    if (cached !== undefined) return cached.tools
-    return registeredFor(agentId)
-  }
+  const modelView = new Map()
 
   /**
    * Fire one registry event, the way the real service's `ctx.emit` does.
@@ -582,6 +631,26 @@ function fakeHost() {
     for (const listener of listeners.get(name) ?? []) listener()
   }
 
+  /**
+   * `restrict()`, as the registry implements it: scoped only, inherited names only,
+   * "unknown global tool" for anything else, and a disposer that lifts the filter.
+   */
+  function restrictFor(agentId, filter) {
+    const known = viewOf(agentId).restrictableNames
+    const unknown = [...(filter.deny ?? [])].filter((name) => !known.has(name))
+    if (unknown.length > 0) {
+      throw new Error(`tools.restrict() names unknown global tool ${unknown.map((n) => `"${n}"`).join(', ')}`)
+    }
+    const entry = { deny: new Set(filter.deny ?? []) }
+    const list = restrictions.get(agentId) ?? []
+    list.push(entry)
+    restrictions.set(agentId, list)
+    return () => {
+      const current = restrictions.get(agentId) ?? []
+      const at = current.indexOf(entry)
+      if (at >= 0) current.splice(at, 1)
+    }
+  }
 
   /** The `tools` service, scoped when it belongs to one agent's context. */
   const tools = {
@@ -600,6 +669,10 @@ function fakeHost() {
     restrict() {
       throw new Error('an unscoped restriction would mask every agent')
     },
+    /** The registry's derivation for one scope; the panel reads LOCKED from here. */
+    view(scope) {
+      return viewOf(scope)
+    },
     /**
      * The GLOBAL view: the host composition's own rows, nothing hidden.
      *
@@ -609,24 +682,22 @@ function fakeHost() {
      */
     schemas(scope) {
       if (scope === undefined) return GLOBAL_TOOLS.map((name) => ({ name }))
-      const agent = live.find((entry) => entry.id === scope.id)
-      return visibleFor(scope.id, agent?.preset).map((name) => ({ name }))
+      return [...viewOf(scope).visible.values()].map((entry) => ({ name: entry.name }))
     },
     /**
      * Test-only: register a tool later and fire `tools/change`, the way a real
      * registration does. Used to prove a tool that appears AFTER the switch was set
-     * is hidden as well. The new row is a PRESET row, because that is the layer that
-     * actually gains tools at runtime (an MCP server connecting).
+     * is hidden as well — the restriction is a layer filter, so it masks a name that
+     * arrives tomorrow exactly like one that was already there.
      */
     __register(name) {
       PRESET_TOOLS.push(name)
-      for (const listener of listeners.get('tools/change') ?? []) listener()
+      emit('tools/change')
     },
     /**
      * Test-only: fire `tools/change` without changing anything, the way any unrelated
-     * registry mutation does. The convergence check re-fires it to prove the panel
-     * reaches a fixed point instead of answering every notification with a
-     * tear-down/re-apply pair.
+     * registry mutation does. Used to prove the panel reaches a fixed point instead
+     * of answering every notification with a tear-down/re-apply pair.
      */
     __notify() {
       emit('tools/change')
@@ -634,11 +705,10 @@ function fakeHost() {
     /**
      * Test-only: a name in the agent's OWN layer, which `restrict()` can never mask.
      *
-     * The real registry resolves `restrictableNames` from INHERITED contributions
-     * only, so a scope's own registrations fail the call with "unknown global tool".
-     * The fake models that by rejecting names that are not in the inherited tables —
-     * registering one here is how the "don't re-probe a permanent failure" path gets
-     * exercised.
+     * The real registry derives `restrictableNames` from inherited contributions only,
+     * so a scope's own registrations are LOCKED: visible forever, never switchable.
+     * The fake models that split, and `restrictFor()` rejects these names with the
+     * same "unknown global tool" the real service uses.
      */
     __registerLocal(name) {
       LOCAL_TOOLS.push(name)
@@ -671,17 +741,29 @@ function fakeHost() {
     agent.presetId = shared.presetId
     agent.ctx = {
       // `fiber.uid` is the scope's identity and `fiber.parent` is the enclosing
-      // CONTEXT — the documented Cordis shape. The tool filter no longer walks this
-      // chain (it is registered once, without a scope), but the prompt and skill
-      // shadows still mount per agent, so the scope has to be a real mount point.
+      // CONTEXT — the documented Cordis shape. The prompt and skill shadows mount per
+      // agent, and `restrict()` is registered on THIS scope, so it has to be a real
+      // mount point.
       fiber: { uid: id, parent: undefined },
+      /**
+       * The SCOPED tools service.
+       *
+       * `restrict()` is allowed here and nowhere else — that is the contract the
+       * plugin depends on ("requires a scoped context"), and the fake enforces it by
+       * recording the filter against this agent's id. `view`/`schemas` answer for the
+       * same scope so the plugin can ask what this agent could hide.
+       */
+      tools: {
+        restrict: (filter) => restrictFor(id, filter),
+        view: () => viewOf(id),
+        schemas: () => tools.schemas({ id })
+      },
       plugin(definition) {
         const fiberCtx = {
           tools: {
             guard: tools.guard,
-            // No `restrict()`: the mechanism is gone. Leaving it out is deliberate —
-            // if the plugin ever called it again, this fake would fail loudly instead
-            // of silently accepting the call.
+            restrict: (filter) => restrictFor(id, filter),
+            view: () => viewOf(id),
             schemas: (argument) => tools.schemas(argument ?? { id })
           },
           // Resolved per CALL: the prompt-shadow plugin is mounted when this agent
@@ -1154,6 +1236,31 @@ try {
     check('groups: and the same names the snapshot reported', saved.groups[0].name === 'one')
   }
   {
+    // PROGRESSIVE DISCLOSURE at the storage layer: a deferred group keeps its two
+    // extra fields through normalize/save/load, and a plain group stays free of them
+    // so existing files do not churn.
+    const posted = await (await post({
+      sessionId: 'root-a',
+      groups: [
+        { id: 'g-def', name: 'deferred one', members: ['read', 'write'], disclosure: 'deferred', prompt: 'use when editing files' },
+        { id: 'g-plain', name: 'plain one', members: ['bash'] }
+      ]
+    })).json()
+    const list = posted.state?.groups ?? []
+    const deferredGroup = list.find((group) => group.id === 'g-def')
+    const plainGroup = list.find((group) => group.id === 'g-plain')
+    check('disclosure: a deferred group keeps its mode and prompt',
+      deferredGroup?.disclosure === 'deferred' && deferredGroup?.prompt === 'use when editing files',
+      JSON.stringify(deferredGroup))
+    check('disclosure: a plain group carries neither field',
+      plainGroup?.disclosure === undefined && plainGroup?.prompt === undefined,
+      JSON.stringify(plainGroup))
+    check('disclosure: the session starts with nothing unlocked',
+      Array.isArray(posted.state?.unlocked) && posted.state.unlocked.length === 0,
+      JSON.stringify(posted.state?.unlocked))
+    await post({ sessionId: 'root-a', groups: [] })
+  }
+  {
     // A tool that appears AFTER the list was written (an MCP server connecting) must
     // be hidden too. The fake registers it and emits `tools/change`, which is what a
     // real registration does; the handler defers, so this waits one tick.
@@ -1194,92 +1301,105 @@ try {
     await settle()
   }
   {
-    // THE bug this rewrite fixes, stated as an outcome.
-    //
     // A tool registered into the AGENT'S OWN layer is invisible to
     // `tools.restrict()`: restrictions only filter INHERITED contributions, and that
     // exemption is deliberate — it is how the delegation runtime hands a child its
-    // own tools. So the old implementation could not remove `subagent`,
-    // `send_team`, the `team_task_*` family, `wait_agent`, `interrupt_agent`,
-    // `list_agents` or `list_subagent_models`, and the panel showed their switches
-    // off while the model kept being offered them. That gap is what the user
-    // reported as "tools are not blocked".
-    //
-    // The schema filter does not care which layer registered a name, so it must
-    // remove these exactly like any other denied tool.
+    // own tools. Harness 0.2.2 removed the only mechanism that could have reached
+    // them (the presentation waterfall no longer carries tool declarations), so the
+    // honest answer is to say so: LOCKED, shown, never switchable, and never recorded
+    // in the deny set — a switch that cannot move is worse than no switch.
     const scopeLocal = ['scope_local_probe_a', 'scope_local_probe_b']
     host.tools.__registerLocal(scopeLocal[0])
     host.tools.__registerLocal(scopeLocal[1])
-    await post({ sessionId: 'root-a', deny: scopeLocal })
+    const lockedAnswer = await (await post({ sessionId: 'root-a', deny: scopeLocal })).json()
     await settle()
     const seenByModel = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
     check(
-      'scope-local: a tool registered in the agent own layer IS removed',
-      !seenByModel.includes(scopeLocal[0]),
+      'scope-local: the tool stays visible, because no restriction can remove it',
+      seenByModel.includes(scopeLocal[0]),
       seenByModel.join(',')
     )
     check(
-      'scope-local: and so is the second one',
-      !seenByModel.includes(scopeLocal[1]),
+      'scope-local: and so does the second one',
+      seenByModel.includes(scopeLocal[1]),
       seenByModel.join(',')
+    )
+    check(
+      'scope-local: the snapshot reports both as locked',
+      JSON.stringify(lockedAnswer.state?.locked) === JSON.stringify([...scopeLocal].sort()),
+      JSON.stringify(lockedAnswer.state?.locked)
+    )
+    check(
+      'scope-local: and refuses to record them in the deny set',
+      !(lockedAnswer.state?.denied ?? []).some((name) => scopeLocal.includes(name)),
+      JSON.stringify(lockedAnswer.state?.denied)
     )
     check(
       'scope-local: the untouched tools are still offered',
       seenByModel.includes('read') && seenByModel.includes('working_directory'),
       seenByModel.join(',')
     )
-    // The guard is a separate, cheaper backstop and must stay: it is what stops a
-    // call the model makes from history or through a PTC sub-dispatch.
     check(
-      'scope-local: the guard still refuses the name independently of the filter',
-      typeof host.guards[0]({ name: scopeLocal[0], agent: { id: 'root-a' } }) === 'string'
+      'scope-local: the guard does not refuse a tool the user never denied',
+      host.guards[0]({ name: scopeLocal[0], agent: { id: 'root-a' } }) === undefined
     )
     await post({ sessionId: 'root-a', deny: [] })
     await settle()
   }
   {
-    // WHICH list the menu shows: the MODEL-FACING catalog, not the registry view.
-    //
-    // This is the shipped bug's geometry, and it is NOT the `withoutTools` case
-    // above: there the scope view itself was empty, so a registry read already
-    // answered []. A preset like "空白模式" registers nothing else, but the
-    // process-wide rows its agents inherit stay REGISTERED and stay visible to
-    // `schemas(agent)`; only the assemble stage empties the catalog. The old code
-    // read `schemas(agent)`, so it offered live-looking switches for tools the
-    // model would never see and the guard would refuse.
-    host.extras.systemPrompt = { async assemble() { return { tools: [], sections: [] } } }
+    // A deny set persisted by an older build can still carry a name that is LOCKED
+    // now (the tool moved into an agent's own layer). Read-only has to mean "not
+    // denied", so the registry sweep prunes it: the guard must never refuse a tool
+    // the control draws as read-only, or the panel is back to lying — this time in
+    // the opposite direction.
+    replaceToolDisabled(['write', 'scope_local_probe_a'])
+    // A REAL registry change: the sweep is gated on the registry content (our own
+    // restrictions also emit `tools/change`, so reacting to the event alone would
+    // loop). Registering one more own-layer tool is the change that runs it.
+    host.tools.__registerLocal('scope_local_probe_c')
+    await settle()
+    const afterPrune = getToolDisabled()
     check(
-      'catalog: the registry still reports tools for that session',
-      host.tools.schemas({ id: 'root-a' }).length > 0,
-      host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name).join(',')
+      'locked: a locked name is pruned from the deny set',
+      !afterPrune.includes('scope_local_probe_a'),
+      JSON.stringify(afterPrune)
     )
-    const blankLike = await (await get('root-a')).json()
     check(
-      'catalog: a session whose assembly offers no tools lists none',
-      blankLike.state?.tools?.length === 0,
-      (blankLike.state?.tools ?? []).join(',')
+      'locked: and the hideable name survives the prune',
+      afterPrune.includes('write'),
+      JSON.stringify(afterPrune)
     )
-    // The rule is the CATALOG, not "hide everything when anything is missing": a
-    // preset that offers two of the registry's tools lists exactly those two.
-    host.extras.systemPrompt = { async assemble() { return { tools: [{ name: 'read' }, { name: 'bash' }], sections: [] } } }
-    const partial = await (await get('root-a')).json()
     check(
-      'catalog: the list follows the assembled catalog',
-      JSON.stringify(partial.state?.tools) === '["bash","read"]',
-      JSON.stringify(partial.state?.tools)
+      'locked: the pruned name is no longer refused by the guard',
+      host.guards[0]({ name: 'scope_local_probe_a', agent: { id: 'root-a' } }) === undefined
     )
-    // A denied name is still unioned in, so the switch that turned it off stays
-    // reachable from a session whose catalog no longer carries the tool.
-    await post({ sessionId: 'root-a', deny: ['write'] })
-    const deniedBack = await (await get('root-a')).json()
     check(
-      'catalog: denied names are still listed',
-      JSON.stringify(deniedBack.state?.tools) === '["bash","read","write"]',
-      JSON.stringify(deniedBack.state?.tools)
+      'locked: while the hideable one still is',
+      typeof host.guards[0]({ name: 'write', agent: { id: 'root-a' } }) === 'string'
     )
     await post({ sessionId: 'root-a', deny: [] })
-    // PTC: the wire catalog is the single `run_code` transport schema, so the
-    // per-tool list has to come from the registry instead of collapsing to one row.
+    await settle()
+  }
+  {
+    // TOOLS ARE PROVIDER-OWNED in Harness 0.2.2: the presentation waterfall no longer
+    // carries them, which is exactly why the old schema filter silently stopped
+    // working. The panel must therefore read the verdict from the REGISTRY, and an
+    // assembly that answers an empty tool list must not empty the menu.
+    host.extras.systemPrompt = { async assemble() { return { tools: [], sections: [] } } }
+    const blankLike = await (await get('root-a')).json()
+    check(
+      'catalog: an empty assembly does not empty the list',
+      (blankLike.state?.tools ?? []).length > 0,
+      (blankLike.state?.tools ?? []).join(',')
+    )
+    check(
+      'catalog: and it still lists the real tools',
+      (blankLike.state?.tools ?? []).includes('edit'),
+      (blankLike.state?.tools ?? []).join(',')
+    )
+    // PTC collapses the WIRE catalog to the single `run_code` transport schema. That
+    // is a transport detail, not a registry one: the per-tool list stays the
+    // registry's, which is the only list the switches can act on.
     host.extras.systemPrompt = { async assemble() { return { tools: [{ name: 'run_code' }], sections: [] } } }
     const ptc = await (await get('root-a')).json()
     check(
@@ -1287,29 +1407,16 @@ try {
       (ptc.state?.tools ?? []).includes('edit') && !(ptc.state?.tools ?? []).includes('run_code'),
       (ptc.state?.tools ?? []).join(',')
     )
-    // Everything that cannot answer for the catalog keeps the registry view, which
-    // is exactly what this route returned before the change.
-    delete host.extras.systemPrompt
-    const registryOnly = await (await get('root-a')).json()
+    // A denied name is still unioned in, so the switch that turned it off stays
+    // reachable even though the restriction removed it from the visible set.
+    await post({ sessionId: 'root-a', deny: ['write'] })
+    const deniedBack = await (await get('root-a')).json()
     check(
-      'catalog: no systemPrompt service keeps the registry view',
-      (registryOnly.state?.tools ?? []).includes('edit'),
-      (registryOnly.state?.tools ?? []).join(',')
+      'catalog: denied names are still listed',
+      (deniedBack.state?.tools ?? []).includes('write') && !host.tools.schemas({ id: 'root-a' }).map((x) => x.name).includes('write'),
+      (deniedBack.state?.tools ?? []).join(',')
     )
-    host.extras.systemPrompt = { async assemble() { throw new Error('assembly failed') } }
-    const failedRead = await (await get('root-a')).json()
-    check(
-      'catalog: a failed assembly keeps the registry view',
-      (failedRead.state?.tools ?? []).includes('edit'),
-      (failedRead.state?.tools ?? []).join(',')
-    )
-    host.extras.systemPrompt = { async assemble() { return { sections: [] } } }
-    const noToolsField = await (await get('root-a')).json()
-    check(
-      'catalog: an assembly without `tools` keeps the registry view',
-      (noToolsField.state?.tools ?? []).includes('edit'),
-      (noToolsField.state?.tools ?? []).join(',')
-    )
+    await post({ sessionId: 'root-a', deny: [] })
     delete host.extras.systemPrompt
   }
   {
@@ -2457,13 +2564,6 @@ check('client: sends the session on POST', clientSource.includes('...patch, sess
 check('client: does not hardcode a session id', !/sessionId:\s*['"]/.test(clientSource))
 // The scope badge: the deny set is global and durable, so the menu has to say that a
 // switch affects every conversation and survives a restart.
-check(
-  'client: surfaces the global scope',
-  clientSource.includes("t('toolsGlobal')") &&
-    clientSource.includes("toolsGlobal: '全局 · 重启后仍生效'") &&
-    clientSource.includes("toolsGlobal: 'Global · survives a restart'"),
-  'a scope badge the switches cannot imply on their own'
-)
 check('client: no longer claims a per-session inheritance', !clientSource.includes("t('inherited')"))
 check('client: the icon-only trigger keeps an accessible name', clientSource.includes("'aria-label': t('title')"))
 check(
@@ -2526,7 +2626,6 @@ check(
 // The count badge was removed at the user's request; the scope badge stays, because
 // that one says what the switches cannot: they apply profile-wide and persist.
 check('panel: no count badge', !/tool-count/.test(clientSource) && !/\$\{denied\.size\}\//.test(clientSource))
-check('panel: the scope badge stays', clientSource.includes("t('toolsGlobal')"))
 
 check(
   'scroll: the tab pane is a flex participant',
