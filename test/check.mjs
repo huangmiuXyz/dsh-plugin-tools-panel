@@ -136,6 +136,7 @@ const {
   deferredNamesFor,
   normalizeGroupPrompt,
   registerDeferredIndex,
+  createRestrictor,
   unlockGroup,
   unlockedFor
 } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
@@ -532,78 +533,68 @@ function fakeHost() {
   }
 
   /**
-   * What the MODEL currently sees, per agent, computed by the plugin's own listeners.
-   *
-   * The assembly waterfall is ASYNC, so the fake cannot answer `schemas()` by running
-   * it on demand. Instead the real listeners are drained ahead of time into this
-   * cache, and `schemas()` stays synchronous. Every assertion in this file runs after
-   * a route round-trip or an explicit `settle()`, both of which call `refresh()`.
-   *
-   * Running the plugin's actual listeners (rather than re-implementing "everything
-   * minus the deny set") is what keeps the fake a harness: a filter deleted from the
-   * plugin has to show up as a test failure, not be papered over by the mirror.
+   * Every tool this plugin registered process-wide (the `get_tools` mouth).
    */
-  /**
-   * The section names the fake's global prompt layer registers.
-   *
-   * The prompt filter removes names from `assembly.sections`; without a non-empty
-   * section list there would be nothing to remove and the prompt assertions would
-   * pass vacuously. The prompt-route tests install a richer `systemPrompt` service,
-   * but the FILTER only needs the name list, so this stays a plain array.
-   */
-  const promptSections = ['identity', 'rules', 'style']
-
-  const modelView = new Map()
-
-  /** Every tool this plugin registered process-wide (the `get_tools` mouth). */
   const registered = []
 
   /** The scope-less `system-prompt/assemble` listeners, in registration order. */
   const assembleListeners = []
 
-  /** Names registered for one agent, before any plugin filter runs. */
+  /**
+   * What the assembled CATALOG carries for one agent, computed by the plugin's real
+   * `system-prompt/assemble` listeners.
+   *
+   * This is the PRESENTATION view the panel reads — deliberately not the model view.
+   * The model receives `tools.schemas(agent)`, so an assertion about what the model can
+   * call must use `host.tools.schemas`, and an assertion about what the menu shows uses
+   * this. A test that conflates them cannot tell a stale restriction from a working one.
+   */
+  const catalogSections = ['identity', 'rules', 'style']
+  async function catalogFor(agentId) {
+    const assembly = {
+      tools: registeredFor(agentId).map((name) => ({ name })),
+      sections: catalogSections.map((name) => ({ name, text: `text of ${name}` }))
+    }
+    let result = assembly
+    for (const listener of assembleListeners) {
+      // `next()` must hand each listener what the previous one produced, which is what
+      // the host's `waterfall` does with its shifting callback list.
+      result = await listener(result, { scope: { id: agentId } }, () => Promise.resolve(result))
+    }
+    return {
+      tools: (result.tools ?? assembly.tools).map((schema) => schema.name),
+      sections: (result.sections ?? assembly.sections).map((section) => section.name)
+    }
+  }
+
+  /**
+   * Per-agent registry restrictions, as the REAL service keeps them: a name is hidden
+   * while ANY mounted restriction denies it, and `restrict()` accepts only names the
+   * scope INHERITS (the global composition plus its preset layers). That asymmetry is
+   * the reason the panel cannot hide an agent-local registration at all, so the fake
+   * has to model it rather than pretend every name is maskable.
+   */
+  const restrictions = new Map()
+
+  /** Names registered for one agent, before any restriction applies. */
   function registeredFor(agentId) {
     if (noTools.has(agentId)) return []
     return [...GLOBAL_TOOLS, ...PRESET_TOOLS, ...LOCAL_TOOLS]
   }
 
   /**
-   * Run the real waterfall for one agent and cache what comes out.
+   * What the model is actually offered for one agent: the registry projection.
    *
-   * Mirrors the host: each listener gets `(assembly, context, next)` and may return a
-   * replacement; the outermost value wins. Sections are included so the prompt
-   * filter is exercised through the same path, which is why one drain serves both.
+   * This is the fake's `ctx.tools.schemas(agent)` — NOT the `system-prompt/assemble`
+   * result. The two are different lists in the host (the request carries the registry
+   * projection, the assemble waterfall returns a presentation catalog), and conflating
+   * them is what let a stale `restrict()` mask pass every assertion while the model
+   * kept receiving the tool.
    */
-  async function refresh() {
-    for (const agent of live) {
-      const names = registeredFor(agent.id)
-      const assembly = {
-        tools: names.map((name) => ({ name })),
-        sections: promptSections.map((name) => ({ name, text: `text of ${name}` }))
-      }
-      let result = assembly
-      for (const listener of assembleListeners) {
-        // `next()` must hand each listener what the previous one produced, which is
-        // what the host's `waterfall` does with its shifting callback list.
-        result = await listener(result, { scope: agent }, () => Promise.resolve(result))
-      }
-      modelView.set(agent.id, {
-        tools: (result.tools ?? assembly.tools).map((schema) => schema.name),
-        sections: (result.sections ?? assembly.sections).map((section) => section.name)
-      })
-    }
-  }
-
-  /**
-   * The names one agent can CALL, as the model ends up seeing them.
-   *
-   * Falls back to the unfiltered registry list when no drain has happened yet, so a
-   * caller that reads before the first `refresh()` still gets a sane answer.
-   */
-  function visibleFor(agentId) {
-    const cached = modelView.get(agentId)
-    if (cached !== undefined) return cached.tools
-    return registeredFor(agentId)
+  function restrictedFor(agentId) {
+    const counts = restrictions.get(agentId)
+    const names = registeredFor(agentId)
+    return counts === undefined ? names : names.filter((name) => !counts.has(name))
   }
 
   /**
@@ -638,14 +629,13 @@ function fakeHost() {
     /**
      * The GLOBAL view: the host composition's own rows, nothing hidden.
      *
-     * A scope view is what the agent can CALL, so an agent whose preset mounted no
-     * tools answers `[]` — the general rule, not a special case: the menu lists what
-     * this session can call, whatever the reason it cannot call anything.
+     * A scope view is what the agent can CALL — the registry projection, after every
+     * restriction mounted for that scope. An agent whose preset mounted no tools
+     * answers `[]`: the general rule, not a special case.
      */
     schemas(scope) {
       if (scope === undefined) return GLOBAL_TOOLS.map((name) => ({ name }))
-      const agent = live.find((entry) => entry.id === scope.id)
-      return visibleFor(scope.id, agent?.preset).map((name) => ({ name }))
+      return restrictedFor(scope.id).map((name) => ({ name }))
     },
     /**
      * Test-only: register a tool later and fire `tools/change`, the way a real
@@ -725,9 +715,36 @@ function fakeHost() {
         const fiberCtx = {
           tools: {
             guard: tools.guard,
-            // No `restrict()`: the mechanism is gone. Leaving it out is deliberate —
-            // if the plugin ever called it again, this fake would fail loudly instead
-            // of silently accepting the call.
+            /**
+             * The SCOPED restriction, which is the only seam that changes the model's
+             * tool declarations. It validates like the real service: an empty filter,
+             * an unscoped call, and any name the scope does not INHERIT are refused,
+             * so the plugin has to bisect the list and live with the agent-local names
+             * it cannot mask.
+             */
+            restrict(filter) {
+              const deny = Array.isArray(filter?.deny) ? [...filter.deny] : []
+              if (deny.length === 0) throw new Error('an empty restriction is refused')
+              const inherited = new Set([...GLOBAL_TOOLS, ...PRESET_TOOLS])
+              const unknown = deny.filter((name) => !inherited.has(name))
+              if (unknown.length > 0) {
+                throw new Error(
+                  `tools.restrict() names unknown global tools ${unknown
+                    .map((name) => JSON.stringify(name))
+                    .join(', ')}; known global tools: ${[...inherited].sort().join(', ')}`
+                )
+              }
+              const counts = restrictions.get(id) ?? new Map()
+              restrictions.set(id, counts)
+              for (const name of deny) counts.set(name, (counts.get(name) ?? 0) + 1)
+              return () => {
+                for (const name of deny) {
+                  const next = (counts.get(name) ?? 0) - 1
+                  if (next <= 0) counts.delete(name)
+                  else counts.set(name, next)
+                }
+              }
+            },
             schemas: (argument) => tools.schemas(argument ?? { id })
           },
           // Resolved per CALL: the prompt-shadow plugin is mounted when this agent
@@ -810,7 +827,7 @@ function fakeHost() {
     inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
     effect: (fn) => fn()
   }
-  return { agents, assembleListeners, ctx, extras, guards, live, refresh, registered, registeredFor, routes, server, tools }
+  return { agents, assembleListeners, catalogFor, ctx, extras, guards, live, registered, registeredFor, restrictions, routes, server, tools }
 }
 
 // The module-level set is shared with `apply`, so clear it before wiring the fake
@@ -821,15 +838,14 @@ const host = fakeHost()
 const { apply } = await import(pathToFileURL(path.join(PKG, 'src', 'index.js')).href)
 apply(host.ctx)
 /**
- * Let deferred work land, then re-drain the real assembly listeners.
+ * Let deferred work land.
  *
- * Two things need waiting on: the plugin's own microtasks, and the
- * `system-prompt/assemble` listeners whose result `schemas()` reports. Draining here
- * is what keeps every `schemas()` read after a route call meaningful.
+ * `schemas()` is the registry projection and answers synchronously, but the routes and
+ * the plugin's own microtasks may still be settling; a short tick keeps every assertion
+ * after a route call meaningful without pretending the model view is async.
  */
 const settle = async () => {
   await new Promise((resolve) => setTimeout(resolve, 5))
-  await host.refresh()
 }
 check('apply: registers exactly one guard', host.guards.length === 1, String(host.guards.length))
 check('apply: registers the control route', host.routes.has(ROUTE), ROUTE)
@@ -839,11 +855,11 @@ const base = `http://127.0.0.1:${host.server.address().port}`
 const get = (sessionId) =>
   fetch(sessionId === undefined ? `${base}${ROUTE}` : `${base}${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
 /**
- * POST the control route, then re-drain the assembly listeners.
+ * POST the control route.
  *
- * The drain is part of the helper on purpose: every `schemas()` assertion after a
- * switch is a question about what the model would see NEXT, and the answer only
- * exists once the plugin's listeners have run again.
+ * No drain is needed: hiding is a scoped `restrict()` registration now, applied inside
+ * the route handler, so by the time the response arrives the registry view already
+ * reflects the write.
  */
 const post = async (body, withHeader = true) => {
   const answer = await fetch(`${base}${ROUTE}`, {
@@ -851,7 +867,6 @@ const post = async (body, withHeader = true) => {
     headers: { 'content-type': 'application/json', ...(withHeader ? { [HEADER]: '1' } : {}) },
     body: JSON.stringify(body)
   })
-  await host.refresh()
   return answer
 }
 
@@ -1200,9 +1215,14 @@ try {
     check('groups: and the same names the snapshot reported', saved.groups[0].name === 'one')
   }
   {
-    // A tool that appears AFTER the list was written (an MCP server connecting) must
-    // be hidden too. The fake registers it and emits `tools/change`, which is what a
-    // real registration does; the handler defers, so this waits one tick.
+    // A tool that appears AFTER the list was written (an MCP server connecting).
+    //
+    // `tools.restrict()` validates names when it is called, so a name that was not
+    // registered yet cannot be put in the mask. The tool therefore stays in the model's
+    // list until some later policy edit re-applies the mask — the guard refuses every
+    // call meanwhile, and the catalog filter keeps it out of the menu. A real service
+    // that reconnects is the ordinary case; the honest answer is that hiding catches up
+    // on the next edit, not that the switch retracts the schema retroactively.
     await post({ sessionId: 'root-b', deny: ['mcp__late__tool'] })
     check(
       'tools/change: nothing is hidden before the tool exists',
@@ -1211,16 +1231,30 @@ try {
     host.tools.__register('mcp__late__tool')
     await settle()
     check(
-      'tools/change: the late tool is hidden once it registers',
+      'tools/change: the late tool is visible to the model until a re-apply',
+      host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('mcp__late__tool'),
+      host.tools.schemas({ id: 'root-b' }).map((s) => s.name).join(',')
+    )
+    check(
+      'tools/change: the guard refuses it in the meantime',
+      typeof host.guards[0]({ name: 'mcp__late__tool', agent: { id: 'root-b' } }) === 'string'
+    )
+    const lateCatalog = await host.catalogFor('root-b')
+    check('tools/change: and the catalog filter hides it', !lateCatalog.tools.includes('mcp__late__tool'), lateCatalog.tools.join(','))
+    // Any later policy edit re-applies the whole set, and the now-registered name is
+    // masked for every session — including one that never had the switch written from it.
+    await post({ sessionId: 'root-b', deny: ['mcp__late__tool', 'write'] })
+    await settle()
+    check(
+      'tools/change: a later edit masks it',
       !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('mcp__late__tool')
     )
-    // The set is global, so the late tool is masked for EVERY session once it
-    // registers — including one that never had the switch written from it.
     check(
       'tools/change: and it is masked for other sessions too',
       !host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('mcp__late__tool')
     )
     await post({ sessionId: 'root-b', deny: [] })
+    await settle()
   }
   {
     // Disposing an agent unmounts its scope restriction, but the global set — the
@@ -1240,19 +1274,15 @@ try {
     await settle()
   }
   {
-    // THE bug this rewrite fixes, stated as an outcome.
+    // THE limitation, stated as an outcome rather than wished away.
     //
-    // A tool registered into the AGENT'S OWN layer is invisible to
-    // `tools.restrict()`: restrictions only filter INHERITED contributions, and that
-    // exemption is deliberate — it is how the delegation runtime hands a child its
-    // own tools. So the old implementation could not remove `subagent`,
-    // `send_team`, the `team_task_*` family, `wait_agent`, `interrupt_agent`,
-    // `list_agents` or `list_subagent_models`, and the panel showed their switches
-    // off while the model kept being offered them. That gap is what the user
-    // reported as "tools are not blocked".
-    //
-    // The schema filter does not care which layer registered a name, so it must
-    // remove these exactly like any other denied tool.
+    // A tool registered into the AGENT'S OWN layer is invisible to `tools.restrict()`:
+    // restrictions only filter INHERITED contributions, and that exemption is
+    // deliberate — it is how the delegation runtime hands a child its own tools. So a
+    // name like `subagent`, `spawn_teammate` or the `team_task_*` family cannot be
+    // removed from the model's request. What the panel CAN do is (a) keep it out of the
+    // assembled catalog, (b) refuse every call through the guard, and (c) say so in the
+    // snapshot diagnostics instead of showing a switch that silently does nothing.
     const scopeLocal = ['scope_local_probe_a', 'scope_local_probe_b']
     host.tools.__registerLocal(scopeLocal[0])
     host.tools.__registerLocal(scopeLocal[1])
@@ -1260,24 +1290,29 @@ try {
     await settle()
     const seenByModel = host.tools.schemas({ id: 'root-a' }).map((schema) => schema.name)
     check(
-      'scope-local: a tool registered in the agent own layer IS removed',
-      !seenByModel.includes(scopeLocal[0]),
+      'scope-local: the registry CANNOT mask an agent-local tool',
+      seenByModel.includes(scopeLocal[0]) && seenByModel.includes(scopeLocal[1]),
       seenByModel.join(',')
     )
+    const catalog = await host.catalogFor('root-a')
     check(
-      'scope-local: and so is the second one',
-      !seenByModel.includes(scopeLocal[1]),
-      seenByModel.join(',')
+      'scope-local: the catalog filter still drops it from the menu',
+      !catalog.tools.includes(scopeLocal[0]) && !catalog.tools.includes(scopeLocal[1]),
+      catalog.tools.join(',')
     )
+    // The diagnostic must name what could not be masked, so "why is this switch not
+    // hiding anything" is answerable without a debugger.
+    const snap = await (await get('root-a')).json()
     check(
-      'scope-local: the untouched tools are still offered',
-      seenByModel.includes('read') && seenByModel.includes('working_directory'),
-      seenByModel.join(',')
+      'scope-local: the snapshot reports the unmaskable names',
+      Array.isArray(snap.state?.unmaskable) &&
+        scopeLocal.every((name) => snap.state.unmaskable.includes(name)),
+      JSON.stringify(snap.state?.unmaskable)
     )
     // The guard is a separate, cheaper backstop and must stay: it is what stops a
     // call the model makes from history or through a PTC sub-dispatch.
     check(
-      'scope-local: the guard still refuses the name independently of the filter',
+      'scope-local: the guard refuses the name independently of hiding',
       typeof host.guards[0]({ name: scopeLocal[0], agent: { id: 'root-a' } }) === 'string'
     )
     await post({ sessionId: 'root-a', deny: [] })
@@ -1388,27 +1423,21 @@ try {
   }
   {
     // --- progressive disclosure (protocol 10) --------------------------------
-    // A group can opt in to being DEFERRED: its members leave the model-facing catalog
+    // A group can opt in to being DEFERRED: its members leave the MODEL'S tool list
     // until THIS session loads them, and the only trace is one index line plus the
-    // `get_tools` mouth. The seam is the same assembly filter the deny set uses, so the
-    // layer a tool lives in stops mattering — including agent-local tools, which
-    // `restrict()` could never mask.
+    // `get_tools` mouth. The seam is the same one the deny set uses — a scoped
+    // `tools.restrict()` mask — so the load MUST re-apply the mask in the same call.
+    // That is the regression this block pins: without the unlock hook the mask stays
+    // mounted after the unlock, the group disappears from the model's list for good,
+    // and the panel stops listing it too because it is no longer deferred.
     const MEMBERS = ['read', 'edit']
-    // A real deployment always has the `systemPrompt` service, and the feature is built
-    // on it: the catalog read and the schema filter both live there. The catalog tests
-    // above deliberately ran without it, so re-install one that executes the REAL
-    // assembly listeners for this block.
+    // A real deployment always has the `systemPrompt` service: the catalog read and the
+    // prompt index live there. The catalog tests above deliberately ran without it, so
+    // re-install one that executes the REAL assembly listeners for this block.
     host.extras.systemPrompt = {
       async assemble({ agent } = {}) {
-        const assembly = {
-          tools: host.registeredFor(agent?.id).map((name) => ({ name })),
-          sections: []
-        }
-        let result = assembly
-        for (const listener of host.assembleListeners) {
-          result = await listener(result, { scope: agent }, () => Promise.resolve(result))
-        }
-        return result
+        const catalog = await host.catalogFor(agent?.id)
+        return { tools: catalog.tools.map((name) => ({ name })), sections: [] }
       }
     }
     const deferred = await (
@@ -1424,7 +1453,7 @@ try {
     )
     await settle()
     check(
-      'disclosure: a locked group leaves the model-facing catalog',
+      'disclosure: a locked group leaves the model request list',
       !host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read'),
       host.tools.schemas({ id: 'root-a' }).map((s) => s.name).join(',')
     )
@@ -1460,18 +1489,39 @@ try {
       'disclosure: the load puts the members back',
       MEMBERS.every((name) => host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes(name))
     )
+    // The same fact stated against the MECHANISM: the mask that hid the group is gone,
+    // not merely stale-but-ignored. Without this the model list check above would pass
+    // for the assembly view too, which is exactly how the shipped bug hid.
+    check(
+      'disclosure: the load re-applied the registry mask',
+      !(host.restrictions.get('root-a')?.has('read') ?? false) && !(host.restrictions.get('root-a')?.has('edit') ?? false),
+      JSON.stringify([...(host.restrictions.get('root-a')?.keys() ?? [])])
+    )
     check('disclosure: the index is gone once loaded', deferredIndexText('root-a') === '', deferredIndexText('root-a'))
     check('disclosure: the session reports the unlock', unlockedFor('root-a').has('g-defer'))
     // Per conversation: another session is untouched by this load.
     check('disclosure: another session stays locked', deferredNamesFor('root-b').has('read'))
+    check(
+      'disclosure: and its mask still hides the group',
+      !host.tools.schemas({ id: 'root-b' }).map((s) => s.name).includes('read')
+    )
     // And a subagent inherits its parent's load, so delegating is not a way to get the
     // tools back.
     host.agents.spawn('child-d', 'root-a')
     check('disclosure: a child inherits the parent load', !deferredNamesFor('child-d').has('read'))
+    check(
+      'disclosure: and the child is never masked for it',
+      host.tools.schemas({ id: 'child-d' }).map((s) => s.name).includes('read')
+    )
     // The manual counterpart of `get_tools`: lock it again for this session only.
     await post({ sessionId: 'root-a', hide: ['g-defer'] })
     await settle()
     check('disclosure: hide locks the group again', deferredNamesFor('root-a').has('read'))
+    check(
+      'disclosure: and hide re-applies the mask',
+      !host.tools.schemas({ id: 'root-a' }).map((s) => s.name).includes('read'),
+      host.tools.schemas({ id: 'root-a' }).map((s) => s.name).join(',')
+    )
     check('disclosure: the index comes back', deferredIndexText('root-a').includes('Editors'))
     // `hide` is validated like every other body field.
     const badHide = await post({ sessionId: 'root-a', hide: 'g-defer' })
@@ -1840,6 +1890,77 @@ try {
     }
     check('prompts: the only section cannot be switched off', refused !== undefined && refused.status === 409, String(refused?.status))
     check('prompts: the refusal wrote nothing', getPromptDisabled().length === 0, JSON.stringify(getPromptDisabled()))
+  }
+}
+
+// --- 4c. the restriction controller in isolation ------------------------------
+{
+  // The integration tests above reach the controller through `apply`, which needs the
+  // whole fake host. This block drives it directly, for the two behaviours a route test
+  // cannot isolate: a partially refused batch must still mount the rest, and a refusal
+  // must be a REPORT rather than a cache — a name that was merely not registered yet has
+  // to be picked up by the next policy change.
+  const mounted = new Set()
+  const refusals = new Set()
+  const scopedTools = {
+    restrict(filter) {
+      const deny = Array.isArray(filter?.deny) ? filter.deny : []
+      const bad = deny.filter((name) => refusals.has(name))
+      if (bad.length > 0) throw new Error(`tools.restrict() names unknown global tools ${bad.join(', ')}`)
+      for (const name of deny) mounted.add(name)
+      return () => {
+        for (const name of deny) mounted.delete(name)
+      }
+    },
+    schemas: () => [],
+    guard: () => () => {}
+  }
+  const agent = {
+    id: 'restrictor-probe',
+    ctx: {
+      plugin(definition) {
+        definition.apply?.({ tools: scopedTools, effect: (fn) => fn() })
+        return { dispose() {} }
+      }
+    }
+  }
+  const controller = createRestrictor()
+  try {
+    replaceToolDisabled([])
+    setGroups([])
+    controller.mount(agent)
+    controller.syncAll()
+    check('restrictor: a quiet policy mounts no restriction', mounted.size === 0, [...mounted].join(','))
+
+    replaceToolDisabled(['alpha', 'beta', 'gamma'])
+    refusals.add('beta')
+    controller.syncAll()
+    check('restrictor: the refused name is skipped', !mounted.has('beta'), [...mounted].join(','))
+    check('restrictor: the accepted names still mount', mounted.has('alpha') && mounted.has('gamma'), [...mounted].join(','))
+    check(
+      'restrictor: the scope reports what it could not mask',
+      controller.unmaskableFor(agent.id).join(',') === 'beta',
+      controller.unmaskableFor(agent.id).join(',')
+    )
+
+    // The controller must not remember the refusal: once the registry can take the name,
+    // the next policy change has to mount it.
+    refusals.delete('beta')
+    replaceToolDisabled(['alpha', 'beta'])
+    controller.syncAll()
+    check(
+      'restrictor: a changed policy rebuilds the mask, including the previously refused name',
+      mounted.has('alpha') && mounted.has('beta') && mounted.size === 2,
+      [...mounted].join(',')
+    )
+
+    replaceToolDisabled([])
+    controller.syncAll()
+    check('restrictor: an empty policy lifts every name', mounted.size === 0, [...mounted].join(','))
+  } finally {
+    controller.dispose()
+    replaceToolDisabled([])
+    setGroups([])
   }
 }
 

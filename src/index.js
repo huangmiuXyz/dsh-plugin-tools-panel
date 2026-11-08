@@ -8,32 +8,41 @@
  *   next tool call already sees it — no reload, no restart, not even a re-render.
  *
  * TWO MECHANISMS, ON PURPOSE
- *   1. HIDING (`system-prompt/assemble`). The denied tools are removed from the
- *      schema list handed to the model, so they are never offered in the first
- *      place. This is the primary mechanism: the model does not see the tool, so it
- *      does not call it, and the request is smaller.
+ *   A model request's tool declarations are the registry's scoped projection
+ *   (`ctx.tools.schemas(agent)`; `request/header.tools` in the session log records
+ *   that exact list). Both mechanisms act on that projection.
  *
- *      WHY NOT `ctx.tools.restrict()`, WHICH IS THE DOCUMENTED WAY TO HIDE A TOOL
- *      `restrict()` filters what a scope INHERITS and never what its own layer
- *      registers — an exemption the delegation runtime depends on, because that is
- *      how a child gets its own structured-output tools. Every agent-local tool
- *      (the `subagent` / `team_task_*` / `wait_agent` family) therefore made
- *      `restrict()` throw "unknown global tool", so the switch showed off while the
- *      model was still offered the tool. Filtering the assembled schema list is
- *      layer-agnostic and removes both kinds.
+ *   1. HIDING (`ctx.tools.restrict({ deny })`). One restriction fiber mounted inside
+ *      each live agent's context, because the contract is scope-bound. The name leaves
+ *      the model's tool list, so it is never offered and the request is smaller. This
+ *      is the primary mechanism.
  *
- *      The listener is registered ONCE, on the plugin's own context. The waterfall
- *      dispatch resolves listeners through `scopeTarget`, whose filter accepts a
- *      scope-less registration for every scope, so one listener covers all live
- *      agents and every agent created later — no per-agent mount, no re-sync, no
- *      release on disposal, and no scope chain to walk.
+ *      SCOPE-LOCAL EXEMPTION: `restrict()` filters what a scope INHERITS and never what
+ *      its own layer registers — an exemption the delegation runtime depends on,
+ *      because that is how a child gets its own structured-output tools. Every
+ *      agent-local tool (`spawn_teammate`, the `team_task_*` family, `wait_agent`, …)
+ *      therefore fails the call with "unknown global tool" and STAYS in the model's
+ *      list. The snapshot reports those names (`unmaskable`), the catalog filter below
+ *      still hides them from the menu, and the guard is what refuses them.
  *
- *   2. GUARDING (`ctx.tools.guard()`). A backstop, and deliberately kept. The filter
- *      only shapes what the MODEL is shown; it cannot stop a call that arrives from
- *      conversation history, from a resumed session whose header predates the
- *      switch, or through a PTC sub-dispatch. The guard is a SYNCHRONOUS monotonic
- *      check in the execution pipeline, so such a call is refused with a reason the
- *      model can read even when the schema no longer lists it.
+ *      A restriction is an explicit registration, so a changed set must be re-applied
+ *      to every mounted scope: `setDeny` and a group load/lock each fire a hook that
+ *      re-syncs. Forgetting the load/lock half is exactly what made `get_tools` report
+ *      a group as loaded while its tools never reached the request.
+ *
+ *   2. CATALOG FILTERING (`system-prompt/assemble`). The assembled catalog is a
+ *      PRESENTATION view — the panel reads it, the request does not — so this listener
+ *      exists to keep that view consistent with the policy and to cover the names
+ *      `restrict()` cannot mask. It is registered ONCE on the plugin's own context; the
+ *      waterfall dispatch accepts a scope-less listener for every scope, so one listener
+ *      covers all live agents and every agent created later.
+ *
+ *   3. GUARDING (`ctx.tools.guard()`). A backstop, and deliberately kept. Hiding shapes
+ *      what the model is offered; it cannot stop a call that arrives from conversation
+ *      history, from a resumed session whose header predates the switch, or through a
+ *      PTC sub-dispatch. The guard is a SYNCHRONOUS monotonic check in the execution
+ *      pipeline, so such a call is refused with a reason the model can read even when
+ *      the schema no longer lists it.
  *
  * WHY THE GUARD IS NOT THE PRIMARY MECHANISM
  *   A guard can only refuse a call that was already made. That burns a step per
@@ -47,19 +56,22 @@
  *   what makes this tab behave like the skills and prompts tabs: one durable answer
  *   about the environment, not a restriction on one conversation.
  *
- *   Nothing has to be re-applied when the set changes: the filter reads the live
- *   deny set during each assembly, so the next model step already reflects the edit.
+ *   Nothing has to be re-applied when the set changes for the GUARD (it reads the live
+ *   set on every call) or for the catalog filter (it reads it every assembly). The
+ *   registry restriction is an explicit registration, so the two policy hooks re-apply
+ *   it: {@link onDenyChanged} for a deny write and {@link onUnlockChanged} for a group
+ *   load/lock.
  *
  *   A call with NO agent is governed too: the set is global, so there is no session
  *   to consult and nothing to exempt.
  *
  * WHAT POPULATES THE LIST
- *   The control lists the tools the session can actually see, read from the
- *   registry (`ctx.tools.schemas(agent)`) at the moment the menu opens. Nothing is
- *   hard-coded here: an MCP server or a third-party plugin that registers a tool
- *   shows up in the menu by itself, and uninstalls disappear from it. The names
- *   that are currently denied are always listed too: the registry still holds them,
- *   and without them a denied tool could never be re-enabled.
+ *   The control lists the tools the session can actually see, read from the assembled
+ *   catalog (`system-prompt/assemble`), with `ctx.tools.schemas(agent)` as the
+ *   fallback. Nothing is hard-coded here: an MCP server or a third-party plugin that
+ *   registers a tool shows up in the menu by itself, and uninstalls disappear from it.
+ *   The names that are currently denied (or deferred) are always listed too: hiding is
+ *   what removes them, and without the union they could never be switched back on.
  *
  * PERSISTENCE
  *   The deny set is DURABLE and global: one file under `DSH_HOME`, written on every
@@ -82,10 +94,10 @@
  *
  * PROGRESSIVE DISCLOSURE (protocol 10)
  *   A group may OPT IN to being deferred: the user gives it a description prompt and,
- *   while it is deferred, its member tools are dropped from the assembled schema list
- *   exactly like denied ones — same `system-prompt/assemble` seam, so LAYER DOES NOT
- *   MATTER. They cost no context until the model asks for them, and the only thing
- *   left about them is one index line in the system prompt:
+ *   while it is deferred, its member tools are hidden from the MODEL'S tool list — the
+ *   scoped `restrict()` seam described above (the catalog filter drops them from the
+ *   menu's view as well). They cost no context until the model asks for them, and the
+ *   only thing left about them is one index line in the system prompt:
  *
  *     1. a `tools-panel:deferred-tools` section naming each still-locked group, its
  *        description prompt and its member count (never the member names), and
@@ -96,11 +108,14 @@
  *   about one conversation, so a new conversation (or a restart) starts locked again,
  *   and a subagent inherits its parent's loads through the delegation tree. The group
  *   DEFINITION (whether it defers, and its prompt) is durable and global, like every
- *   other group field.
+ *   other group field. Loading must also LIFT the registry mask in the same call — the
+ *   unlock hook does that — or the tools stay hidden even though the index says loaded.
  *
  *   Disclosure is CONTEXT ECONOMY, NOT POLICY: a deferred tool stays callable by name
  *   (it is not denied, and the guard does not refuse it), which is why it is not
- *   merged into `denied` anywhere.
+ *   merged into `denied` anywhere. Names registered in an agent's OWN layer cannot be
+ *   masked at all, so they stay advertised; the snapshot's `unmaskable` diagnostics say
+ *   which ones, per session.
  */
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -156,6 +171,11 @@ const HEADER = 'x-dsh-plugin-tools-panel'
  * group ids it has loaded), and a POST may carry `hide` to lock a group again. A
  * client that does not read those fields would show a deferred group's members as
  * ordinary rows, so the number had to move.
+ *
+ * 10 also grew host-side DIAGNOSTICS this client ignores: `masked` (hidden names still
+ * in the registry view), `scopes` (mounted restriction fibers), `unmaskable` (names the
+ * host refused to mask for this session) and `scopesError`. Additive and read-only, so
+ * they did not need a number of their own.
  */
 const PROTOCOL = 10
 
@@ -712,6 +732,28 @@ let groups = loadGroups()
  */
 let onGroupsChanged = () => {}
 
+/**
+ * Run after the deny set is replaced, so the mounted restrictions follow it.
+ *
+ * The two hiding halves disagree about when they need telling. The assembly filter
+ * reads `denied` on every assembly and needs nothing; the REGISTRY restriction is an
+ * explicit registration and does. `apply` swaps in the live hook.
+ */
+let onDenyChanged = () => {}
+
+/**
+ * Run after a session's LOADED-GROUP set changes, so the mounted restrictions follow it.
+ *
+ * Same asymmetry as {@link onDenyChanged}, and the reason `get_tools` could report a
+ * group as loaded while the tools were missing from the very next request: the mask
+ * installed while the group was still deferred is a registration, so unlocking in
+ * memory left it in place. The model's declarations come from the registry's scoped
+ * projection, not from the assemble waterfall, so without this hook the group was
+ * hidden twice and revealed never — and because the names were no longer deferred, the
+ * panel stopped listing them too.
+ */
+let onUnlockChanged = () => {}
+
 // --- progressive disclosure, per session -------------------------------------
 
 /**
@@ -793,6 +835,8 @@ function unlockGroup(sessionId, groupId) {
   const next = new Set(current ?? [])
   next.add(groupId)
   unlocked.set(sessionId, next)
+  // The registry mask must go, or the tools stay hidden forever: see onUnlockChanged.
+  onUnlockChanged()
   return true
 }
 
@@ -804,6 +848,9 @@ function lockGroup(sessionId, groupId) {
   next.delete(groupId)
   if (next.size === 0) unlocked.delete(sessionId)
   else unlocked.set(sessionId, next)
+  // The counterpart of the unlock: the group's names must be masked again NOW, not on
+  // the next policy edit.
+  onUnlockChanged()
   return true
 }
 
@@ -891,30 +938,28 @@ function makeGuard() {
 // --- per-agent hiding ---------------------------------------------------------
 
 /**
- * The prompt-level filter: remove denied tools from the schema list the model is shown.
+ * The catalog filter: remove hidden names from the tool list ONE ASSEMBLY carries.
  *
- * WHY THIS REPLACES `tools.restrict()`
- *   `restrict()` can only mask what a scope INHERITS. It never touches the scope's
- *   OWN layer — and the delegation runtime registers its tools (`subagent`,
- *   `send_team`, the `team_task_*` family, `wait_agent`, `interrupt_agent`,
- *   `list_agents`, `list_subagent_models`) into the agent's own layer precisely so a
- *   per-child capability filter cannot strip them. For those names `restrict()`
- *   throws "unknown global tool", so the tool stayed in the model's schema list while
- *   the panel showed its switch as off. That is the "still visible after disabling"
- *   symptom this module now fixes.
+ * WHAT THIS IS NOT
+ *   This is not the enforcement seam. A model request's tool declarations are the
+ *   registry's scoped projection (`ctx.tools.schemas(agent)`), which is what
+ *   `request/header.tools` in the session log records; the assemble waterfall returns a
+ *   PRESENTATION catalog that other prompt consumers and this panel read. Rewriting its
+ *   `tools` therefore does not change what the model is offered — the live proof being a
+ *   deferred group whose members are registered in the agent's own scope, which stayed in
+ *   the request while this filter dropped them.
+ *
+ *   Enforcement is `ctx.tools.restrict()` per agent scope ({@link createRestrictor}),
+ *   because restrictions only filter inherited contributions. This filter runs on
+ *   purpose anyway: it keeps the catalog consistent with the policy for the panel and for
+ *   any other plugin that reads the assembled catalog, and it covers the scope-local
+ *   names that `restrict()` structurally cannot mask.
  *
  * THE HOOK
- *   `system-prompt/assemble` is the waterfall that produces the prompt AND the tool
- *   schemas for one step; the loop then feeds `assembly.tools` straight into the
- *   request. Its return value replaces the whole assembly, which is exactly what
- *   makes a filter possible here: nothing else in the pipeline can remove a tool that
- *   a plugin registered into its own scope.
- *
  *   The hook is registered on the PLUGIN's context, not per agent. `waterfall` is
  *   dispatched through `scopeTarget(this, scope)`, and that filter accepts a listener
  *   registered with no scope for every scope (`tag === void 0` returns true). One
- *   registration therefore covers every agent, including ones created later, and
- *   there are no per-agent fibers to mount, re-sync, or clean up.
+ *   registration therefore covers every agent, including ones created later.
  *
  * THE COST, STATED PLAINLY
  *   The Harness plugin guide says not to add or remove tools through this waterfall,
@@ -948,6 +993,252 @@ function createSchemaFilter() {
     })
 }
 
+
+// --- per-agent hiding (the registry half) -------------------------------------
+
+/**
+ * The names one session must not be offered: the global deny set plus the deferred
+ * groups it has not loaded.
+ *
+ * The assembly filter asks the same question, but only for the CATALOG the panel reads.
+ * THIS set is what the registry is asked to remove, because a schema the registry still
+ * returns is a schema the loop can still send: a request's tool declarations are built
+ * from `tools.schemas(agent)`, not from the assemble waterfall.
+ */
+function hiddenNamesFor(sessionId) {
+  const names = new Set(denied)
+  for (const name of deferredNamesFor(sessionId)) names.add(name)
+  return names
+}
+
+/**
+ * Mount a `ctx.tools.restrict()` restriction into every live agent's scope.
+ *
+ * WHY THE REGISTRY, NOT THE ASSEMBLY
+ *   `system-prompt/assemble` is a PRESENTATION waterfall: it shapes the prompt text and
+ *   the catalog the panel reads, but the tool DECLARATIONS of a model request are the
+ *   registry's scoped projection (`tools.schemas(agent)`) — `request/header.tools` in
+ *   the session log is exactly that list. Rewriting `assembly.tools` therefore changes
+ *   what the panel shows while the model keeps receiving every schema. The live proof:
+ *   a deferred group whose members are registered in the agent's own scope stayed in
+ *   the request even while the assembly filter dropped them.
+ *
+ *   `restrict({ deny })` IS the registry seam, and it is scope-bound on purpose: the
+ *   contract refuses an unscoped call ("would mask every agent"), so the only supported
+ *   way is a fiber mounted INSIDE the agent's own context. A name the scope may not mask
+ *   — one registered in its OWN layer, which is how the delegation runtime hands an
+ *   agent `subagent`, `spawn_teammate`, `team_task_*`, … — fails the call. Those stay in
+ *   the model's list; for a DENIED name the guard still refuses every call, which is
+ *   the documented backstop, and for a DEFERRED name the schema stays advertised (the
+ *   context saving is lost, the tool is not).
+ *
+ * WHY A BISECT
+ *   One unacceptable name fails the whole batch, and the error does not say which names
+ *   were the problem. Retrying one name at a time costs a round trip per name and emits
+ *   `tools/change` per success; halving the list finds the refused names in O(k log n)
+ *   calls. The refused names are reported (`unmaskable`) and re-hunted only when the
+ *   policy changes, so an unchanged wanted set never touches the registry.
+ *
+ * The wanted set is read from POLICY (deny + disclosure), never from the live view, so
+ * hiding cannot feed itself: `restrict()` emits `tools/change`, and an unchanged wanted
+ * set returns before touching the registry. A group load/lock and a deny edit are the
+ * events that change it — see `onUnlockChanged` / `onDenyChanged`.
+ * @returns the controller used by the agent lifecycle and the routes.
+ */
+function createRestrictor() {
+  /** agent id -> { holder, fiber } */
+  const entries = new Map()
+  /** Agents whose scope could not take a fiber at all: id -> reason. */
+  const unmounted = new Map()
+  let live = true
+
+  /** One agent's restriction fiber: it re-reads the policy when asked. */
+  function mount(agent) {
+    if (!live) return
+    const id = agent?.id
+    if (typeof id !== 'string' || entries.has(id)) return
+    const agentCtx = agent?.ctx
+    if (agentCtx === undefined || typeof agentCtx.plugin !== 'function') {
+      unmounted.set(id, 'agent scope has no ctx.plugin: hiding unavailable, the guard still refuses calls')
+      return
+    }
+    /**
+     * Names this scope refused to mask during the LAST pass, for diagnostics.
+     *
+     * Not a cache: the registry validates names at call time, so a name refused
+     * because it was not registered yet must get another chance after the set changes
+     * (an MCP server connecting is the ordinary case). Re-hunting on a policy edit
+     * costs a handful of in-process calls and is the only way to tell the two apart —
+     * the host's error reports both as "unknown global tools".
+     */
+    let unmaskable = new Set()
+    /** The last thing that went wrong in this scope, if anything. */
+    const holder = { sync: () => {}, error: undefined, unmaskable: () => [...unmaskable].sort() }
+    const definition = {
+      name: 'dsh-plugin-tools-panel:restricted-tools',
+      inject: ['tools'],
+      apply(c) {
+        let stopped = false
+        /** The exact wanted set the mounted restriction was built for, `\0`-joined. */
+        let applied
+        const disposers = []
+        const clear = () => {
+          for (const off of disposers.splice(0)) {
+            try {
+              off()
+            } catch {
+              /* the layer is already gone */
+            }
+          }
+        }
+        const sync = () => {
+          if (stopped) return
+          if (typeof c.tools?.restrict !== 'function') {
+            holder.error =
+              'ctx.tools.restrict is unavailable in this scope: the model still sees every tool, ' +
+              'the guard refuses denied calls'
+            return
+          }
+          const wanted = [...hiddenNamesFor(id)].sort()
+          const signature = wanted.join('\u0000')
+          // An unchanged wanted set keeps the mounted restriction: rebuilding it would
+          // tear down and re-add the same layer, and both directions emit `tools/change`
+          // synchronously.
+          if (signature === applied) return
+          clear()
+          applied = signature
+          unmaskable = new Set()
+          if (wanted.length === 0) {
+            holder.error = undefined
+            return
+          }
+          const rejected = []
+          /**
+           * Restrict one group of names. A failure means at least one name in the group
+           * is unacceptable here, so halve until the culprit is a single name: the host
+           * does not say which ones it refused.
+           */
+          const attempt = (names) => {
+            try {
+              disposers.push(c.tools.restrict({ deny: names }))
+            } catch {
+              if (names.length === 1) {
+                rejected.push(names[0])
+                return
+              }
+              const middle = names.length >> 1
+              attempt(names.slice(0, middle))
+              attempt(names.slice(middle))
+            }
+          }
+          attempt(wanted)
+          if (rejected.length === 0) {
+            holder.error = undefined
+            return
+          }
+          for (const name of rejected) unmaskable.add(name)
+          holder.error =
+            `${rejected.length} hidden name${rejected.length === 1 ? '' : 's'} cannot be masked in this ` +
+            `scope (registered in the agent's own layer, or not registered yet): ${rejected.join(', ')}`
+        }
+        holder.sync = sync
+        try {
+          c.effect(() => () => {
+            stopped = true
+            holder.sync = () => {}
+            clear()
+          })
+        } catch {
+          /* a minimal context without `effect`: the fiber teardown still runs */
+        }
+        sync()
+      }
+    }
+    try {
+      entries.set(id, { holder, fiber: agentCtx.plugin(definition) })
+      unmounted.delete(id)
+    } catch (failure) {
+      unmounted.set(id, String(failure?.message ?? failure))
+    }
+  }
+
+  function syncAll() {
+    if (!live) return
+    for (const entry of entries.values()) {
+      try {
+        entry.holder.sync()
+      } catch (failure) {
+        // One dead scope must not stop the rest.
+        entry.holder.error = String(failure?.message ?? failure)
+      }
+    }
+    writeHidingReport()
+  }
+
+  /**
+   * A small file under the panel directory, so "is the restriction actually mounted,
+   * and on what" is answerable by opening one JSON file instead of restarting with a
+   * debugger. Best effort: a read-only home just skips it.
+   */
+  function writeHidingReport() {
+    try {
+      const failures = []
+      const agents = []
+      for (const [id, entry] of entries) {
+        const names = [...hiddenNamesFor(id)].sort()
+        const unmaskable = entry.holder.unmaskable()
+        agents.push({ id, names, unmaskable })
+        if (entry.holder.error !== undefined) failures.push(`${id}: ${entry.holder.error}`)
+      }
+      for (const [id, reason] of unmounted) failures.push(`${id}: ${reason}`)
+      const report = {
+        at: new Date().toISOString(),
+        agents,
+        error: failures.length === 0 ? null : failures.join(' | ')
+      }
+      const file = join(panelDir(), 'hiding.json')
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+    } catch {
+      /* diagnostics must never take the switch down */
+    }
+  }
+
+  return {
+    mount,
+    syncAll,
+    release(id) {
+      entries.delete(id)
+      unmounted.delete(id)
+    },
+    dispose() {
+      live = false
+      for (const entry of entries.values()) {
+        try {
+          entry.fiber?.dispose?.()
+        } catch {
+          /* already gone */
+        }
+      }
+      entries.clear()
+      unmounted.clear()
+    },
+    get size() { return entries.size },
+    /** The first scope-level failure, for the diagnostics in the snapshot. */
+    get error() {
+      const first = unmounted.values().next()
+      if (first.done !== true) return first.value
+      for (const entry of entries.values()) {
+        if (entry.holder.error !== undefined) return entry.holder.error
+      }
+      return undefined
+    },
+    /** The names this scope could not mask (diagnostics only). */
+    unmaskableFor(id) {
+      return entries.get(id)?.holder.unmaskable() ?? []
+    }
+  }
+}
 
 // --- progressive disclosure: the index and the fetch tool ---------------------
 
@@ -1017,10 +1308,10 @@ function findGroupByName(list, value) {
 /**
  * Whether one tool is registered at all (mounted somewhere), through the global view.
  *
- * The assembly read below answers "is it in the request", which is the truth while the
- * group is loaded. The global view covers the case the assembly cannot be read at all
- * (no `systemPrompt` service, PTC collapsing the catalog to `run_code`): a name
- * registered process-wide counts as loaded, because that is where an agent inherits it.
+ * The scoped registry read below is the model's tool list, which is the truth while the
+ * group is loaded. This global view covers the case the scope view cannot answer (no
+ * agent, a registry that throws): a name registered process-wide counts as loaded,
+ * because that is where an agent inherits it.
  * @returns whether the name is registered, or undefined when there is no registry.
  */
 function registeredSomewhere(host, name) {
@@ -1040,7 +1331,7 @@ function registeredSomewhere(host, name) {
  * {@link getToolsDefinition}), so a group whose list is partly unmounted only needs the
  * missing count to report honestly.
  * @param group - the group definition.
- * @param live - the names the calling agent's assembly carries, after the unlock.
+ * @param live - the names the calling agent's registry projection carries after the unlock.
  * @param host - the registry, for the global fallback (see `registeredSomewhere`).
  * @returns the member count and how many of them are not in the catalog.
  */
@@ -1068,9 +1359,9 @@ function describeGroup(group, live, host) {
  * {@link createDeferredTools}), so a profile that never uses the feature pays no schema
  * for a tool that could never answer anything.
  * @param enable - unlock one group for one session; returns whether it changed.
- * @param names - the calling agent's model-facing tool names (async: it is one
- *   assembly), so the answer can say how many members actually landed.
- * @param registry - `{ tools }`, read for the global view (see `registeredSomewhere`).
+ * @param names - the calling agent's model-facing tool names, read from the registry
+ *   projection after the unlock, so the answer can say how many members actually landed.
+ * @param registry - `{ tools }`, read for the global fallback (see `registeredSomewhere`).
  */
 function getToolsDefinition({ enable, names, registry }) {
   return {
@@ -1168,11 +1459,11 @@ function getToolsDefinition({ enable, names, registry }) {
       const nowOpen = sessionId === undefined || wasOpen
         ? false
         : enable(sessionId, group.id)
-      // Read the model-facing catalog AFTER the unlock. The filter consults the unlocked
-      // set during assembly, so this is the honest answer to "did the members land" —
-      // reading it before would count the members this very call just revealed as
-      // "missing", because disclosure was hiding them from the same catalog.
-      const live = exec?.agent === undefined ? new Set() : await names(exec.agent)
+      // Read the model's tool list AFTER the unlock. `enable()` lifts the registry mask
+      // synchronously through the unlock hook, so this is the honest answer to "did the
+      // members land"; reading it before would report the names this very call just
+      // revealed as "missing".
+      const live = exec?.agent === undefined ? new Set() : names(exec.agent)
       const described = describeGroup(group, live, registry)
       // The answer is the confirmation and nothing else: the schemas arrive with the
       // tools themselves on the next step, so they are not copied into this text.
@@ -1227,7 +1518,7 @@ function getToolsDefinition({ enable, names, registry }) {
  * registered separately, so the model would still learn the groups exist, and the next
  * group edit retries.
  * @param ctx - the plugin context (`tools`).
- * @param host - `{ systemPrompt }`, read per call for the model-facing catalog.
+ * @param host - `{ tools }`, read per call for the model-facing registry view.
  */
 function createDeferredTools(ctx, host) {
   /** The registration disposer while `get_tools` is mounted. */
@@ -1251,13 +1542,17 @@ function createDeferredTools(ctx, host) {
       off = ctx.tools.register(
         getToolsDefinition({
           enable(sessionId, groupId) {
-            // Unlocking is the whole job now: the next assembly consults the unlocked
-            // set itself, so there is no restriction to lift.
+            // Unlocking is not the whole job: the registry mask has to come off in the
+            // same breath, which `unlockGroup` does through the unlock hook. Returning
+            // its boolean is all this call has to add.
             return unlockGroup(sessionId, groupId)
           },
-          async names(agent) {
-            const assembled = await assembledToolNames(host, agent)
-            return new Set(assembled ?? registryToolNames(host, agent))
+          names(agent) {
+            // The registry projection is the model's tool list. The assemble waterfall
+            // is a catalog by comparison; reading it here would report a member the
+            // filter happens to drop (a scope-local name) as "missing" although the
+            // model still receives it.
+            return new Set(registryToolNames(host, agent))
           },
           registry: { tools: ctx.tools }
         })
@@ -1805,20 +2100,21 @@ function registryToolNames(host, agent) {
 }
 
 /**
- * The names in the MODEL-FACING catalog, or `undefined` when the assembly cannot
- * answer for this session.
+ * The names in the assembled CATALOG, or `undefined` when the assembly cannot answer.
  *
- * `assembly.tools` is the exact list the loop hands to the request, AFTER every
- * `system-prompt/assemble` listener has run. That is what the menu has to show,
- * because the registry view is not the request: the blank preset's whole point is
- * that its catalog is empty while the process-wide rows it inherits are still
- * registered and still visible to `schemas()`. Reading the assembly is also what
- * makes this tab follow every other assemble-time filter, not just this plugin's.
+ * `assembly.tools` is the post-waterfall catalog: what the panel and any other
+ * prompt-side consumer read as "the tools this conversation offers". It is NOT the
+ * request's declaration list — that is `schemas(agent)`, the registry projection — but
+ * it is the closest thing to a preset-scoped catalog this plugin can read, and every
+ * assemble-time filter (this plugin's and other plugins') lands in it.
+ *
+ * The two views agree on everything this panel hides: the registry mask removes global
+ * names, this filter removes them from the catalog, and the scope-local names the mask
+ * cannot reach are unioned back into the menu as policy rows (`deferred` / `denied`).
  *
  * PTC presentation collapses the catalog to the single `run_code` transport schema.
- * In that mode the per-tool list is still the registry's (the request has nothing
- * per-tool to filter, so the guard is the enforcement), so answering `run_code`
- * alone would hide every switch the tab exists for.
+ * In that mode the per-tool list is still the registry's, so answering `run_code` alone
+ * would hide every switch the tab exists for.
  */
 async function assembledToolNames(host, agent, signal) {
   let assembly
@@ -1840,12 +2136,12 @@ async function assembledToolNames(host, agent, signal) {
 /**
  * Tool names the session can see, plus every name it has denied.
  *
- * THE LIST IS THE MODEL-FACING ONE, read from the assembled catalog. `schemas(agent)`
- * is only the fallback — no `systemPrompt` service, an assembly that fails or does
- * not carry `tools`, or the PTC collapse above — because the registry view is where
- * this panel was wrong: under a preset that empties its catalog ("空白模式") the
- * registry still holds the inherited rows, so the menu offered live-looking switches
- * for tools the model would never see and the guard would refuse.
+ * THE LIST IS THE ASSEMBLED CATALOG, with `schemas(agent)` as the fallback — no
+ * `systemPrompt` service, an assembly that fails or does not carry `tools`, or the PTC
+ * collapse above. The assembly is read because that is the list other prompt-side
+ * filters shape, and under a preset that empties its catalog ("空白模式") the registry
+ * still holds its inherited rows; offering live-looking switches for tools the model
+ * would not receive was the bug this read replaced.
  *
  * The denied names are unioned in because hiding is exactly what removes them from
  * that answer — without the union the control could only ever switch tools OFF. A
@@ -1872,23 +2168,22 @@ async function toolsForSession(sessionId, host, signal) {
 }
 
 /**
- * How many of the denied names are really gone from this session's registry view.
+ * How many of the hidden names the registry no longer offers to this session.
  *
- * A sanity gauge rather than a policy input. `schemas(agent)` is the registry view,
- * which the schema filter does not rewrite — the filter runs later, at assembly. So a
- * denied name still appearing here is EXPECTED for its own layer's tools; what the
- * number catches is the opposite, surprising case: a name vanishing from the registry
- * for some other reason (its plugin unloaded), which would make a switch look
- * effective when it is merely unmounted.
+ * This is the difference between "hidden" and "merely guarded". A name that is denied
+ * (or deferred) but still in `schemas(agent)` was NOT masked — it is being stopped by
+ * the guard alone, which is exactly the symptom this number exists to expose. Reading it
+ * from the snapshot is what makes that answerable without a debugger.
  */
 function maskedCount(sessionId, host) {
-  if (denied.size === 0) return 0
-  const agent = host.agents?.get?.(sessionId)
+  const hidden = hiddenNamesFor(sessionId)
+  if (hidden.size === 0) return 0
+  const agent = agentFor(host, sessionId)
   if (agent === undefined) return 0
   try {
     const visible = new Set(host.tools.schemas(agent).map((schema) => schema.name))
     let masked = 0
-    for (const name of denied) if (!visible.has(name)) masked += 1
+    for (const name of hidden) if (!visible.has(name)) masked += 1
     return masked
   } catch {
     return 0
@@ -1913,10 +2208,14 @@ async function snapshot(sessionId, host, signal) {
     sessionId,
     tools,
     denied: [...denied].sort(),
-    // Diagnostics, not UI: how many denied names are really gone from the model's
-    // schema list. The filter is process-wide now, so there is no per-agent scope
-    // count or mount error left to report.
+    // Diagnostics, not UI: how many hidden names are really gone from the registry's
+    // view of this session (0 means the switch is being enforced by the guard alone),
+    // which scopes the restriction is mounted on, which names the scope refused to
+    // mask, and why the last mount failed.
     masked: host === undefined ? undefined : maskedCount(sessionId, host),
+    scopes: host?.restrictor?.size ?? 0,
+    unmaskable: host?.restrictor?.unmaskableFor(sessionId) ?? [],
+    ...(host?.restrictor?.error === undefined ? {} : { scopesError: host.restrictor.error }),
     // The user's groups, copied so a caller cannot mutate the live definitions. The
     // disclosure fields travel with them: the control draws the badge from `disclosure`
     // and seeds the dialog from `prompt`.
@@ -1947,8 +2246,9 @@ async function snapshot(sessionId, host, signal) {
 function setDeny(names) {
   denied = new Set(names)
   saveTools()
-  // No re-apply step: the schema filter reads `denied` on every assembly, so the
-  // next model step already sees the new set.
+  // The registry has to be told: unlike the assembly filter, a restriction is an
+  // explicit registration, so a changed set must be re-applied to every mounted scope.
+  onDenyChanged()
 }
 
 /**
@@ -2304,17 +2604,36 @@ export function apply(ctx) {
     'tools-panel: prompt section filter'
   )
 
+  // The REGISTRY half of hiding: `restrict()` is the seam that decides the model's tool
+  // declarations (`request/header.tools` is this projection; the assemble waterfall is
+  // presentation). Mounted per agent because the contract is scope-bound. Both policy
+  // edits that change the wanted set — a deny write and a group load/lock — re-apply.
+  const restrictor = createRestrictor()
+  ctx.effect(() => () => restrictor.dispose(), 'tools-panel: restriction scopes')
+  onDenyChanged = () => restrictor.syncAll()
+  onUnlockChanged = () => restrictor.syncAll()
+  ctx.effect(
+    () => () => {
+      onDenyChanged = () => {}
+      onUnlockChanged = () => {}
+    },
+    'tools-panel: policy change hooks'
+  )
+
   // Progressive disclosure: the fetch tool, mounted only while some group defers. The
-  // unlocking it performs is pure session state; the next assembly's schema filter
-  // reads it, so nothing has to be re-applied.
-  const deferred = createDeferredTools(ctx, { get systemPrompt() { return ctx.get('systemPrompt') } })
+  // unlock it performs is session state PLUS a registry edit: `unlockGroup` fires the
+  // hook above, so the group's mask is lifted before the call returns.
+  const deferred = createDeferredTools(ctx, { tools: ctx.tools })
   ctx.effect(() => () => deferred.dispose(), 'tools-panel: get_tools')
   deferred.sync()
 
   // A group edit changes which halves exist: whether `get_tools` is registered at all.
   // `replaceGroups` is the single write path (route and agent tool alike), so one hook
   // is enough.
-  onGroupsChanged = () => deferred.sync()
+  onGroupsChanged = () => {
+    deferred.sync()
+    restrictor.syncAll()
+  }
   ctx.effect(
     () => () => {
       onGroupsChanged = () => {}
@@ -2335,6 +2654,10 @@ export function apply(ctx) {
     const parentId = detectParent(agentsNow(), agent)
     if (parentId !== undefined) parents.set(agent.id, parentId)
     skillShadows.mount(agent)
+    // Mount the restriction at creation, so a switch set BEFORE this agent existed
+    // already covers it.
+    restrictor.mount(agent)
+    restrictor.syncAll()
   }
 
   // The lifecycle listeners are registered UNCONDITIONALLY and read the agent out of the
@@ -2352,6 +2675,8 @@ export function apply(ctx) {
       parents.delete(agent.id)
       seenAgents.delete(agent.id)
       skillShadows.release(agent.id)
+      // The restriction itself was owned by the agent's scope and is already gone.
+      restrictor.release(agent.id)
     }),
     'tools-panel: agent cleanup'
   )
@@ -2370,8 +2695,10 @@ export function apply(ctx) {
       return
     }
     for (const agent of list) attachAgent(agent)
-    // A skill switched off before this process had any agent must apply now.
+    // A skill switched off before this process had any agent must apply now, and so must
+    // a denied or deferred name.
     skillShadows.syncAll()
+    restrictor.syncAll()
   }
   attachLive()
   if (agentsNow() === undefined) {
@@ -2388,6 +2715,7 @@ export function apply(ctx) {
     get agents() { return agentsNow() },
     /** Agents seen through lifecycle events: the tabs' fallback while it is missing. */
     seenAgents,
+    restrictor,
     skillShadows,
     // Probed per request, not captured at apply time: a service that appears after
     // this plugin mounts must still answer the tab instead of being reported absent.
@@ -2418,6 +2746,8 @@ export {
   PROMPTS_ROUTE,
   PROTOCOL,
   createDeferredTools,
+  createRestrictor,
+  hiddenNamesFor,
   createPromptFilter,
   createSchemaFilter,
   deferredGroups,
