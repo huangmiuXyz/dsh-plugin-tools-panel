@@ -176,8 +176,25 @@ const HEADER = 'x-dsh-plugin-tools-panel'
  * in the registry view), `scopes` (mounted restriction fibers), `unmaskable` (names the
  * host refused to mask for this session) and `scopesError`. Additive and read-only, so
  * they did not need a number of their own.
+ *
+ * 11 added DYNAMIC CONTEXTS to the prompt tab's snapshot. `assemble()` returns `sections`
+ * (which become the system message) AND `contexts` (ordered dynamic facts the loop
+ * materialises as sourced user-role snapshots). The tab listed only sections, so the
+ * "injected prompt" view covered roughly a quarter of what the model actually receives.
+ * The snapshot now carries a read-only `contexts` array, and every text it reports is
+ * interpolated with the assembly's `variables` for display. A client that ignores the
+ * new field still draws the sections; the interpolation changes what a row's
+ * `text`/`chars`/`liveChars` mean, which is why the number moves rather than staying.
+ *
+ * 12 made CONTEXTS SWITCHABLE. The prompt filter also drops a disabled context name from
+ * the assembly, so a future snapshot no longer carries it (an already-recorded snapshot
+ * stays in history — the row says so rather than pretending the text is gone). The POST
+ * carries a `kind` so one route addresses both namespaces, and a disable is VERIFIED
+ * through `refreshContext()` as well as a fresh `assemble()`: the harness restores a
+ * `required` context that a waterfall listener removed, and that case has to come back
+ * as a refusal instead of a switch that looks off while the text is still sent.
  */
-const PROTOCOL = 10
+const PROTOCOL = 12
 
 /**
  * Where the user's own group definitions live.
@@ -380,23 +397,46 @@ function normalizePromptNames(value) {
   return names
 }
 
-/** Read the saved disabled-section names; a missing or corrupt file means none. */
-function loadPrompts() {
+/** Read BOTH switch sets out of one file; a missing or corrupt file means none. */
+function readPromptFile() {
   try {
     const parsed = JSON.parse(readFileSync(promptsFile(), 'utf8'))
-    return normalizePromptNames(parsed?.disabled)
+    return {
+      disabled: normalizePromptNames(parsed?.disabled),
+      contexts: normalizePromptNames(parsed?.contexts)
+    }
   } catch {
-    return []
+    return { disabled: [], contexts: [] }
   }
 }
 
-/** Persist the disabled-section names atomically enough that a crash cannot truncate. */
-function savePrompts(names) {
+/** Read the saved disabled-section names; a missing or corrupt file means none. */
+function loadPrompts() {
+  return readPromptFile().disabled
+}
+
+/** Read the saved disabled-CONTEXT names (the user-role snapshots of protocol 12). */
+function loadPromptContexts() {
+  return readPromptFile().contexts
+}
+
+/**
+ * Persist both switch sets atomically.
+ *
+ * One file for the whole prompt tab: the two sets are the same kind of user
+ * configuration (a name the user does not want injected), and splitting them would let
+ * a crash persist one half of a write.
+ */
+function savePromptState(disabled, contexts) {
   try {
     const file = promptsFile()
     mkdirSync(dirname(file), { recursive: true })
     const temp = `${file}.tmp-${process.pid}`
-    writeFileSync(temp, `${JSON.stringify({ version: 1, disabled: [...names] }, null, 2)}\n`, 'utf8')
+    writeFileSync(
+      temp,
+      `${JSON.stringify({ version: 1, disabled: [...disabled], contexts: [...contexts] }, null, 2)}\n`,
+      'utf8'
+    )
     renameSync(temp, file)
   } catch {
     // A read-only home leaves the switch in memory for this process: degraded, but
@@ -404,8 +444,20 @@ function savePrompts(names) {
   }
 }
 
+/** Persist the disabled-section names (keeping the context set as it is in memory). */
+function savePrompts(names) {
+  savePromptState(names, promptContextDisabled)
+}
+
+/** Persist the disabled-context names (keeping the section set as it is in memory). */
+function savePromptContexts(names) {
+  savePromptState(promptDisabled, names)
+}
+
 /** The live disabled set, loaded once at module load and written on every change. */
 let promptDisabled = new Set(loadPrompts())
+/** The live disabled-CONTEXT set, same lifetime and same rules. */
+let promptContextDisabled = new Set(loadPromptContexts())
 
 // --- disabled runtime skills ---------------------------------------------------
 
@@ -606,11 +658,32 @@ function noteSkillDescription(row) {
 /** The last non-empty text seen for one section name, so a disabled row still previews. */
 const lastSectionText = new Map()
 
-/** Remember one section's text for the disabled-row preview. */
-function noteSectionText(name, text) {
+/**
+ * The last non-empty text seen for one dynamic context, same purpose.
+ *
+ * A disabled context is absent from the assembly (the filter removed it), so without
+ * this cache its row could never show what it was that the user switched off.
+ */
+const lastContextText = new Map()
+
+/**
+ * Remember one section's text for the disabled-row preview.
+ *
+ * The interpolation flag is cached with the text: a section that opted out of
+ * `{{variable}}` interpolation must keep its braces literal even after it has been
+ * switched off and its row is drawn from the cache.
+ */
+function noteSectionText(name, text, interpolate) {
   if (text.length === 0) return
   if (!lastSectionText.has(name) && lastSectionText.size >= MAX_SECTION_CACHE) return
-  lastSectionText.set(name, text)
+  lastSectionText.set(name, { text, interpolate: interpolate !== false })
+}
+
+/** Remember one context's text (and its interpolation flag) for the disabled-row preview. */
+function noteContextText(name, text, interpolate) {
+  if (text.length === 0) return
+  if (!lastContextText.has(name) && lastContextText.size >= MAX_SECTION_CACHE) return
+  lastContextText.set(name, { text, interpolate: interpolate !== false })
 }
 
 /** A bounded preview plus the fact that it was cut. */
@@ -619,6 +692,62 @@ function truncateText(value, max) {
   return text.length > max
     ? { text: `${text.slice(0, max - 1)}…`, truncated: true }
     : { text, truncated: false }
+}
+
+/** `{{name}}` references, in the shape `renderPrompt` resolves (names are `[a-z][a-z0-9_]*`). */
+const VARIABLE_REFERENCE = /\{\{\s*([a-z][a-z0-9_]*)\s*\}\}/g
+
+/**
+ * Fold an assembly's `variables` into a plain name → value lookup.
+ *
+ * The documented shape is "each registered variable's value under this context", but it
+ * is a map-like view rather than a plain object, and a deployment may change the exact
+ * container. Reading it defensively keeps a display-only concern from taking the whole
+ * tab down; the name-keyed object is also what the interpolation below wants.
+ * @returns a Map of variable name to its value; empty when the assembly has none.
+ */
+function assemblyVariables(assembly) {
+  const variables = new Map()
+  const raw = assembly?.variables
+  try {
+    if (raw !== null && typeof raw === 'object' && typeof raw.get === 'function' && typeof raw.forEach === 'function') {
+      raw.forEach((value, name) => {
+        if (typeof name === 'string') variables.set(name, value)
+      })
+    } else if (Array.isArray(raw)) {
+      for (const entry of raw) {
+        if (Array.isArray(entry) && typeof entry[0] === 'string') variables.set(entry[0], entry[1])
+        else if (entry !== null && typeof entry === 'object' && typeof entry.name === 'string') {
+          variables.set(entry.name, entry.value)
+        }
+      }
+    } else if (raw !== null && typeof raw === 'object') {
+      for (const [name, value] of Object.entries(raw)) variables.set(name, value)
+    }
+  } catch {
+    /* an unreadable variables view leaves the text un-interpolated, which is honest */
+  }
+  return variables
+}
+
+/**
+ * Best-effort interpolation for DISPLAY, mirroring `renderPrompt`.
+ *
+ * The real renderer throws on an unknown reference, but `assemble()` itself returns the
+ * text UN-interpolated — the loop renders it later. The tab must not fail because a
+ * reference is missing (a disabled section is not rendered at all), so an unresolved
+ * `{{name}}` stays literal and is visible as such instead of blanking the row.
+ * @param text - the assembly's evaluated text.
+ * @param variables - {@link assemblyVariables} result.
+ * @param interpolate - the contribution's `interpolate` flag; `false` keeps the text raw.
+ * @returns the display text.
+ */
+function interpolateText(text, variables, interpolate) {
+  if (interpolate === false || variables.size === 0) return text
+  return text.replace(VARIABLE_REFERENCE, (match, name) => {
+    const value = variables.get(name)
+    return typeof value === 'string' ? value : match
+  })
 }
 
 /** Write a file through a same-directory temp + rename, so a reader never sees a half file. */
@@ -1798,29 +1927,40 @@ async function toggleSkill(host, sessionId, name, enabled, signal) {
  * preview shows (a disabled section still previews its last known text). Keeping
  * both is what lets the route verify that a shadow really took effect without
  * mistaking the cached preview for the live prompt.
+ *
+ * The text is INTERPOLATED for display: `assemble()` returns evaluated but
+ * un-interpolated text, so a section that reads `{{model}}` would otherwise show the
+ * template while the model receives the value. `interpolate: false` contributions keep
+ * their braces literally, exactly as `renderPrompt` renders them.
+ * @param raw - the assembly's `sections`.
+ * @param variables - the assembly's variables, folded by {@link assemblyVariables}.
  */
-function promptRows(raw) {
+function promptRows(raw, variables = new Map()) {
   const live = raw
     .map((section) => {
       const name = String(section?.name ?? '')
       const text = typeof section?.text === 'string' ? section.text : String(section?.text ?? '')
-      return { name, text }
+      return { name, text, interpolate: section?.interpolate }
     })
     .filter((section) => section.name.length > 0)
   const sole = live.length === 1
   const rows = live.map((section) => {
     const enabled = !promptDisabled.has(section.name)
-    if (enabled && section.text.length > 0) noteSectionText(section.name, section.text)
-    const shown = enabled ? section.text : (lastSectionText.get(section.name) ?? section.text)
-    const cut = truncateText(shown, MAX_SECTION_TEXT)
+    const shown = interpolateText(section.text, variables, section.interpolate)
+    if (enabled && section.text.length > 0) noteSectionText(section.name, section.text, section.interpolate)
+    const cached = lastSectionText.get(section.name)
+    const display = enabled
+      ? shown
+      : interpolateText(cached?.text ?? section.text, variables, cached?.interpolate ?? section.interpolate)
+    const cut = truncateText(display, MAX_SECTION_TEXT)
     return {
       name: section.name,
       text: cut.text,
-      chars: shown.length,
+      chars: display.length,
       truncated: cut.truncated,
       enabled,
       present: true,
-      liveChars: section.text.length,
+      liveChars: enabled ? shown.length : 0,
       // The only section is the whole prompt: switching it off would leave nothing
       // to send. It can still be switched back ON when it is already off.
       toggleable: !sole || !enabled,
@@ -1829,13 +1969,85 @@ function promptRows(raw) {
   })
   for (const name of promptDisabled) {
     if (live.some((section) => section.name === name)) continue
-    const shown = lastSectionText.get(name) ?? ''
-    const cut = truncateText(shown, MAX_SECTION_TEXT)
+    const cached = lastSectionText.get(name)
+    const display = interpolateText(cached?.text ?? '', variables, cached?.interpolate)
+    const cut = truncateText(display, MAX_SECTION_TEXT)
     rows.push({
       name,
       text: cut.text,
-      chars: shown.length,
+      chars: display.length,
       truncated: cut.truncated,
+      enabled: false,
+      present: false,
+      liveChars: 0,
+      toggleable: true
+    })
+  }
+  return rows
+}
+
+/**
+ * The dynamic contexts of the current assembly, in the shape the tab draws.
+ *
+ * These are NOT sections: `assemble()` returns them separately, and the loop
+ * materialises them as sourced USER-role snapshots in the model history instead of
+ * folding them into the system message. The tab used to omit them entirely, which made
+ * its "injected prompt" view cover only the sections — often a quarter of the text a
+ * model actually receives.
+ *
+ * A row is SWITCHABLE from protocol 12 on. The switch removes the name from the
+ * assembly, which stops FUTURE snapshots from carrying it; a snapshot the loop already
+ * recorded stays in history, and the row's hint says so. That is a strictly better deal
+ * than not offering the switch at all: a context that has not been materialised yet
+ * (the next step, a new session) never arrives.
+ *
+ * Empty contexts contribute nothing to the model (documented), so an enabled-but-empty
+ * one is omitted. A DISABLED name is always listed even when the assembly does not
+ * carry it, or the user could never switch it back on.
+ * @param raw - the assembly's `contexts`.
+ * @param variables - the assembly's variables, folded by {@link assemblyVariables}.
+ */
+function contextRows(raw, variables = new Map()) {
+  const rows = []
+  const present = new Set()
+  for (const entry of raw) {
+    const name = String(entry?.name ?? '')
+    if (name.length === 0) continue
+    present.add(name)
+    const text = typeof entry?.text === 'string' ? entry.text : String(entry?.text ?? '')
+    const enabled = !promptContextDisabled.has(name)
+    const shown = interpolateText(text, variables, entry?.interpolate)
+    if (enabled && text.length > 0) noteContextText(name, text, entry?.interpolate)
+    // An empty contribution adds nothing to the model; listing it as a row would make
+    // the tab claim something is injected when it is not.
+    if (text.length === 0) continue
+    const display = enabled
+      ? shown
+      : interpolateText(lastContextText.get(name)?.text ?? text, variables, lastContextText.get(name)?.interpolate ?? entry?.interpolate)
+    const cut = truncateText(display, MAX_SECTION_TEXT)
+    rows.push({
+      name,
+      text: cut.text,
+      chars: display.length,
+      truncated: cut.truncated,
+      kind: 'context',
+      enabled,
+      present: true,
+      liveChars: enabled ? shown.length : 0,
+      toggleable: true
+    })
+  }
+  for (const name of promptContextDisabled) {
+    if (present.has(name)) continue
+    const cached = lastContextText.get(name)
+    const display = interpolateText(cached?.text ?? '', variables, cached?.interpolate)
+    const cut = truncateText(display, MAX_SECTION_TEXT)
+    rows.push({
+      name,
+      text: cut.text,
+      chars: display.length,
+      truncated: cut.truncated,
+      kind: 'context',
       enabled: false,
       present: false,
       liveChars: 0,
@@ -1862,19 +2074,15 @@ async function assembleFor(host, agent, signal) {
   return systemPrompt.assemble({ agent, scope: agent, ...(signal === undefined ? {} : { signal }) })
 }
 
-/** Assemble one agent's prompt sections, through the same context shape the loop uses. */
-async function assembleSections(host, agent, signal) {
-  const assembly = await assembleFor(host, agent, signal)
-  return Array.isArray(assembly?.sections) ? assembly.sections : []
-}
-
 /** The prompt tab's state for one session. */
 async function promptsState(host, sessionId, signal) {
   const base = {
     protocol: PROTOCOL,
     sessionId,
     disabled: [...promptDisabled].sort(),
-    sections: []
+    disabledContexts: [...promptContextDisabled].sort(),
+    sections: [],
+    contexts: []
   }
   if (host?.systemPrompt === undefined) {
     return { ...base, available: false, reason: 'no-system-prompt' }
@@ -1885,12 +2093,12 @@ async function promptsState(host, sessionId, signal) {
       ...base,
       available: true,
       reason: 'no-live-agent',
-      sections: promptRows([])
+      sections: promptRows([], new Map())
     }
   }
-  let raw
+  let assembly
   try {
-    raw = await assembleSections(host, agent, signal)
+    assembly = await assembleFor(host, agent, signal)
   } catch (error) {
     if (error instanceof PanelError) {
       return { ...base, available: false, reason: 'no-system-prompt' }
@@ -1902,7 +2110,15 @@ async function promptsState(host, sessionId, signal) {
       error: String(error?.message ?? error)
     }
   }
-  return { ...base, available: true, sections: promptRows(raw) }
+  const variables = assemblyVariables(assembly)
+  const rawSections = Array.isArray(assembly?.sections) ? assembly.sections : []
+  const rawContexts = Array.isArray(assembly?.contexts) ? assembly.contexts : []
+  return {
+    ...base,
+    available: true,
+    sections: promptRows(rawSections, variables),
+    contexts: contextRows(rawContexts, variables)
+  }
 }
 
 /** Write one name into the disabled set. The filter reads it on the next assembly. */
@@ -1927,8 +2143,11 @@ async function togglePromptSection(host, sessionId, name, enabled, signal) {
     throw new PanelError(409, 'the systemPrompt service is unavailable in this deployment')
   }
   const agent = agentFor(host, sessionId)
-  const beforeRaw = agent === undefined ? [] : await assembleSections(host, agent, signal)
-  const before = promptRows(beforeRaw)
+  const beforeAssembly = agent === undefined ? undefined : await assembleFor(host, agent, signal)
+  const before = promptRows(
+    Array.isArray(beforeAssembly?.sections) ? beforeAssembly.sections : [],
+    assemblyVariables(beforeAssembly)
+  )
   const beforePresent = before.filter((row) => row.present).length
   // Disabling a name that is not in the assembly would persist a dead switch, and a
   // later plugin registering that name would then be off without the user seeing why.
@@ -1943,8 +2162,11 @@ async function togglePromptSection(host, sessionId, name, enabled, signal) {
     if (agent === undefined) {
       return { state: await promptsState(host, sessionId, signal), applied: false, reason: 'no-live-agent' }
     }
-    const afterRaw = await assembleSections(host, agent, signal)
-    const after = promptRows(afterRaw)
+    const afterAssembly = await assembleFor(host, agent, signal)
+    const after = promptRows(
+      Array.isArray(afterAssembly?.sections) ? afterAssembly.sections : [],
+      assemblyVariables(afterAssembly)
+    )
     const afterRow = after.find((row) => row.name === name && row.present)
     const liveBefore = before.filter((row) => row.present).reduce((sum, row) => sum + row.liveChars, 0)
     const liveAfter = after.filter((row) => row.present).reduce((sum, row) => sum + row.liveChars, 0)
@@ -1971,17 +2193,109 @@ async function togglePromptSection(host, sessionId, name, enabled, signal) {
   }
 }
 
-/** Put every disabled section back: clear the set. */
+/**
+ * The contexts AFTER the loop's admission refresh.
+ *
+ * `refreshContext()` is the pre-step pass that re-reads registered runtime facts and
+ * restores a `required` context the waterfall removed. Verifying a context disable
+ * against `assemble()` alone would report a required context as "off" while the next
+ * request still carries it, so the toggle asks the exact method the loop uses.
+ * @returns the contexts as the next step would accept them.
+ */
+async function refreshedContexts(host, agent, assembly, signal) {
+  const contexts = Array.isArray(assembly?.contexts) ? assembly.contexts : []
+  const systemPrompt = host?.systemPrompt
+  if (systemPrompt === undefined || typeof systemPrompt.refreshContext !== 'function') return contexts
+  try {
+    const refreshed = await systemPrompt.refreshContext(assembly, {
+      agent,
+      scope: agent,
+      ...(signal === undefined ? {} : { signal })
+    })
+    return Array.isArray(refreshed?.contexts) ? refreshed.contexts : contexts
+  } catch {
+    // A refresh that cannot answer leaves the assembly as the best available truth.
+    return contexts
+  }
+}
+
+/**
+ * Flip one dynamic context off/on, then PROVE the switch took effect.
+ *
+ * Contexts are materialised as user-role snapshots from the accepted assembly, so
+ * removing the name stops FUTURE snapshots from carrying it — a snapshot already
+ * written into history is out of reach, which is stated in the UI instead of being
+ * papered over by a fake "off".
+ *
+ * The verification is TWO-STAGE on purpose: a fresh `assemble()` proves the waterfall
+ * filter removed it, and `refreshContext()` proves the harness does not restore it
+ * (the admission pass restores `required` contexts). The switch only reports `applied`
+ * when both agree, and rolls the persisted set back otherwise — the same rule the
+ * section toggle follows for a re-imposed `complete` section.
+ */
+async function togglePromptContext(host, sessionId, name, enabled, signal) {
+  if (host?.systemPrompt === undefined) {
+    throw new PanelError(409, 'the systemPrompt service is unavailable in this deployment')
+  }
+  const agent = agentFor(host, sessionId)
+  const beforeAssembly = agent === undefined ? undefined : await assembleFor(host, agent, signal)
+  const before = Array.isArray(beforeAssembly?.contexts) ? beforeAssembly.contexts : []
+  // Refuse a name this assembly does not contribute and the set does not hold: it
+  // would persist a dead switch, and a later plugin registering that name would then
+  // be off without the user seeing why.
+  if (!before.some((context) => context?.name === name) && !promptContextDisabled.has(name)) {
+    throw new PanelError(404, `unknown prompt context "${name}"`)
+  }
+  if (enabled) promptContextDisabled.delete(name)
+  else promptContextDisabled.add(name)
+  savePromptContexts(promptContextDisabled)
+  try {
+    if (agent === undefined) {
+      return { state: await promptsState(host, sessionId, signal), applied: false, reason: 'no-live-agent' }
+    }
+    const afterAssembly = await assembleFor(host, agent, signal)
+    const after = Array.isArray(afterAssembly?.contexts) ? afterAssembly.contexts : []
+    const accepted = await refreshedContexts(host, agent, afterAssembly, signal)
+    let failure
+    if (!enabled) {
+      const stillAssembled = after.some((context) => context?.name === name)
+      const stillAccepted = accepted.some((context) => context?.name === name)
+      if (stillAccepted && !stillAssembled) {
+        failure = 'this context is marked required and is restored by the harness after assembly; it cannot be switched off here'
+      } else if (stillAssembled) {
+        failure = 'this context is still present in the assembly; the switch did not take effect'
+      }
+    } else if (!after.some((context) => context?.name === name)) {
+      failure = 'this context is not contributed by the current assembly, so it cannot be switched back on'
+    }
+    if (failure !== undefined) throw new PanelError(409, failure)
+    return { state: await promptsState(host, sessionId, signal), applied: true }
+  } catch (error) {
+    // Any failure after the write must not leave the persisted set disagreeing with
+    // what is actually applied. The set holds DISABLED names; the desired state is the
+    // FLIP of the previous one, so the membership before this call was exactly
+    // `enabled`, and that is what the rollback restores.
+    if (promptContextDisabled.has(name) !== enabled) {
+      if (enabled) promptContextDisabled.add(name)
+      else promptContextDisabled.delete(name)
+      savePromptContexts(promptContextDisabled)
+    }
+    throw error
+  }
+}
+
+/** Put every disabled prompt contribution back: clear BOTH sets. */
 async function resetPromptSections(host, sessionId, signal) {
   promptDisabled.clear()
-  savePrompts(promptDisabled)
+  promptContextDisabled.clear()
+  savePromptState(promptDisabled, promptContextDisabled)
   return promptsState(host, sessionId, signal)
 }
 
 // --- prompt sections ----------------------------------------------------------
 
 /**
- * Remove the disabled prompt sections from the assembled system prompt.
+ * Remove the disabled prompt sections AND dynamic contexts from one assembly.
  *
  * WHY THIS REPLACES THE PER-AGENT SHADOW
  *   The previous mechanism registered an empty same-name section into each live
@@ -2002,22 +2316,37 @@ async function resetPromptSections(host, sessionId, signal) {
  *   blanking its text therefore render identically; the difference is only that
  *   deletion also works for sections the shadow could not reach.
  *
+ * CONTEXTS (protocol 12)
+ *   A dynamic context is materialised as a user-role snapshot when the accepted
+ *   assembly changes, so dropping it here stops FUTURE snapshots from carrying it. An
+ *   already-recorded snapshot stays in the model history — the row says so, and this
+ *   is why the switch is described as "stop injecting it", not "erase it".
+ *
  * THE ONE THING IT CANNOT DO
  *   `SystemPrompt.assemble` re-imposes a `complete: true` section AFTER the
  *   waterfall returns, so a complete section is outside this listener's reach —
  *   there can be at most one, and blanking the prompt wholesale is not a switch
- *   any panel should own. That case still reports a failure to the caller.
- * @returns the assembly, with disabled sections removed.
+ *   any panel should own. That case still reports a failure to the caller. The same
+ *   is true of a `required` context: `refreshContext()` restores it after the
+ *   waterfall, which the toggle verifies for and refuses instead of lying.
+ * @returns the assembly, with disabled sections and contexts removed.
  */
 function createPromptFilter() {
   return (assembly, _context, next) =>
     Promise.resolve(next()).then((resolved) => {
-      if (promptDisabled.size === 0) return resolved
+      if (promptDisabled.size === 0 && promptContextDisabled.size === 0) return resolved
+      let nextAssembly = resolved
       const sections = resolved?.sections
-      if (!Array.isArray(sections)) return resolved
-      const kept = sections.filter((section) => !promptDisabled.has(section?.name))
-      if (kept.length === sections.length) return resolved
-      return { ...resolved, sections: kept }
+      if (Array.isArray(sections) && promptDisabled.size > 0) {
+        const kept = sections.filter((section) => !promptDisabled.has(section?.name))
+        if (kept.length !== sections.length) nextAssembly = { ...nextAssembly, sections: kept }
+      }
+      const contexts = resolved?.contexts
+      if (Array.isArray(contexts) && promptContextDisabled.size > 0) {
+        const kept = contexts.filter((context) => !promptContextDisabled.has(context?.name))
+        if (kept.length !== contexts.length) nextAssembly = { ...nextAssembly, contexts: kept }
+      }
+      return nextAssembly
     })
 }
 
@@ -2506,14 +2835,19 @@ async function handlePrompts(req, res, host) {
     }
     const name = cleanPanelName(payload.name)
     if (name === undefined) {
-      sendJson(res, 400, { ok: false, error: '`name` must be a non-empty section name' })
+      sendJson(res, 400, { ok: false, error: '`name` must be a non-empty prompt contribution name' })
       return
     }
     if (typeof payload.enabled !== 'boolean') {
       sendJson(res, 400, { ok: false, error: '`enabled` must be a boolean' })
       return
     }
-    const answer = await togglePromptSection(host, sessionId, name, payload.enabled, signal)
+    // One route, two namespaces. `section` is the default so an older client that
+    // knows nothing about contexts keeps addressing sections exactly as before.
+    const context = payload.kind === 'context'
+    const answer = context
+      ? await togglePromptContext(host, sessionId, name, payload.enabled, signal)
+      : await togglePromptSection(host, sessionId, name, payload.enabled, signal)
     sendJson(res, 200, { ok: true, state: answer.state, applied: answer.applied })
   } catch (error) {
     sendJson(res, error instanceof PanelError ? error.status : 500, {
@@ -2767,11 +3101,13 @@ export {
   ROUTE,
   SKILLS_ROUTE,
   cleanDeny,
+  contextRows,
   createSkillShadows,
   denyReason,
   denySetFor,
   groupsFile,
   loadGroups,
+  loadPromptContexts,
   loadPrompts,
   loadSkillDisabled,
   loadTools,
@@ -2780,7 +3116,9 @@ export {
   normalizePromptNames,
   promptsFile,
   promptsState,
+  interpolateText,
   saveGroups,
+  savePromptContexts,
   savePrompts,
   saveSkillDisabled,
   saveTools,
@@ -2788,6 +3126,7 @@ export {
   skillsFile,
   skillsState,
   snapshot,
+  togglePromptContext,
   togglePromptSection,
   toggleSkill,
   resetPromptSections,
@@ -2803,6 +3142,16 @@ export function getPromptDisabled() {
 /** Test-only: replace the live disabled set without touching disk. */
 export function replacePromptDisabled(names) {
   promptDisabled = new Set(normalizePromptNames(names))
+}
+
+/** Test-only: the live disabled-context names. */
+export function getPromptContextDisabled() {
+  return [...promptContextDisabled].sort()
+}
+
+/** Test-only: replace the live disabled-context set without touching disk. */
+export function replacePromptContextDisabled(names) {
+  promptContextDisabled = new Set(normalizePromptNames(names))
 }
 
 /** Test-only: the live disabled-skill names. */

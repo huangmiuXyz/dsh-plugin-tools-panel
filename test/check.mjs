@@ -108,24 +108,30 @@ const {
   MAX_SECTION_TEXT,
   PROMPTS_ROUTE,
   SKILLS_ROUTE,
+  getPromptContextDisabled,
   getPromptDisabled,
   getSkillDisabled,
   groupsFile,
+  interpolateText,
   loadGroups,
+  loadPromptContexts,
   loadPrompts,
   normalizeGroups,
   normalizePromptNames,
   promptsFile,
   promptsState,
+  replacePromptContextDisabled,
   replacePromptDisabled,
   replaceSkillDisabled,
   saveGroups,
+  savePromptContexts,
   savePrompts,
   setDeny,
   setGroups,
   getGroups,
   skillsFile,
   skillsState,
+  togglePromptContext,
   togglePromptSection,
   snapshot,
   GET_TOOLS,
@@ -1581,8 +1587,25 @@ try {
     normalizePromptNames(Array.from({ length: MAX_PROMPTS + 5 }, (_, index) => `s${index}`)).length === MAX_PROMPTS
   )
   check('prompts: an unusable payload becomes empty', JSON.stringify(normalizePromptNames({ a: 1 })) === '[]')
+  replacePromptDisabled(['alpha'])
   savePrompts(new Set(['alpha']))
   check('prompts: the disabled set round-trips through disk', JSON.stringify(loadPrompts()) === '["alpha"]', JSON.stringify(loadPrompts()))
+  check('prompts: a section-only file has no disabled contexts', loadPromptContexts().length === 0, JSON.stringify(loadPromptContexts()))
+  replacePromptContextDisabled(['ctx-alpha'])
+  savePromptContexts(new Set(['ctx-alpha']))
+  check(
+    'prompts: the disabled context set round-trips through disk',
+    JSON.stringify(loadPromptContexts()) === '["ctx-alpha"]',
+    JSON.stringify(loadPromptContexts())
+  )
+  check(
+    'prompts: both switch sets live in one file',
+    JSON.stringify(loadPrompts()) === '["alpha"]',
+    JSON.stringify(loadPrompts())
+  )
+  replacePromptContextDisabled([])
+  savePromptContexts(new Set())
+  replacePromptDisabled([])
   savePrompts(new Set())
   check('prompts: the file lives under DSH_HOME', promptsFile().startsWith(SANDBOX), promptsFile())
 
@@ -1744,9 +1767,21 @@ try {
 
     // --- prompt sections over the same real route
     const promptGlobal = [
-      { name: 'identity', order: 1, text: 'You are DSH.' },
+      { name: 'identity', order: 1, text: 'You are {{model}}.' },
       { name: 'tool-notes', order: 2, text: 'Use tools carefully.' },
-      { name: 'workspace', order: 3, text: 'Workspace: /tmp/work' }
+      { name: 'workspace', order: 3, text: 'Workspace: /tmp/work' },
+      // `interpolate: false` is documented to keep braces literal, so the display text
+      // must too — this is the negative half of the interpolation assertion below.
+      { name: 'literal', order: 4, text: 'Keep {{model}} literal.', interpolate: false }
+    ]
+    // Dynamic contexts are NOT sections: the loop materialises them as user-role
+    // snapshots. The tab lists them with their own switch (protocol 12); an empty one
+    // is omitted because it contributes nothing to the model.
+    const promptContexts = [
+      { name: 'runtime-context', text: 'Runtime model: {{model}}.' },
+      { name: 'skill-catalog', text: 'Skills are listed here.' },
+      { name: 'required-context', text: 'Required facts.' },
+      { name: 'empty-context', text: '' }
     ]
     const overlays = new Map()
     const shadowFails = new Set()
@@ -1759,7 +1794,13 @@ try {
         const assembly = {
           sections: [...merged.values()]
             .sort((left, right) => left.order - right.order)
-            .map((section) => ({ name: section.name, text: section.text }))
+            .map((section) => ({
+              name: section.name,
+              text: section.text,
+              ...(section.interpolate === undefined ? {} : { interpolate: section.interpolate })
+            })),
+          contexts: promptContexts.map((context) => ({ name: context.name, text: context.text })),
+          variables: new Map([['model', 'dsh-test']])
         }
         // Run the plugin's REAL `system-prompt/assemble` listeners, exactly as the
         // host does. Without this the fake would answer from the raw registry and the
@@ -1772,6 +1813,19 @@ try {
         // Mirror the host's post-waterfall rule: a `complete` section is re-imposed.
         // No section in this fixture is complete, so nothing is restored.
         return result
+      },
+      /**
+       * The admission pass. The real service restores a `required` context that a
+       * waterfall listener removed; this fake does the same for ONE name, so the
+       * toggle's two-stage verification is exercised instead of assumed.
+       */
+      async refreshContext(assembly) {
+        const contexts = Array.isArray(assembly?.contexts) ? [...assembly.contexts] : []
+        if (!contexts.some((context) => context.name === 'required-context')) {
+          const required = promptContexts.find((context) => context.name === 'required-context')
+          contexts.push({ name: required.name, text: required.text })
+        }
+        return { ...assembly, contexts }
       },
       __scoped(id) {
         return (definition) => {
@@ -1786,11 +1840,94 @@ try {
 
     replacePromptDisabled([])
     const promptList = await (await promptsGet('root-a')).json()
-    check('prompts route: lists the assembled sections', promptList.ok === true && promptList.state.sections.length === 3, String(promptList.state.sections.length))
-    check('prompts route: preserves assembly order', promptList.state.sections.map((row) => row.name).join(',') === 'identity,tool-notes,workspace')
+    check('prompts route: lists the assembled sections', promptList.ok === true && promptList.state.sections.length === 4, String(promptList.state.sections.length))
+    check('prompts route: preserves assembly order', promptList.state.sections.map((row) => row.name).join(',') === 'identity,tool-notes,workspace,literal')
     check('prompts route: everything starts enabled', promptList.state.sections.every((row) => row.enabled === true))
     check('prompts route: every section can be switched off', promptList.state.sections.every((row) => row.toggleable === true))
     check('prompts route: carries the protocol', promptList.state.protocol === PROTOCOL)
+    // Display interpolation: assemble() returns un-interpolated text, so the route has
+    // to resolve `{{model}}` with the assembly's variables or the tab shows a template
+    // the model never receives. `interpolate: false` keeps the braces literally.
+    check(
+      'prompts route: section text is interpolated for display',
+      promptList.state.sections.find((row) => row.name === 'identity')?.text === 'You are dsh-test.',
+      promptList.state.sections.find((row) => row.name === 'identity')?.text
+    )
+    check(
+      'prompts route: interpolated chars match the displayed text',
+      promptList.state.sections.find((row) => row.name === 'identity')?.chars === 'You are dsh-test.'.length,
+      String(promptList.state.sections.find((row) => row.name === 'identity')?.chars)
+    )
+    check(
+      'prompts route: interpolate:false keeps the braces literal',
+      promptList.state.sections.find((row) => row.name === 'literal')?.text === 'Keep {{model}} literal.',
+      promptList.state.sections.find((row) => row.name === 'literal')?.text
+    )
+    // Dynamic contexts: listed separately, switchable, interpolated, empty ones omitted.
+    check('prompts route: lists the dynamic contexts', promptList.state.contexts?.length === 3, JSON.stringify(promptList.state.contexts?.map((row) => row.name)))
+    check(
+      'prompts route: contexts keep their assembly order',
+      promptList.state.contexts?.map((row) => row.name).join(',') === 'runtime-context,skill-catalog,required-context'
+    )
+    check(
+      'prompts route: a context is listed with its own switch',
+      promptList.state.contexts?.every((row) => row.kind === 'context' && row.enabled === true && row.toggleable === true) === true
+    )
+    check(
+      'prompts route: context text is interpolated too',
+      promptList.state.contexts?.find((row) => row.name === 'runtime-context')?.text === 'Runtime model: dsh-test.',
+      promptList.state.contexts?.find((row) => row.name === 'runtime-context')?.text
+    )
+
+    // Disabling a context must remove it from the NEXT assembly (the snapshot the loop
+    // records from), and persist the name; the already-recorded snapshot is out of the
+    // panel's reach and the UI says so.
+    const contextOff = await (await promptsPost({ sessionId: 'root-a', name: 'skill-catalog', enabled: false, kind: 'context' })).json()
+    check('prompts route: an optional context can be switched off', contextOff.ok === true && contextOff.applied === true, JSON.stringify(contextOff))
+    const afterContextOff = await host.extras.systemPrompt.assemble({ agent: host.agents.get('root-a') })
+    check(
+      'prompts route: the context is gone from the next assembly',
+      !afterContextOff.contexts.some((context) => context.name === 'skill-catalog')
+    )
+    const contextOffRow = contextOff.state.contexts.find((row) => row.name === 'skill-catalog')
+    check(
+      'prompts route: the off context keeps its preview and is marked absent',
+      contextOffRow?.enabled === false && contextOffRow?.present === false && contextOffRow?.chars > 0,
+      JSON.stringify(contextOffRow)
+    )
+    check('prompts route: the context name is persisted', JSON.stringify(loadPromptContexts()) === '["skill-catalog"]', JSON.stringify(loadPromptContexts()))
+    check(
+      'prompts route: the state reports the disabled context set',
+      JSON.stringify(contextOff.state.disabledContexts) === '["skill-catalog"]',
+      JSON.stringify(contextOff.state.disabledContexts)
+    )
+
+    // A required context is restored by the admission pass, so the switch must refuse
+    // and roll back instead of showing "off" while the next request still carries it.
+    const requiredOff = await promptsPost({ sessionId: 'root-a', name: 'required-context', enabled: false, kind: 'context' })
+    const requiredBody = await requiredOff.json()
+    check('prompts route: a required context is refused', requiredOff.status === 409, JSON.stringify(requiredBody))
+    check(
+      'prompts route: the refusal explains the harness restore',
+      String(requiredBody.error).includes('required'),
+      requiredBody.error
+    )
+    check(
+      'prompts route: the refused switch persisted nothing',
+      !getPromptContextDisabled().includes('required-context'),
+      JSON.stringify(getPromptContextDisabled())
+    )
+    const requiredRow = (await (await promptsGet('root-a')).json()).state.contexts.find((row) => row.name === 'required-context')
+    check('prompts route: the required context row stays on', requiredRow?.enabled === true)
+
+    // Unknown context names must not create a dead switch either.
+    check(
+      'prompts route: an unknown context is a 404',
+      (await promptsPost({ sessionId: 'root-a', name: 'nope', enabled: false, kind: 'context' })).status === 404
+    )
+    const contextOn = await (await promptsPost({ sessionId: 'root-a', name: 'skill-catalog', enabled: true, kind: 'context' })).json()
+    check('prompts route: a context can be switched back on', contextOn.ok === true && contextOn.applied === true, JSON.stringify(contextOn))
+    check('prompts route: the context set is clean again', getPromptContextDisabled().length === 0, JSON.stringify(getPromptContextDisabled()))
 
     const hidden = await (await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })).json()
     check('prompts route: the switch reports it took effect', hidden.ok === true && hidden.applied === true)
@@ -1811,6 +1948,11 @@ try {
     const hiddenRow = hidden.state.sections.find((row) => row.name === 'identity')
     check('prompts route: the row is off', hiddenRow?.enabled === false)
     check('prompts route: the row keeps its preview', hiddenRow?.chars > 0 && hiddenRow?.liveChars === 0, JSON.stringify(hiddenRow))
+    check(
+      'prompts route: a disabled row still previews interpolated text',
+      hiddenRow?.text === 'You are dsh-test.',
+      hiddenRow?.text
+    )
     check('prompts route: the other sections still carry text', hidden.state.sections.filter((row) => row.name !== 'identity').every((row) => row.liveChars > 0))
     check('prompts route: the disabled name is persisted', JSON.stringify(loadPrompts()) === '["identity"]', JSON.stringify(loadPrompts()))
 
@@ -1850,15 +1992,21 @@ try {
     // Put it back so the reset assertions below start from a clean set.
     await promptsPost({ sessionId: 'root-a', name: 'tool-notes', enabled: true })
 
-    // The reset switch restores every disabled section at once.
+    // The reset switch restores every disabled prompt contribution at once.
     await promptsPost({ sessionId: 'root-a', name: 'identity', enabled: false })
     await promptsPost({ sessionId: 'root-a', name: 'workspace', enabled: false })
+    await promptsPost({ sessionId: 'root-a', name: 'skill-catalog', enabled: false, kind: 'context' })
     check('prompts route: two sections are off', getPromptDisabled().length === 2, JSON.stringify(getPromptDisabled()))
+    check('prompts route: one context is off too', getPromptContextDisabled().length === 1, JSON.stringify(getPromptContextDisabled()))
     const reset = await (await promptsPost({ sessionId: 'root-a', reset: true })).json()
     check('prompts route: reset restores everything', reset.ok === true && getPromptDisabled().length === 0)
+    check('prompts route: reset clears the context set', getPromptContextDisabled().length === 0, JSON.stringify(getPromptContextDisabled()))
     check('prompts route: reset re-enables every row', reset.state.sections.every((row) => row.enabled === true))
+    check('prompts route: reset re-enables every context', reset.state.contexts.every((row) => row.enabled === true))
     check('prompts route: reset persisted the empty set', JSON.stringify(loadPrompts()) === '[]', JSON.stringify(loadPrompts()))
+    check('prompts route: reset persisted the empty context set', JSON.stringify(loadPromptContexts()) === '[]', JSON.stringify(loadPromptContexts()))
   } finally {
+    replacePromptContextDisabled([])
     replacePromptDisabled([])
     savePrompts(new Set())
     await new Promise((resolve) => host.server.close(resolve))
@@ -1873,6 +2021,15 @@ try {
     (await promptsState({ systemPrompt: { assemble: async () => ({ sections: [] }) }, agents: { get: () => undefined } }, 'x')).reason === 'no-live-agent'
   )
   check('prompts: a preview is bounded', MAX_SECTION_TEXT > 0)
+  // Display interpolation: a section that reads `{{model}}` must not show the template
+  // while the model receives the value. Unresolved references stay literal (a disabled
+  // section is never rendered, so the real renderer's throw is not the display rule).
+  check('prompts: interpolateText resolves a {{name}} reference', interpolateText('Hi {{model}}.', new Map([['model', 'm']])) === 'Hi m.')
+  check('prompts: interpolateText keeps an unresolved reference literal', interpolateText('Hi {{missing}}.', new Map()) === 'Hi {{missing}}.')
+  check(
+    'prompts: interpolateText respects interpolate: false',
+    interpolateText('Hi {{model}}.', new Map([['model', 'm']]), false) === 'Hi {{model}}.'
+  )
 
   // --- the sole-section refusal happens BEFORE any write
   {
@@ -2298,7 +2455,12 @@ try {
     pluginsFailed: 'pf',
     pluginsSwitchFailed: '失败：',
     pluginsOverridden: '{name} 被覆盖',
-    pluginsCancelled: '{name} 已取消'
+    pluginsCancelled: '{name} 已取消',
+    // The prompts tab's read-only context block (the rest of its keys render as the key
+    // name, which is enough for a fake translator).
+    promptsContexts: '动态上下文',
+    promptsContextsHint: '关闭只影响之后的注入',
+    promptsContextKind: '上下文'
   }
   const tt = (key, params) => {
     const template = DICT[key]
@@ -2711,6 +2873,103 @@ try {
       check(
         'skills tab: a refused write rolls the switch back',
         byClass(currentTree, 'dsh-tools-panel-tool-switch').find((node) => node.props['aria-label'] === 'alpha')?.props['aria-checked'] === true
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+  // The prompts tab: sections AND dynamic contexts carry switches (protocol 12).
+  // A context switch stops FUTURE injections; the block header states that a snapshot
+  // already recorded in history cannot be retracted.
+  {
+    rememberTab('prompts')
+    const originalFetch = globalThis.fetch
+    const calls = []
+    const fixture = {
+      protocol: PROTOCOL,
+      sessionId: 's1',
+      available: true,
+      disabled: [],
+      disabledContexts: [],
+      sections: [
+        { name: 'identity', text: 'You are dsh-test.', chars: 16, truncated: false, enabled: true, present: true, liveChars: 16, toggleable: true },
+        { name: 'literal', text: 'Keep {{model}} literal.', chars: 23, truncated: false, enabled: true, present: true, liveChars: 23, toggleable: true }
+      ],
+      contexts: [
+        { name: 'runtime-context', text: 'Runtime model: dsh-test.', chars: 23, truncated: false, kind: 'context', enabled: true, present: true, liveChars: 23, toggleable: true },
+        { name: 'skill-catalog', text: 'Skills are listed here.', chars: 22, truncated: false, kind: 'context', enabled: true, present: true, liveChars: 22, toggleable: true }
+      ]
+    }
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url: String(url), init })
+      if (init.method === 'POST') {
+        const body = JSON.parse(init.body)
+        const state = {
+          ...fixture,
+          disabledContexts: body.kind === 'context' ? [body.name] : [],
+          contexts: fixture.contexts.map((row) =>
+            body.kind === 'context' && row.name === body.name
+              ? { ...row, enabled: false, present: false, liveChars: 0 }
+              : row
+          )
+        }
+        return { status: 200, json: async () => ({ ok: true, applied: true, state }) }
+      }
+      return { status: 200, json: async () => ({ ok: true, state: fixture }) }
+    }
+    try {
+      const comp = driveApply({ locale: fakeLocale, remotes: {} }).registrations[0].component
+      const view = render(comp, { t: tt, sessionId: 's1' })
+      byClass(view.tree, 'dsh-tools-panel-trigger')[0].props.onClick()
+      await pump(view)
+      const contextRows = byClass(currentTree, 'dsh-tools-panel-context-row')
+      const promptRows = byClass(currentTree, 'dsh-tools-panel-prompt-row')
+      const sectionRows = promptRows.filter(
+        (node) => !String(node.props?.className ?? '').includes('dsh-tools-panel-context-row')
+      )
+      check('prompts tab: lists the dynamic contexts', contextRows.length === 2, String(contextRows.length))
+      check('prompts tab: the section rows are still there', sectionRows.length === 2, String(sectionRows.length))
+      check(
+        'prompts tab: a section row carries its switch',
+        sectionRows.every((node) => byClass(node, 'dsh-tools-panel-tool-switch').length === 1)
+      )
+      check(
+        'prompts tab: a context row carries its own switch',
+        contextRows.every((node) => byClass(node, 'dsh-tools-panel-tool-switch').length === 1)
+      )
+      check('prompts tab: the context block is labelled', textOf(currentTree).some((text) => text.includes('动态上下文')))
+      check(
+        'prompts tab: the block explains the history limit',
+        textOf(currentTree).some((text) => text.includes('关闭只影响之后的注入')),
+        textOf(currentTree).filter((text) => text.includes('注入')).join('|')
+      )
+      check(
+        'prompts tab: the context shows its text',
+        textOf(contextRows[0]).join('').includes('Runtime model: dsh-test.'),
+        textOf(contextRows[0]).join('|')
+      )
+      const contextSwitch = byClass(contextRows[0], 'dsh-tools-panel-tool-switch')[0]
+      check('prompts tab: a context starts on', contextSwitch?.props['aria-checked'] === true)
+      contextSwitch.props.onClick()
+      await pump(view)
+      const post = calls.find((call) => call.init.method === 'POST')
+      check(
+        'prompts tab: toggling a context posts kind=context',
+        JSON.parse(post?.init.body ?? '{}').kind === 'context' &&
+          JSON.parse(post?.init.body ?? '{}').name === 'runtime-context',
+        post?.init.body
+      )
+      check(
+        'prompts tab: the answer updates the context switch',
+        byClass(currentTree, 'dsh-tools-panel-context-row')[0] !== undefined &&
+          byClass(currentTree, 'dsh-tools-panel-context-row')
+            .map((node) => byClass(node, 'dsh-tools-panel-tool-switch')[0]?.props['aria-checked'])
+            .includes(false),
+        JSON.stringify(
+          byClass(currentTree, 'dsh-tools-panel-context-row').map(
+            (node) => byClass(node, 'dsh-tools-panel-tool-switch')[0]?.props['aria-checked']
+          )
+        )
       )
     } finally {
       globalThis.fetch = originalFetch

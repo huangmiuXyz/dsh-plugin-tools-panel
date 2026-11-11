@@ -65,7 +65,7 @@ window.__ModuleLoader__.load({
      * with an OLD host, and without this check that shows up as a switch that flips
      * back on its own.
      */
-    const PROTOCOL = 10
+    const PROTOCOL = 12
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 320
     const MENU_MAX_HEIGHT = 420
@@ -109,7 +109,7 @@ window.__ModuleLoader__.load({
       promptsNoAgent: '会话尚未启动，无法预览注入段落；已关闭的段落仍会保留。',
       promptsAssembleFailed: '系统提示词装配失败',
       promptsSole: '这是当前唯一的提示词段落，关闭会让提示词为空',
-      promptsMissing: '当前装配里没有这一段',
+      promptsMissing: '当前装配里没有这一项',
       promptsEmptyText: '（这一段的当前文本为空）',
       promptsGlobal: '全局',
       promptsReset: '全部恢复',
@@ -117,6 +117,9 @@ window.__ModuleLoader__.load({
       promptsTruncated: '已截断',
       promptsSaving: '正在应用…',
       promptsWarning: '设置已保存，但本会话没有立即生效；请刷新重试。',
+      promptsContexts: '动态上下文',
+      promptsContextsHint: '关闭只影响之后的注入；历史里已注入的旧快照撤回不了',
+      promptsContextKind: '上下文',
       refresh: '刷新',
       // ---- tools
       search: '搜索工具',
@@ -212,6 +215,9 @@ window.__ModuleLoader__.load({
       promptsTruncated: 'truncated',
       promptsSaving: 'Applying…',
       promptsWarning: 'Saved, but this session did not pick it up; refresh and retry.',
+      promptsContexts: 'Dynamic contexts',
+      promptsContextsHint: 'Switching one off stops future injections; snapshots already in history cannot be retracted.',
+      promptsContextKind: 'context',
       refresh: 'Refresh',
       search: 'Search tools',
       denyAll: 'Disable all',
@@ -441,12 +447,19 @@ window.__ModuleLoader__.load({
     const readPrompts = (sessionId) =>
       call({ method: 'GET' }, `${PROMPTS_ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
 
-    /** One assembled section off/on; the Host verifies and rolls back on a refusal. */
-    const writePrompt = async (sessionId, name, enabled) => {
+    /**
+     * One prompt contribution off/on; the Host verifies and rolls back on a refusal.
+     *
+     * `kind` selects the namespace: a section (the default, so an older caller keeps
+     * working) or a dynamic context. The route treats them differently — a section has
+     * a rendering consequence, a context an admission-refresh consequence — but the
+     * switch shape and the refusal handling are identical.
+     */
+    const writePrompt = async (sessionId, name, enabled, kind) => {
       const answer = await request({
         method: 'POST',
         headers: { 'content-type': 'application/json', [HEADER]: '1' },
-        body: JSON.stringify({ sessionId, name, enabled })
+        body: JSON.stringify({ sessionId, name, enabled, ...(kind === 'context' ? { kind: 'context' } : {}) })
       }, PROMPTS_ROUTE)
       return { state: answer.state, applied: answer.applied !== false }
     }
@@ -1224,6 +1237,28 @@ window.__ModuleLoader__.load({
   word-break: break-word;
 }
 .dsh-tools-panel-prompt-note { color: var(--dsw-alias-label-caption); font-size: 10px; line-height: 14px; }
+/* Dynamic contexts: the same row shape as a section, including its switch. A context
+   becomes a user-role snapshot in history, so the switch stops FUTURE injections and
+   cannot retract a snapshot the model already read — the block header states that.
+   The heading separates "becomes the system message" from "becomes a user snapshot". */
+.dsh-tools-panel-prompt-contexts {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: .5px solid var(--dsw-alias-border-l2);
+}
+.dsh-tools-panel-prompt-contextsHead {
+  padding: 2px 8px 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+}
+.dsh-tools-panel-prompt-contextsHint {
+  padding: 0 8px 2px;
+  color: var(--dsw-alias-label-caption);
+  font-size: 10px;
+  line-height: 14px;
+}
 .dsh-tools-panel-inlineWarn { color: var(--dsw-alias-state-warn-label); font-size: 11px; line-height: 16px; }
 .dsh-tools-panel-actions { display: flex; align-items: center; gap: 6px; padding: 4px 8px 2px; }
 /* Progressive disclosure: one small gear per group, and the dialog it opens. The
@@ -3110,21 +3145,35 @@ window.__ModuleLoader__.load({
           if (active) load()
         }, [active, load])
 
+        /**
+         * One row's identity across the two namespaces.
+         *
+         * Sections and contexts are independent name universes, so the same name can
+         * legitimately appear in both; the prefix keeps their expansion and in-flight
+         * state from bleeding together.
+         */
+        const rowKey = useCallback((row) => (row.kind === 'context' ? `context:${row.name}` : row.name), [])
+
         const toggle = useCallback((row) => {
           if (activeSession === undefined || row.toggleable !== true) return
           const next = !row.enabled
+          const key = rowKey(row)
+          const isContext = row.kind === 'context'
           const previous = dataRef.current
-          setSaving((prev) => new Set(prev).add(row.name))
+          setSaving((prev) => new Set(prev).add(key))
           setWarning(undefined)
-          setData((prev) => prev === undefined
-            ? prev
-            : {
-                ...prev,
-                sections: prev.sections.map((section) =>
-                  section.name === row.name ? { ...section, enabled: next } : section
-                )
-              })
-          writePrompt(activeSession, row.name, next)
+          setData((prev) => {
+            if (prev === undefined) return prev
+            const list = isContext ? prev.contexts : prev.sections
+            if (!Array.isArray(list)) return prev
+            return {
+              ...prev,
+              [isContext ? 'contexts' : 'sections']: list.map((entry) =>
+                entry.name === row.name ? { ...entry, enabled: next } : entry
+              )
+            }
+          })
+          writePrompt(activeSession, row.name, next, isContext ? 'context' : undefined)
             .then((answer) => {
               if (!liveRef.current) return
               dataRef.current = answer.state
@@ -3151,11 +3200,11 @@ window.__ModuleLoader__.load({
               if (!liveRef.current) return
               setSaving((prev) => {
                 const set = new Set(prev)
-                set.delete(row.name)
+                set.delete(key)
                 return set
               })
             })
-        }, [activeSession, t])
+        }, [activeSession, rowKey, t])
 
         const reset = useCallback(() => {
           if (activeSession === undefined) return
@@ -3192,20 +3241,94 @@ window.__ModuleLoader__.load({
         }, [activeSession, resetArmed])
 
         const sections = data?.sections ?? []
-        const visible = useMemo(() => {
+        const contexts = data?.contexts ?? []
+        const matches = useCallback((row) => {
           const needle = query.trim().toLowerCase()
-          if (needle.length === 0) return sections
-          return sections.filter((section) =>
-            section.name.toLowerCase().includes(needle) ||
-            String(section.text ?? '').toLowerCase().includes(needle)
+          if (needle.length === 0) return true
+          return (
+            row.name.toLowerCase().includes(needle) ||
+            String(row.text ?? '').toLowerCase().includes(needle)
           )
-        }, [sections, query])
+        }, [query])
+        const visible = useMemo(() => sections.filter(matches), [sections, matches])
+        const visibleContexts = useMemo(() => contexts.filter(matches), [contexts, matches])
         const emptyText =
           data?.available === false
             ? t('promptsUnavailable')
-            : sections.length === 0
+            : sections.length === 0 && contexts.length === 0
               ? t('promptsEmpty')
               : t('promptsNoMatch')
+
+        // Dynamic contexts. The same row shape as a section — name, badge, disclosure and a
+        // switch — because the switch is real from protocol 12 on: it removes the name
+        // from the assembly, so the next snapshot no longer carries it. The block header
+        // states the one thing it cannot do (retract a snapshot already in history).
+        const contextRows = visibleContexts.map((row) => {
+          const key = rowKey(row)
+          const busy = saving.has(key)
+          const open = expanded.has(key)
+          const flip = () =>
+            setExpanded((prev) => {
+              const next = new Set(prev)
+              if (next.has(key)) next.delete(key)
+              else next.add(key)
+              return next
+            })
+          return h(
+            'div',
+            {
+              key,
+              className: [
+                'dsh-tools-panel-prompt-row',
+                'dsh-tools-panel-context-row',
+                row.enabled ? '' : 'dsh-tools-panel-prompt-rowOff',
+                row.present === false ? 'dsh-tools-panel-prompt-rowMissing' : ''
+              ].filter(Boolean).join(' ')
+            },
+            h(
+              'div',
+              { className: 'dsh-tools-panel-prompt-head' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-tools-panel-prompt-name',
+                  'aria-expanded': open,
+                  title: row.name,
+                  onClick: flip
+                },
+                row.name
+              ),
+              h('span', { className: 'dsh-tools-panel-prompt-global' }, t('promptsContextKind')),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  role: 'switch',
+                  className: 'dsh-tools-panel-tool-switch',
+                  'aria-checked': row.enabled,
+                  'aria-label': row.name,
+                  disabled: row.toggleable !== true || busy,
+                  title: row.name,
+                  onClick: () => toggle(row)
+                },
+                h('span', { className: 'dsh-tools-panel-tool-thumb', 'aria-hidden': 'true' })
+              )
+            ),
+            h(
+              'div',
+              { className: 'dsh-tools-panel-prompt-preview', onClick: flip },
+              row.text.length === 0 ? t('promptsEmptyText') : String(row.text).split('\n')[0]
+            ),
+            row.present === false
+              ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsMissing'))
+              : null,
+            open ? h('pre', { className: 'dsh-tools-panel-prompt-text' }, row.text) : null,
+            open && row.truncated === true
+              ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsTruncated'))
+              : null
+          )
+        })
 
         return h(
           'div',
@@ -3245,7 +3368,9 @@ window.__ModuleLoader__.load({
                     {
                       type: 'button',
                       className: 'dsh-tools-panel-tool-bulkButton',
-                      disabled: status === 'loading' || (data?.disabled?.length ?? 0) === 0,
+                      disabled:
+                        status === 'loading' ||
+                        (data?.disabled?.length ?? 0) + (data?.disabledContexts?.length ?? 0) === 0,
                       onClick: reset
                     },
                     resetArmed ? t('promptsResetConfirm') : t('promptsReset')
@@ -3291,95 +3416,117 @@ window.__ModuleLoader__.load({
                             t('retry')
                           )
                         )
-                      : visible.length === 0
+                      : visible.length === 0 && contextRows.length === 0
                         ? h(
                             'div',
                             { className: 'dsh-tools-panel-tool-status' },
                             h('span', { className: 'dsh-tools-panel-tool-note' }, emptyText)
                           )
-                        : visible.map((row) => {
-                            const busy = saving.has(row.name)
-                            const open = expanded.has(row.name)
-                            return h(
-                              'div',
-                              {
-                                key: row.name,
-                                className: [
-                                  'dsh-tools-panel-prompt-row',
-                                  row.enabled ? '' : 'dsh-tools-panel-prompt-rowOff',
-                                  row.present === false ? 'dsh-tools-panel-prompt-rowMissing' : ''
-                                ].filter(Boolean).join(' ')
-                              },
-                              h(
-                                'div',
-                                { className: 'dsh-tools-panel-prompt-head' },
-                                h(
-                                  'button',
+                        : [
+                            ...visible.map((row) => {
+                                const busy = saving.has(rowKey(row))
+                                const open = expanded.has(rowKey(row))
+                                return h(
+                                  'div',
                                   {
-                                    type: 'button',
-                                    className: 'dsh-tools-panel-prompt-name',
-                                    'aria-expanded': open,
-                                    title: row.name,
-                                    onClick: () =>
-                                      setExpanded((prev) => {
-                                        const next = new Set(prev)
-                                        if (next.has(row.name)) next.delete(row.name)
-                                        else next.add(row.name)
-                                        return next
-                                      })
+                                    key: row.name,
+                                    className: [
+                                      'dsh-tools-panel-prompt-row',
+                                      row.enabled ? '' : 'dsh-tools-panel-prompt-rowOff',
+                                      row.present === false ? 'dsh-tools-panel-prompt-rowMissing' : ''
+                                    ].filter(Boolean).join(' ')
                                   },
-                                  row.name
-                                ),
-                                h('span', { className: 'dsh-tools-panel-prompt-global' }, t('promptsGlobal')),
-                                h(
-                                  'button',
-                                  {
-                                    type: 'button',
-                                    role: 'switch',
-                                    className: 'dsh-tools-panel-tool-switch',
-                                    'aria-checked': row.enabled,
-                                    'aria-label': row.name,
-                                    disabled: row.toggleable !== true || busy,
-                                    title: row.reason === 'sole-section'
-                                      ? t('promptsSole')
-                                      : row.toggleable !== true
-                                        ? t('promptsSole')
-                                        : row.name,
-                                    onClick: () => toggle(row)
-                                  },
-                                  h('span', { className: 'dsh-tools-panel-tool-thumb', 'aria-hidden': 'true' })
+                                  h(
+                                    'div',
+                                    { className: 'dsh-tools-panel-prompt-head' },
+                                    h(
+                                      'button',
+                                      {
+                                        type: 'button',
+                                        className: 'dsh-tools-panel-prompt-name',
+                                        'aria-expanded': open,
+                                        title: row.name,
+                                        onClick: () =>
+                                          setExpanded((prev) => {
+                                            const key = rowKey(row)
+                                            const next = new Set(prev)
+                                            if (next.has(key)) next.delete(key)
+                                            else next.add(key)
+                                            return next
+                                          })
+                                      },
+                                      row.name
+                                    ),
+                                    h('span', { className: 'dsh-tools-panel-prompt-global' }, t('promptsGlobal')),
+                                    h(
+                                      'button',
+                                      {
+                                        type: 'button',
+                                        role: 'switch',
+                                        className: 'dsh-tools-panel-tool-switch',
+                                        'aria-checked': row.enabled,
+                                        'aria-label': row.name,
+                                        disabled: row.toggleable !== true || busy,
+                                        title: row.reason === 'sole-section'
+                                          ? t('promptsSole')
+                                          : row.toggleable !== true
+                                            ? t('promptsSole')
+                                            : row.name,
+                                        onClick: () => toggle(row)
+                                      },
+                                      h('span', { className: 'dsh-tools-panel-tool-thumb', 'aria-hidden': 'true' })
+                                    )
+                                  ),
+                                  h(
+                                    'div',
+                                    {
+                                      className: 'dsh-tools-panel-prompt-preview',
+                                      onClick: () =>
+                                        setExpanded((prev) => {
+                                          const key = rowKey(row)
+                                          const next = new Set(prev)
+                                          if (next.has(key)) next.delete(key)
+                                          else next.add(key)
+                                          return next
+                                        })
+                                    },
+                                    row.text.length === 0 ? t('promptsEmptyText') : String(row.text).split('\n')[0]
+                                  ),
+                                  row.present === false
+                                    ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsMissing'))
+                                    : null,
+                                  open
+                                    ? h(
+                                        'pre',
+                                        { className: 'dsh-tools-panel-prompt-text' },
+                                        row.text.length === 0 ? t('promptsEmptyText') : row.text
+                                      )
+                                    : null,
+                                  open && row.truncated === true
+                                    ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsTruncated'))
+                                    : null
                                 )
-                              ),
-                              h(
+                            }),
+                          visibleContexts.length === 0
+                            ? null
+                            : h(
                                 'div',
-                                {
-                                  className: 'dsh-tools-panel-prompt-preview',
-                                  onClick: () =>
-                                    setExpanded((prev) => {
-                                      const next = new Set(prev)
-                                      if (next.has(row.name)) next.delete(row.name)
-                                      else next.add(row.name)
-                                      return next
-                                    })
-                                },
-                                row.text.length === 0 ? t('promptsEmptyText') : String(row.text).split('\n')[0]
-                              ),
-                              row.present === false
-                                ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsMissing'))
-                                : null,
-                              open
-                                ? h(
-                                    'pre',
-                                    { className: 'dsh-tools-panel-prompt-text' },
-                                    row.text.length === 0 ? t('promptsEmptyText') : row.text
-                                  )
-                                : null,
-                              open && row.truncated === true
-                                ? h('span', { className: 'dsh-tools-panel-prompt-note' }, t('promptsTruncated'))
-                                : null
-                            )
-                          }
-                        )
+                                { key: 'contexts', className: 'dsh-tools-panel-prompt-contexts' },
+                                [
+                                  h(
+                                    'div',
+                                    { key: 'head', className: 'dsh-tools-panel-prompt-contextsHead' },
+                                    t('promptsContexts')
+                                  ),
+                                  h(
+                                    'div',
+                                    { key: 'hint', className: 'dsh-tools-panel-prompt-contextsHint' },
+                                    t('promptsContextsHint')
+                                  ),
+                                  ...contextRows
+                                ]
+                              )
+                        ]
                       ),
                 status !== 'error' && error !== undefined
                   ? h(

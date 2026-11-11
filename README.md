@@ -1,8 +1,7 @@
 # dsh-plugin-tools-panel
 
 输入框工具条上的**一个**面板，四个 tab。「工具」逐个实时禁用当前会话能调用的工具；
-「技能」启停技能对模型的可见性；「提示词」启停已经注入系统提示词里的段落；「插件」启停
-整个 profile 的插件。
+「技能」启停技能对模型的可见性；「提示词」启停注入模型的段落与动态上下文；「插件」启停整个 profile 的插件。
 
 合并前这是两个独立插件（`dsh-tool-guard`、`dsh-plugin-switch`），各占工具条一个按钮。
 两个下拉回答的是同一个问题——"这个会话现在能用什么"——并排放着逼用户两个都点一遍才
@@ -137,9 +136,27 @@ from the next step on, with their own descriptions and parameter schemas, ...
 
 ### 提示词
 
-这个 tab **不创建、不编辑任何提示词**。它列出当前会话**已经装配进系统提示词**的段落
-（`ctx.systemPrompt.assemble({ agent, scope: agent })` 的 `sections`），一段一行，可以展开
-看原文，也可以按段关掉。
+这个 tab **不创建、不编辑任何提示词**。它列出当前会话**模型实际收到的提示词材料**，分两组：
+
+- **段落（sections）**：`ctx.systemPrompt.assemble({ agent, scope: agent })` 的 `sections`，
+  一段一行，可以展开看原文，也可以按段关掉。
+- **动态上下文（contexts）**：同一次装配返回的 `contexts`。它们不是系统提示词的一部分，而是
+  由 agent loop 物化成**带来源的 user 角色快照**写进模型历史（运行时上下文、技能目录、工作区
+  指令等）。这个 tab 之前只列 `sections`，于是"注入的提示词"视图只覆盖了模型实际收到内容的
+  一部分；现在它们一行一个，带自己的开关。
+
+  关掉一个 context = 在 `system-prompt/assemble` 阶段把这个名字从装配的 `contexts` 里删掉，
+  agent loop 下一份快照就不再带它。**已经写进历史的旧快照撤回不了**，所以界面把开关说成
+  "关闭只影响之后的注入"，而不是假装文本已经消失。
+
+  宿主会**两段验证**：重新装配确认 waterfall 里真的没有了，再调 `refreshContext()`（agent loop
+  准入前的同一步）确认宿主没有把它恢复回来。标了 `required` 的上下文会被准入阶段按注册顺序
+  恢复，那种情况宿主回滚并回 `409` 说明原因——开关不会出现"面板关了、模型还看得见"。
+
+两类文本都会**按装配返回的 `variables` 做显示插值**：`assemble()` 返回的是已求值、未插值的
+文本（例如 `{{model}}`），模型收到的是插值后的值（例如 `deepseek-flash`），所以列表显示后者；
+标了 `interpolate: false` 的贡献保留字面花括号。空文本的 context 不列出（它不贡献任何内容）；
+空文本的 section 仍然列出，因为它是一个可关的注册项，随时可能变非空。
 
 - 关掉一段 = 在 `system-prompt/assemble` 阶段把这一段从装配好的 `sections` 里**删掉**。和工具
   tab 共用同一个窄监听器（只注册一次，覆盖所有 agent）。不碰任何插件的源码或数据文件，升级
@@ -214,14 +231,14 @@ tab 时才跑；技能/提示词 tab 在第一次变成活动 tab 时读一次�
 两个半边各自声明 `PROTOCOL`。快照里带 `protocol`，客户端发现对不上就不显示清单，直接说
 "宿主端还是旧版本，请重启 DSH"；宿主收到既没有 `deny`、也没有 `groups`、也没有 `hide` 的请求
 返回 `409`。改字段名或状态形状时**两边一起加一**，自检里有一条断言盯着这个数字是否一致。
-当前：`10`。
+当前：`12`。
 
 ## 接口
 
 `GET /dsh-plugin-tools-panel/state?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 10, "sessionId": "…",
+  "protocol": 12, "sessionId": "…",
   "tools": ["bash", "…"],          // 本会话可见（含已禁用、已披露隐藏），已排序
   "denied": ["write"],             // 全局生效的禁用集合（写盘，重启还在）
   "groups": [{
@@ -249,7 +266,7 @@ tab 时才跑；技能/提示词 tab 在第一次变成活动 tab 时读一次�
 `GET /dsh-plugin-tools-panel/skills?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 10, "sessionId": "…", "available": true, "complete": true,
+  "protocol": 12, "sessionId": "…", "available": true, "complete": true,
   "skills": [{
     "name": "blender-modeling", "description": "…", "provider": "fs", "source": "user",
     "path": "/home/…/SKILL.md",        // 真实文件路径；没有它就没有可写的开关
@@ -267,22 +284,33 @@ frontmatter 没闭合 → `409`。必须带同一个请求头。
 `GET /dsh-plugin-tools-panel/prompts?sessionId=<id>` →
 ```jsonc
 { "ok": true, "state": {
-  "protocol": 10, "sessionId": "…", "available": true, "disabled": ["workspace"],
+  "protocol": 12, "sessionId": "…", "available": true,
+  "disabled": ["workspace"], "disabledContexts": ["skill-catalog"],
   "sections": [{
-    "name": "identity", "text": "…（≤4000 字，超出截断）", "chars": 128,
-    "truncated": false, "enabled": true, "present": true, "liveChars": 128,
+    "name": "identity", "text": "…（已插值，≤4000 字，超出截断）", "chars": 58,
+    "truncated": false, "enabled": true, "present": true, "liveChars": 58,
     "toggleable": true
+  }],
+  "contexts": [{                     // 模型以 user 角色快照收到它们
+    "name": "runtime-context", "text": "…（已插值，≤4000 字，超出截断）",
+    "chars": 2273, "truncated": false, "kind": "context",
+    "enabled": true, "present": true, "liveChars": 2273, "toggleable": true
   }]
 }}
 ```
-`sections` 保持装配顺序；`liveChars` 是当前装配里这一段的真实长度（关掉的段落为 0），
-`chars` 是预览长度（关掉的段落用上一次看到的文本，所以仍然能预览）。`present:false` 表示
-这个开关还在、但当前装配里没有这一段。
+`sections` 和 `contexts` 都保持装配顺序；`liveChars` 是当前装配里这一条的真实长度（关掉的项
+为 0），`chars` 是预览长度（关掉的项用上一次看到的文本，所以仍然能预览）。`present:false`
+表示这个开关还在、但当前装配里没有这一条。`text`/`chars`/`liveChars` 都是**插值后**的值：
+宿主按 `assembly.variables` 把 `{{model}}` 这类引用换成了模型实际看到的内容，`interpolate:false`
+的贡献除外。空文本的 context 不会出现在 `contexts` 里（它不贡献任何内容）；被关掉的 context
+仍然会列出（`present:false`），否则就再也打不开了。
 
-`POST /dsh-plugin-tools-panel/prompts` body `{ sessionId, name, enabled }` 或
-`{ sessionId, reset: true }`。关掉一段会把该段名加入禁用集合（装配期从 `sections` 删掉），然后
-**重新装配验证**；验证不过（段落遮不住、或关掉后提示词为空）就回滚并回 `409`，`applied` 只在
-真生效时为 `true`。同样要求该请求头。
+`POST /dsh-plugin-tools-panel/prompts` body `{ sessionId, name, enabled }`、
+`{ sessionId, name, enabled, kind: "context" }` 或 `{ sessionId, reset: true }`。`kind` 省略
+时按 `sections` 处理，所以旧客户端不用改。关掉一段/一个 context 会把名字加入对应的禁用集合
+（装配期从 `sections` / `contexts` 删掉），然后**验证**；验证不过（段落遮不住、关掉后提示词为空、
+context 是 `required` 被准入阶段恢复）就回滚并回 `409`，`applied` 只在真生效时为 `true`。
+`reset` 一次清空两个集合。同样要求该请求头。
 
 `scopes` 是"隐藏挂上了几个作用域"，`masked` 是"隐藏名里真的从注册表投影里看不见了几个"，
 `unmaskable` 是"宿主拒绝遮、只能靠 guard 的名字"。被成功隐藏的工具根本到不了 guard，所以
@@ -295,14 +323,17 @@ frontmatter 没闭合 → `409`。必须带同一个请求头。
 node test/check.mjs
 ```
 
-435 条断言，覆盖：清单与 patch、两个半边都不引入外部包（`node:` 内置模块除外，本包用
+475 条断言，覆盖：清单与 patch、两个半边都不引入外部包（`node:` 内置模块除外，本包用
 `link:` 安装）、逐工具判定、全局禁用集合的规范化与落盘（含重启后仍生效）、分组规范化与落盘、请求体清洗、真实 `node:http` 服务器跑
 通的整条链路（缺头 403、`deny` / `hide` 非数组 400、三字段全无 409、未知工具名不炸整份限制、晚注册
 工具在下一次策略变更时补遮），以及用**伪 React 渲染器**跑通的界面：一个触发器、四个 tab、tab 记忆、
 四个 tab 都保持挂载、插件 Remote 调用、过滤未安装运行时、插件搜索与空结果、收藏置顶持久化、
 没有插件管理器时面板仍然打开、技能行与开关（文件型与运行时型走同一条作用域影子）、技能关掉后
 两条调用路径都断、关掉时不改写技能文件、文件自带禁用键时「开」会清掉那一行、开关集合落盘、
-提示词段落列出与开关、
+提示词段落列出与开关、动态上下文列出与开关（可选 context 关掉后从下一次装配消失、名字落盘、
+关掉的行仍可预览、required context 被 `refreshContext` 恢复时回 409 并回滚）、两个禁用集合共用
+一个文件、变量插值显示（`{{model}}` 换成值、`interpolate:false` 保留字面花括号、关掉的段落仍用
+插值后的预览）、空 context 不列出、
 空段落遮蔽、无法遮蔽时的回滚、唯一段落拒绝、全部恢复。
 
 技能/提示词一组还单独覆盖了 frontmatter 补丁（新增 key、翻转、CRLF、BOM、缩进同名项、
